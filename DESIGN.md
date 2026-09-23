@@ -557,8 +557,10 @@ replays the buffer. Killing the pod kills everything inside it.
 - **M0 — the trick works.** bwrap pod, seccomp exec gate, lazy bind-shim redirect, local
   binds only. Success is running Claude Code inside it and seeing every exec intercepted
   with cwd tracking intact. This is the riskiest assumption in the design.
-- **M1 — one remote.** Daemon, sshfs mount, cwd routing to a single host, warm
-  ControlMaster. This is the first genuinely useful version.
-- **M2 — lifecycle. [v1 ships here]** Console, multiple sessions, `vpinit`, detach/attach, PTY buffer, `ps`/`down`.
+- **M1 — one remote.** Daemon, rclone mount with execution-aware invalidation, cwd
+  routing to a single host, warm ControlMaster. First genuinely useful version.
+- **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, exec log,
+  the console, multiple sessions, `ps`/`down`.
 - **M3 — real work.** Credential proxy, toolbin prompts, port forwards, reverse mounts.
-- **M4 — polish.** Multi-host, audit log, `doctor`, `sync` mode.
+- **M4 — polish.** Multi-host, `exec_on`/`expose_to` beyond one target, `doctor`,
+  `sync` mode.
