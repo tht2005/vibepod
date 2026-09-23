@@ -651,6 +651,20 @@ Run `vpctl tree --json` to see what is executing and where.
 
 ### Prompts
 
+Setup also *reports* itself at `up` time. Connecting to a machine that turns out
+not to exist costs ten seconds, and a wait that says nothing is
+indistinguishable from a hang:
+
+```
+vibepod: connecting to gpu03… connected (240ms)
+vibepod: mounting gpu03:/srv/api via sshfs… mounted (310ms)
+```
+
+A failure names the step and explains itself in terms of the next action —
+which key to add, which `Host` entry to check — rather than forwarding ssh's
+own diagnostics, which are written for someone debugging ssh. The step line says
+*which*; the error says *why*; neither repeats the other.
+
 Everything vibepod needs to ask — toolbin pushes, credential forwarding, host trust — is
 asked at **`up` time**, while a human is certainly watching. Mid-run, a question only
 appears if a terminal is attached; otherwise the command fails fast and actionably:

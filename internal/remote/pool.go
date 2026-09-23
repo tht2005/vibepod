@@ -105,16 +105,67 @@ func (h *Host) SSHCommand() string {
 	return "ssh " + strings.Join(h.Opts(), " ")
 }
 
+// ConnectTimeout bounds how long a host gets to answer before vibepod gives up
+// on it. Long enough for a slow link, short enough that a dead one does not
+// look like a hang.
+const ConnectTimeout = 10
+
 // Warm opens the master connection so the first real command does not pay for
-// the handshake, and so an unreachable host is reported at up time.
+// the handshake, and so an unreachable host is reported at up time — where a
+// person is watching — rather than in the middle of an agent run.
 func (h *Host) Warm() error {
-	args := append(h.Opts(), "-o", "ConnectTimeout=10", h.Alias, "true")
+	args := append(h.Opts(),
+		"-o", fmt.Sprintf("ConnectTimeout=%d", ConnectTimeout), h.Alias, "true")
 	out, err := exec.Command("ssh", args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s unreachable: %v: %s", h.Alias, err,
-			strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s", Explain(h.Alias, string(out)))
 	}
 	return nil
+}
+
+// explain turns ssh's output into a sentence that says what to do about it.
+//
+// The raw text is written for someone debugging ssh, not for someone who asked
+// for a pod and got a ten-second pause. The distinctions that matter here are
+// which of these it was, because each has a different next step.
+func Explain(alias, out string) string {
+	line := firstUseful(out)
+	low := strings.ToLower(line)
+	switch {
+	case strings.Contains(low, "timed out"), strings.Contains(low, "timeout"):
+		return fmt.Sprintf("%s timed out after %ds — unreachable, or behind a "+
+			"jump host that is not in your ssh config", alias, ConnectTimeout)
+	case strings.Contains(low, "could not resolve hostname"):
+		return fmt.Sprintf("%s has no address — check the Host entry in "+
+			"~/.ssh/config", alias)
+	case strings.Contains(low, "connection refused"):
+		return fmt.Sprintf("%s refused the connection — nothing is listening on "+
+			"that port", alias)
+	case strings.Contains(low, "permission denied"),
+		strings.Contains(low, "no such identity"),
+		strings.Contains(low, "authentication"):
+		return fmt.Sprintf("%s rejected the key — vibepod runs ssh in batch "+
+			"mode, so the key must already be in your agent (ssh-add) and not "+
+			"need a passphrase", alias)
+	case strings.Contains(low, "host key verification failed"):
+		return fmt.Sprintf("%s failed host key verification — connect to it once "+
+			"by hand to record the key", alias)
+	case line == "":
+		return fmt.Sprintf("%s could not be reached", alias)
+	}
+	return fmt.Sprintf("%s: %s", alias, line)
+}
+
+// firstUseful skips ssh's banners and warnings to reach the reason.
+func firstUseful(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Warning: Permanently added") {
+			continue
+		}
+		return line
+	}
+	return ""
 }
 
 // Reachable reports whether the multiplexed master is currently up.

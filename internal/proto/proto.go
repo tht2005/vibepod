@@ -53,6 +53,10 @@ const (
 	OpDetach  = "detach"  // left running, deliberately
 	OpInput   = "input"   // keystrokes for an attached session
 
+	// OpProgress is sent while a request is still being worked on, so that a
+	// wait long enough to look like a hang does not have to be one.
+	OpProgress = "progress"
+
 	// generic replies
 	OpOK   = "ok"
 	OpErr  = "err"
@@ -151,6 +155,13 @@ type Msg struct {
 	ExecDefault string        `json:"exec_default,omitempty"`
 	EnvPolicy   *EnvPolicy    `json:"env_policy,omitempty"`
 	ShimAll     bool          `json:"shim_all,omitempty"`
+
+	// Detail is human-facing text: what a slow request is waiting for, or why
+	// it stopped waiting.
+	Detail string `json:"detail,omitempty"`
+	// Partial marks progress text that the next message completes, so a step
+	// and its outcome land on one line.
+	Partial bool `json:"partial,omitempty"`
 
 	Follow bool            `json:"follow,omitempty"`
 	All    bool            `json:"all,omitempty"`

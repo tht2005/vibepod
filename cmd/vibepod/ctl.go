@@ -14,6 +14,7 @@ import (
 	"vibepod/internal/daemon"
 	"vibepod/internal/fs"
 	"vibepod/internal/proto"
+	"vibepod/internal/remote"
 	"vibepod/internal/term"
 )
 
@@ -422,8 +423,20 @@ func cmdDoctor() error {
 		if cfg, err := config.Load(cfgPath); err == nil {
 			if hosts := cfg.HostList(); len(hosts) > 0 {
 				fmt.Println("\nhosts in " + short(cfgPath))
+				live := term.IsTTY(os.Stdout)
 				for _, h := range hosts {
-					(check{h, reachable(h)}).print()
+					// Name the host before waiting on it: each of these can
+					// take ConnectTimeout seconds, and a silent pause with
+					// several hosts configured looks like a hang. Only on a
+					// terminal — in a file the escape codes would be the noise.
+					if live {
+						fmt.Printf("  … %s", h)
+					}
+					err := reachable(h)
+					if live {
+						fmt.Print("\r\x1b[K")
+					}
+					(check{h, err}).print()
 				}
 			}
 		}
@@ -468,22 +481,13 @@ func reachable(host string) error {
 	if f := os.Getenv("VIBEPOD_SSH_CONFIG"); f != "" {
 		args = append(args, "-F", f)
 	}
-	args = append(args, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "true")
+	args = append(args, "-o", "BatchMode=yes",
+		fmt.Sprintf("-oConnectTimeout=%d", remote.ConnectTimeout), host, "true")
 	if out, err := exec.Command("ssh", args...).CombinedOutput(); err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("%s", firstLine(msg))
+		// Same explanation the daemon would give, so the two never disagree.
+		return fmt.Errorf("%s", remote.Explain(host, string(out)))
 	}
 	return nil
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[:i]
-	}
-	return s
 }
 
 func statErr(p string) error {

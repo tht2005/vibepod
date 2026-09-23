@@ -543,3 +543,56 @@ func TestARefusedVariableIsReported(t *testing.T) {
 		t.Errorf("a refused variable was dropped silently:\n%s", out)
 	}
 }
+
+// Setting up a pod can mean waiting ten seconds on a machine that turns out not
+// to exist. A wait that says nothing is indistinguishable from a hang, and the
+// error at the end does not say which step it was about.
+func TestPodSetupReportsWhatItIsWaitingFor(t *testing.T) {
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	vpctlIn(t, remoteDir, "down", "e2e-remote")
+	_, errOut, code := vpctlIn(t, remoteDir, "up")
+	if code != 0 {
+		t.Fatalf("up exit %d: %s", code, errOut)
+	}
+	for _, want := range []string{"connecting to vptest", "connected", "mounting", "mounted"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("setup never reported %q:\n%s", want, errOut)
+		}
+	}
+}
+
+// And when it fails, it must say which step failed and why — not the raw ssh
+// text, which is written for someone debugging ssh rather than someone who
+// asked for a pod.
+func TestUnreachableHostSaysWhichStepAndWhy(t *testing.T) {
+	dir := t.TempDir()
+	work := filepath.Join(dir, "w")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "pod: e2e-noaddr\nmounts:\n  - remote: no-such-host-at-all:/tmp\n" +
+		"  - local: " + work + "\nexec:\n  default: pod\n"
+	if err := os.WriteFile(filepath.Join(dir, "vibepod.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, errOut, code := vpctlIn(t, dir, "up")
+	if code == 0 {
+		t.Fatalf("up succeeded against a host that does not exist")
+	}
+	if !strings.Contains(errOut, "connecting to no-such-host-at-all") {
+		t.Errorf("the failing step was not named:\n%s", errOut)
+	}
+	if !strings.Contains(errOut, "failed") {
+		t.Errorf("the step was not marked failed:\n%s", errOut)
+	}
+	// The reason, in terms of what to do about it.
+	if !strings.Contains(errOut, "no address") || !strings.Contains(errOut, "ssh/config") {
+		t.Errorf("the reason does not say what to check:\n%s", errOut)
+	}
+	// And not twice: the step says which, the error says why.
+	if strings.Count(errOut, "no address") != 1 {
+		t.Errorf("the reason was repeated:\n%s", errOut)
+	}
+}

@@ -137,7 +137,7 @@ func (k *ctlConn) serve() {
 		d := k.d
 		switch m.Op {
 		case proto.OpUp:
-			d.reply(k.c, m, d.up(m))
+			d.reply(k.c, m, d.up(m, k.progress(m.ID)))
 		case proto.OpPs:
 			_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Pods: d.ps(),
 				Version: Version})
@@ -248,6 +248,15 @@ func (k *ctlConn) runSession(m *proto.Msg, fds []int) {
 		Session: sess.id})
 }
 
+// progress gives a slow request a way to say what it is waiting for.
+func (k *ctlConn) progress(id uint64) *Progress {
+	return &Progress{id: id, send: func(m *proto.Msg) {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		_ = k.c.Send(m)
+	}}
+}
+
 func (k *ctlConn) attached() *session {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -279,7 +288,7 @@ func (d *Daemon) reply(c *proto.Conn, m *proto.Msg, err error) {
 
 // up creates a pod: its runtime dir, the socket vpsh will call back on, the
 // namespace itself, and the gate loop that watches every exec in it.
-func (d *Daemon) up(m *proto.Msg) error {
+func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	if m.Spec == nil || m.Spec.Name == "" {
 		return fmt.Errorf("up needs a named spec")
 	}
@@ -294,6 +303,7 @@ func (d *Daemon) up(m *proto.Msg) error {
 	// same project at once is ordinary.
 	if ch, busy := d.creating[name]; busy {
 		d.mu.Unlock()
+		pr.step("pod %s is already being created; waiting… ", name)
 		select {
 		case <-ch:
 		case <-time.After(2 * time.Minute):
@@ -303,6 +313,7 @@ func (d *Daemon) up(m *proto.Msg) error {
 		_, ok := d.pods[name]
 		d.mu.Unlock()
 		if ok {
+			pr.ok("ready")
 			return errAlreadyRunning(name)
 		}
 		return fmt.Errorf("pod %q failed to start; see the daemon log", name)
@@ -362,7 +373,7 @@ func (d *Daemon) up(m *proto.Msg) error {
 
 	// Remote directories are mounted on the host first, then bound in with the
 	// rest of the pod's filesystem.
-	fsm, err := d.mountRemotes(m, podRun)
+	fsm, err := d.mountRemotes(m, podRun, pr)
 	if err != nil {
 		ln.Close()
 		return err
@@ -398,7 +409,7 @@ func (d *Daemon) up(m *proto.Msg) error {
 // mountRemotes brings up every remote mount this pod needs, and refuses the
 // pod if any of them cannot be reached — at up time, where a person is
 // watching, rather than mid-run where an agent would meet it.
-func (d *Daemon) mountRemotes(m *proto.Msg, podRun string) (*fs.Manager, error) {
+func (d *Daemon) mountRemotes(m *proto.Msg, podRun string, pr *Progress) (*fs.Manager, error) {
 	if len(m.Remotes) == 0 {
 		return nil, nil
 	}
@@ -413,19 +424,25 @@ func (d *Daemon) mountRemotes(m *proto.Msg, podRun string) (*fs.Manager, error) 
 			return nil, fmt.Errorf("mount mode %q is not implemented yet", rm.Mode)
 		}
 		host := d.pool.Host(rm.Host)
+		pr.step("connecting to %s… ", rm.Host)
 		if err := host.Warm(); err != nil {
+			pr.failed()
 			fsm.Unmount()
 			return nil, err
 		}
+		pr.ok("connected")
 		point := filepath.Join(podRun, "mnt", fmt.Sprintf("%d", i))
 		mount := &fs.Mount{
 			Host: rm.Host, RemotePath: rm.Path, MountPoint: point,
 			At: rm.At, ReadOnly: rm.ReadOnly,
 		}
+		pr.step("mounting %s:%s via %s… ", rm.Host, rm.Path, backend.Name())
 		if err := fsm.Add(mount, host.SSHCommand()); err != nil {
+			pr.failed()
 			fsm.Unmount()
 			return nil, err
 		}
+		pr.ok("mounted")
 		m.Spec.Binds = append(m.Spec.Binds,
 			proto.Bind{Src: point, Dst: rm.At, ReadOnly: rm.ReadOnly})
 		d.logf("pod %s: mounted %s:%s at %s via %s", m.Spec.Name, rm.Host, rm.Path,

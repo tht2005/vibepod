@@ -73,16 +73,41 @@ func spawnDaemon() error {
 
 // call sends one request and returns the reply, turning a protocol error into
 // a Go error.
+//
+// A request may report progress before it answers. Creating a pod can mean
+// waiting on several machines, each with ten seconds to prove it exists, and a
+// wait that says nothing is indistinguishable from a hang.
 func call(c *proto.Conn, m *proto.Msg, fds ...int) (*proto.Msg, error) {
 	if err := c.Send(m, fds...); err != nil {
 		return nil, err
 	}
-	reply, _, err := c.Recv()
-	if err != nil {
-		return nil, err
+	partial := false
+	for {
+		reply, _, err := c.Recv()
+		if err != nil {
+			if partial {
+				fmt.Fprintln(os.Stderr)
+			}
+			return nil, err
+		}
+		if reply.Op == proto.OpProgress {
+			if !partial {
+				fmt.Fprint(os.Stderr, "vibepod: ")
+			}
+			fmt.Fprint(os.Stderr, reply.Detail)
+			if !reply.Partial {
+				fmt.Fprintln(os.Stderr)
+			}
+			partial = reply.Partial
+			continue
+		}
+		if partial {
+			// The step that was in progress never got its outcome.
+			fmt.Fprintln(os.Stderr)
+		}
+		if reply.Op == proto.OpErr {
+			return nil, fmt.Errorf("%s", reply.Err)
+		}
+		return reply, nil
 	}
-	if reply.Op == proto.OpErr {
-		return nil, fmt.Errorf("%s", reply.Err)
-	}
-	return reply, nil
 }

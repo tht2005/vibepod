@@ -214,6 +214,11 @@ would never have chosen.
 parent of — routed ones. For a pod-local exec it knows the command ended but
 not what it returned, so the field is absent rather than zero.
 
+**Waiting.** Creating a pod connects to every machine it mounts from, and each
+gets ten seconds to prove it exists. That wait reports itself — `connecting to
+gpu03… connected (240ms)` — and a failure names the step and says what to
+check, rather than printing ssh's own text at you.
+
 **Environment.** A routed command carries what you set for it — `VAR=v cmd`,
 or an `export` earlier in the same shell — and nothing else. Not your
 credentials, which is the promise above, and not your `PATH` or `HOME`, which
