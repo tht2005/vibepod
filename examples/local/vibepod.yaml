@@ -1,23 +1,28 @@
 # A pod with nothing remote in it.
 #
-# Everything runs here, so this tests only the machinery below the routing:
-# the namespace, the exec gate, and the shims. It needs no network, so it is
-# the first thing to try, and the first thing to blame if something is wrong.
+# Everything is on this machine, so this exercises the parts below the backend
+# model: the namespace, the recording shell, and the agent brief. It needs no
+# network, so it is the first thing to try and the first thing to blame.
 #
 #   cd examples/local
-#   vpctl run -- /bin/sh -c 'pwd; ls'
-#   vpctl tree
-#   vpctl log
+#   vibepod up
+#   vp run -- /bin/sh -c 'pwd; ls'
+#   vp tree
+#   vp log
 #
 # Then, for the real thing — an agent working in a pod, on this repo:
 #
-#   vpctl new              # opens the console; type `claude` at the prompt
+#   vp run claude          # or `vibepod` for the cockpit, then ⏎ on the session
 #
 # Inside the pod the agent can read ~/.claude (its own config and credentials)
 # and ~/Git/vibepod, and nothing else of yours: not ~/.ssh, not ~/Documents,
-# not another project. Check that from the console:
+# not another project. Check it:
 #
-#   ls ~/.ssh              # No such file or directory
+#   vp run -- /bin/sh -c 'ls ~/.ssh'     # No such file or directory
+#
+# And see what the agent was told about this pod:
+#
+#   vp brief
 pod: vibepod-local
 
 mounts:
@@ -31,4 +36,6 @@ host_access:
   - ~/.claude.json
 
 exec:
+  # The machine a new session opens on. With nothing mounted from elsewhere,
+  # `pod` is the only answer there is.
   default: pod

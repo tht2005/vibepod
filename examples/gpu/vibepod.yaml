@@ -1,27 +1,34 @@
 # A pod that edits here and runs on an MI250 box.
 #
 # The mount is 798K of a 131G tree on gpu03's CephFS. Nothing is copied: the
-# directory is mounted lazily over sftp, and any command whose working
-# directory is inside it runs *on gpu03*, against gpu03's own disk and its own
-# toolchain — ROCm, its Python, its GPUs.
+# directory is mounted lazily over sftp, at its own absolute path, so a path in
+# a traceback from gpu03 is a path you can open from here.
 #
 #   cd examples/gpu
-#   vpctl run -- /bin/sh -c 'cd /remote/vast0/duongnguyen/gpu-intern-26/amd_matrix_instruction_calculator && pwd && ls'
-#   vpctl log                # every command, and the machine it ran on
+#   vibepod up
+#   vp @gpu03 rocm-smi --showproductname     # the MI250s
+#   vp log                                    # every command, and where it ran
 #
-# The thing worth actually looking at — run these two and compare:
+# The machine is chosen, not guessed. These two are different on purpose:
 #
-#   vpctl run -- /bin/sh -c 'cd /remote/vast0/duongnguyen/gpu-intern-26/amd_matrix_instruction_calculator && rocm-smi --showproductname'
-#   vpctl run -- /bin/sh -c 'cd ~/Git/vibepod && rocm-smi'
+#   vp run -- /bin/sh -c 'rocm-smi'           # a wrapper in /vp/bin sends it to gpu03
+#   vp run -- /bin/sh -c '/usr/bin/rocm-smi'  # an absolute path this machine lacks: fails
 #
-# The first prints the MI250s. The second refuses, and says why: rocm-smi
-# exists only on a remote, and ~/Git/vibepod runs here. Same pod, same shell,
-# same agent — the directory decided.
+# To work over there rather than send one command at a time:
+#
+#   vp shell -on gpu03                        # a real shell on gpu03; `cd` sticks
+#   vibepod                                   # the cockpit: `b` moves a session
+#
+# And to have gpu03 hold this pod's whole tree at the same paths — needed when a
+# *second* machine is doing the compute:
+#
+#   vibepod up --push
+#   vp node add gpu03
 #
 # Mounted at /remote/vast0/... rather than /home/duongnguyen/..., because
 # `readlink -f $HOME` on gpu03 says that is the canonical path: it is what the
-# remote's own compilers and tracebacks will print, and therefore what has to
-# be openable from in here.
+# remote's own compilers and tracebacks print, and therefore what has to be
+# openable from in here.
 pod: gpu
 
 hosts:
@@ -30,24 +37,24 @@ hosts:
 mounts:
   - remote: gpu03:/remote/vast0/duongnguyen/gpu-intern-26/amd_matrix_instruction_calculator
     # readonly: true      # uncomment while you are still nervous
+    # What a machine must have before a pod on it may hold this mount. Checked
+    # before anything is copied anywhere.
+    requires: [/opt/rocm]
 
-  # Local, so you can see the split: commands here stay on this machine.
+  # Local, so you can see the split: this directory is on this machine, and a
+  # command with it as its working directory has nowhere else to go.
   - local: ~/Git/vibepod
 
-# Tools that exist on gpu03 and not on this laptop. A shim is normally
-# bind-mounted *over* a binary that is already here, so a tool this machine has
-# never heard of needs one placed for it. Named here, `rocm-smi` from a routed
-# directory goes to gpu03 like everything else.
+# Tools that belong on gpu03. Each gets a three-line wrapper in /vp/bin, which
+# leads PATH, so `rocm-smi` by name goes there from anywhere in the pod.
 remote_tools:
-  - rocm-smi
-  - rocminfo
-  - hipcc
+  gpu03: [rocm-smi, rocminfo, hipcc]
 
 host_access:
   - ~/.claude
   - ~/.claude.json
 
 exec:
-  # For a directory that matches no mount. Local is the safe default: a
-  # command has to be somewhere that belongs to gpu03 before it goes there.
+  # The machine a new session opens on. `pod` because the agent lives here and
+  # its own files are here; a session moves when you move it.
   default: pod

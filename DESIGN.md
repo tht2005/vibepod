@@ -1,15 +1,19 @@
 # vibepod — design
 
-> Status: **v1 built and verified** (M0-M2) — and **superseded in design by v2**,
-> which is what this document now describes. v1 routed commands by working
-> directory through a seccomp exec gate; using it showed that the mechanism
-> cannot be made trustworthy, so v2 replaces it with an explicit per-session
-> **backend** and a live shell on it (§3), adds runtime mounting (§9), makes the
-> TUI the primary surface, and solves compute-on-one-machine/data-on-another by
-> running a pod on **every** backend so the composed tree is uniform everywhere
-> (§6a) rather than translating paths. PLAN.md records what was measured before building
-> v1 and the six bugs verification found. §13 has the v2 milestones; §12 the
-> remaining unknowns.
+> Status: **v2 built and verified through M6** (M0-M2 were v1; M3-M6 replaced it).
+> v1 routed commands by working directory through a seccomp exec gate; using it
+> showed the mechanism cannot be made trustworthy, so v2 replaced it with an
+> explicit per-session **backend** and a live shell on it (§3), made the config a
+> live object (§9), made the TUI the primary surface, and solved
+> compute-on-one-machine/data-on-another by running a pod on **every** backend so
+> the composed tree is uniform everywhere (§6a) rather than translating paths.
+>
+> What is not built: `via: relay`, the forwarded-agent credential proxy, `toolbin:`
+> pushes, port forwards, reverse mounts, `sync` mode, and the control plane (M6a)
+> that would let `vp mount` converge a pod that already has node pods — today that
+> combination is a refusal naming the mount. §13 has the milestone list and what
+> each one cost; §12 the remaining unknowns. PLAN.md records what was measured
+> before v1.
 
 ## 1. Problem
 
@@ -41,7 +45,7 @@ Planes 1 and 2 are plumbing. Plane 3 is the product.
 
 ## 3. The mechanism
 
-A *backend*, a **live shell** on it per session, and a **dispatching shell** in the pod.
+A *backend*, a **live shell** on it per session, and a **recording shell** in the pod.
 
 This section replaced an earlier one. v1 routed by working directory through a seccomp
 `SECCOMP_RET_USER_NOTIF` gate on `execve`, redirecting with lazy bind-shims. That was
@@ -139,16 +143,28 @@ down, at the program, by two mechanisms that need no kernel help:
   This is the honest channel: all three agents read project instructions, which is the
   capability the gate was built to work around.
 
-### The dispatching shell
+### The recording shell
 
-The pod's `$SHELL` is vibepod's own, roughly sixty lines. It records the command line,
-consults the session's backend, and either runs the command in the pod or writes it into
-that backend's live shell.
+The pod's `$SHELL` is vibepod's own, about sixty lines. It records the command line and
+then runs it, by exec'ing the user's real shell in place.
 
 It is bypassable by anything that calls `execve` directly, and **that is the trade**: it
 catches what agents and humans actually do — they shell out — at a small fraction of the
 complexity of a seccomp gate, and it logs *command lines as written* rather than
 post-resolution `execve` argv, which is the more useful record.
+
+**It never dispatches**, and that is the resolution of the apparent tension between this
+section and the one above. Building it settled the question: there is no caller for a
+dispatching `-c`. An agent's `-c` is the wrapper described above and must stay here; a
+human's interactive session on another machine is not `vpsh` at all — it *is* that
+machine's shell, with the terminal wired to it, which is why `cd` and `export` stick
+without anything being reproduced. The two paths have different callers rather than a
+heuristic between them, so there is nothing to get wrong.
+
+What the recording shell does instead, when a session's backend is elsewhere, is say so:
+once per session, in the event stream, that shells run in the pod and `vp @host …` is how
+one command goes over there. Said once is information; said per command is noise; not said
+at all is how a surprise becomes a bug report.
 
 ### What crosses with a dispatched command
 
@@ -194,7 +210,7 @@ Three things, stated plainly because they were bought deliberately.
   running on the machine that owns the files. The seccomp gate caught exactly this. The
   mitigations are the FUSE cache and telling the agent to dispatch searches; neither is as
   good as catching it.
-- **The exec log narrows.** It records what the dispatching shell and `vp` see, which is
+- **The exec log narrows.** It records what the recording shell and `vp` see, which is
   every dispatch and every shelled-out command, but not a direct `execve` from a bundled
   binary. An `rm -rf /remote/gpu03/project` run *locally in the pod* still destroys real
   data on gpu03 through the mount, and now goes unrecorded unless it came through a shell.
@@ -216,40 +232,50 @@ interactive programs. This is the same line that separates the two dispatch path
 ## 4. Architecture
 
 ```
-┌─ your machine ─────────────────────────────────────────────────┐
-│                                                                │
-│  vp ──unix socket──► vibepod  (rootless user daemon)        │
-│                            ├─ pod registry & lifecycle         │
-│                            ├─ route table (path → host:path)   │
-│                            ├─ ssh ControlMaster pool           │
-│                            ├─ PTY buffers (dtach-style)        │
-│                            ├─ credential proxy                 │
-│                            └─ audit log                        │
-│                            ▲                                   │
-│  ┌─ pod "work" (bwrap namespace) │                             │
-│  │   vpinit (PID 1) ─────────────┤  holds ns; owns pod mounts  │
-│  │   vpsh ($SHELL in the pod) ───┤  logs, then runs or dispatch│
-│  │   /vp/bin wrappers ───────────┘  ahead of PATH              │
-│  │   /srv/api    ← sshfs  prod:/srv/api                        │
-│  │   ~/Git/notes ← bind   (local)                              │
-│  │   ~/.claude   ← bind   (local, rw)                          │
-│  │   claude / codex / opencode                                 │
-│  └────────────────────────────────────────────────────────────┘│
-└────────────────────────────────────────────────────────────────┘
-         │ ssh, multiplexed — private keys never enter the pod
+┌─ your machine ──────────────────────────────────────────────────┐
+│                                                                 │
+│  vp ──unix socket──► vibepod   (rootless user daemon)           │
+│                            ├─ pod registry & lifecycle          │
+│                            ├─ per-session backends              │
+│                            ├─ the mount list (live, ordered)    │
+│                            ├─ ssh ControlMaster pool            │
+│                            ├─ live shells, PTY buffers          │
+│                            └─ event stream / audit log          │
+│                            ▲                                    │
+│  ┌─ pod "work" (own user+mount+pid ns) │                        │
+│  │   vpinit (PID 1) ─────────────┤  holds ns; owns pod mounts   │
+│  │   vpsh ($SHELL in the pod) ───┤  records, then runs          │
+│  │   /vp/bin wrappers ───────────┤  ahead of PATH               │
+│  │   /vp/mnt ────────────────────┘  where a new mount arrives   │
+│  │   /remote/vast0/…  ← sshfs  gpu03:/remote/vast0/…            │
+│  │   ~/Git/notes      ← bind   (local)                          │
+│  │   ~/.claude        ← bind   (local, rw) — never replicated   │
+│  │   claude / codex / opencode                                  │
+│  └─────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────┘
+         │ ssh, multiplexed — private keys never enter a pod,
+         │ and never leave this machine
          ▼
-     prod · staging · build-box
+┌─ gpu05 ─────────────────────────┐   ┌─ gpu03 ──────────────────┐
+│  ~/.vp/bin/vibepod  (pushed)    │   │  sshd, and the data       │
+│  vpnode ──► vpinit              │──►│  /remote/vast0/…          │
+│  ┌─ node pod ──────────────────┐│   └──────────────────────────┘
+│  │  gpu05's own /usr /opt /dev ││   the composed zone, at the
+│  │  /remote/vast0/…  ← cached  ││   same paths, on every machine
+│  │  ~/Git/notes      ← cached  ││
+│  └────────────────────────────┘│
+└─────────────────────────────────┘
 ```
 
-### Components (one Go binary, five names via argv[0])
+### Components (one Go binary, five names via argv[0]; `vpsh` is its own)
 
 | Name | Role |
 |---|---|
-| `vp` | thin client and the verb surface: `use`, `@host`, `mount`, `hosts`, `log`, `tree` |
-| `vibepod` | rootless user daemon, auto-spawned on first use. Owns everything long-lived |
-| `vpinit` | PID 1 inside each pod. Holds the mount namespace open, performs every pod mount on its one capable thread — including mounts added long after `up` — reaps zombies, forwards signals |
-| `vpsh` | the pod's `$SHELL`. Records the command line, then runs it locally or writes it into the session backend's live shell |
-| `vpnode` | `vpinit` on a *backend machine*, pushed on consent: the node's pod. Builds the same composed tree over that node's own system layer, supervises its rclone cache, holds a renewable lease so a job survives a disconnect (§6a) |
+| `vp` | thin client and the verb surface: `use`, `@host`, `mount`, `node`, `hosts`, `log`, `tree` |
+| `vibepod` | the cockpit, the pod's lifecycle, and — as `vibepod daemon` — the rootless user daemon, auto-spawned on first use. Owns everything long-lived |
+| `vpinit` | PID 1 inside each pod, local or on a node. Holds the mount namespace open, performs every pod mount on its one capable thread — including mounts added long after `up` — reaps zombies, forwards signals |
+| `vpnode` | on a *backend machine*, pushed on consent: a small daemon that builds the node's pod over that machine's own system layer, makes its cached mounts, and answers spawn requests. `nodeexec` is the other half of a dispatch, reached by one ssh |
+| `vpsh` | a separate binary, the pod's `$SHELL`. Records the command line, then execs the user's real shell in place. Separate because it goes on the front of every command an agent runs, and a shell that linked in the whole client would be a strange thing to put there |
 
 `vpinit` exists because **a mount namespace only survives while a process is inside it.**
 Without it, detaching would destroy the pod.
@@ -852,8 +878,12 @@ mounts:
     cache: 200G                      # on each node's own local disk
     prefetch: true                   # many small files: copy up front, don't warm lazily
 
-remote_tools:                      # exist only on a remote; shimmed in /vp/bin
-  - rocm-smi                       # ahead of PATH, since nothing here to shadow
+remote_tools:                      # commands that belong on another machine
+  gpu-box: [rocm-smi, hipcc]       # a three-line wrapper in /vp/bin, ahead of PATH
+                                   # (a bare list also works when one machine is
+                                   #  obvious; the map says which, and a wrapper
+                                   #  called from a session that is in the pod has
+                                   #  to be told rather than guess between two)
 
 host_access:                       # bound from host into pod
   - ~/.claude
@@ -881,6 +911,10 @@ gitignored).
 Every field here is also settable while the pod runs (§9), and `vp save` writes the live
 state back. The file is a starting point and a snapshot, not a thing you restart for.
 
+Two fields in this example are not yet read: `via:` (a node uses its own ssh config, and the
+relay is unbuilt) and `lease:` (M6a). `toolbin:`, `ports:` and `expose_to:` are likewise
+accepted and unused. Everything else here is live.
+
 ## 9. Interface
 
 ### Command surface
@@ -895,21 +929,33 @@ vibepod up [name]             create pod, detached, no TUI         (scripts, CI)
 vibepod down [pod]            stop, unmount, disconnect
 vibepod doctor                namespaces, mounts, ssh reachability, toolchains
 
-vp use <host|pod>             move this session's backend
+vp use <host|pod> [-s N]     move this session's backend, or session N's
 vp backend                    which backend is this session on
 vp @host cmd ...              one command elsewhere; the mode does not change
 vp hosts                      machines this pod knows, mounted or not
+vp node [add|drop <host>]     the machines running a pod of their own (§6a)
 vp mount <host>:<path> [at]   connect and mount into a running pod
-vp unmount @host              unmount and disconnect
+vp unmount <path|@host>       unmount and disconnect
 vp cd @host                   go to a machine's directory
 vp where [@host]              what this directory is called on a machine, or the reverse
-vp shell [pod]                another independent terminal into a running pod
-vp attach [pod]               reattach to a detached session
-vp ps                         pods, backends, health
+vp shell [pod] [-on host] [-C dir]   another independent terminal into a running pod
+vp attach [pod] [session]     reattach to a detached session
+vp ps                         pods, sessions, backends
 vp tree [pod]                 mounts and live session/exec structure
 vp log [-f] [pod]             every dispatched and shelled command, and where it ran
-vp save                       write live state back to vibepod.yaml
+vp brief [pod]                the instructions the agent in this pod was given
+vp save [file]                write live state back to vibepod.yaml
 ```
+
+`vibepod up --push` grants, for the machines this config names, the one thing a node pod
+needs: a copy of the vibepod binary in `~/.vp/bin`. `vp node add <host>` is the same grant
+for one machine, and typing it *is* the consent — the cheapest form that is still explicit.
+Without it, a machine that needs a pod says so and says which command allows it.
+
+`-s N` exists because a session on another machine cannot move itself: nothing is installed
+there, so `vp` is not on that machine's PATH. That is the premise working as intended rather
+than a gap, and the way back is the machine that owns the session — `-s`, or `b` in the
+cockpit.
 
 Pods are **named** and globally listable, but a bare `vibepod`/`vibepod up` in a project
 directory takes its name from `./vibepod.yaml`.
@@ -1020,7 +1066,7 @@ approximate. Honest by default, deep when asked.
 
 **One data source, three renderings.** The daemon emits a single event stream (exec start,
 exec exit); the TUI's activity pane, `vp tree -f`, and `vp log -f` are all subscribers.
-Collection is solved by the dispatching shell — this is only a rendering problem.
+Collection is solved by the recording shell and by `vp` — this is only a rendering problem.
 
 ```
 vp tree --json                 # frugal: live in full, completed as counts
@@ -1069,16 +1115,25 @@ into the namespace. That socket is a control plane, and reading is not the same 
 
 | | pod socket | host socket |
 |---|---|---|
-| `tree`, `log`, `ps`, `where`, `hosts`, `backend` | ✓ | ✓ |
-| `use` (own session only) | ✓ | ✓ |
+| `tree`, `log`, `ps`, `where`, `hosts`, `backend`, `brief`, `node` (list) | ✓ | ✓ |
+| `@host cmd`, and every `/vp/bin` wrapper | ✓ | ✓ |
+| `use` — **own session only, enforced from `/proc`** | ✓ | ✓ *any session* |
 | `mount`, `unmount` | ✓ *allowlisted hosts only* | ✓ |
-| `down`, `save`, `up` | ✗ | ✓ |
+| `node add`/`drop`, `down`, `save`, `up` | ✗ | ✓ |
 
 v1 put a tty check on `use`, reasoning that an agent must not re-route itself. **v2 drops
 that**, because in v2 an agent choosing its own backend is the entire interface — it is how
 work reaches gpu03 at all. What was a privilege is now the mechanism, and the thing it was
 protecting (you not knowing where a command ran) is handled instead by the backend being
 explicit, per-session, and on screen.
+
+"Own session" is not the caller's word for it. Which session is asking is read from
+`/proc/<peer>/environ` — the kernel says which process is on the other end of the socket, and
+its inherited environment says which session it belongs to — so an agent can move itself and
+cannot move yours. From the host socket any session can be named, because those are yours.
+
+`node add` is on the host side for the same reason `mount` is allowlisted: it puts a binary
+on another machine. Nothing inside a pod can decide that.
 
 `mount` is where the real boundary moved, and it is a different kind of boundary: it opens a
 **network path** out of a sandbox built for containment, which no `rm -rf` does. So hosts
@@ -1206,6 +1261,14 @@ replays the buffer. Killing the pod kills everything inside it.
 | Remote credentials | forwarded ssh-agent socket, never a key | lets gpu05 read gpu03 as you, with nothing stored there and authority that dies with the connection |
 | Compute-node footprint | `vpnode` + `rclone` in `~/.vp/bin`, asked once per host | caching to a node's local disk needs a process on that node; the alternative is not a smaller footprint but no feature. Still no credentials, no agent, nothing system-wide |
 | Names | `vibepod` for the TUI, `vp` for verbs | one is opened, the other is typed constantly; `vpctl` was a mouthful for the common case |
+| Recording shell | `vpsh` records and runs; it never dispatches | building it showed there is no caller for a dispatching `-c`: an agent's wrapper must stay local, and an interactive session elsewhere is that machine's own shell. Different callers, not a heuristic |
+| Runtime mount transport | pod root is `MS_SLAVE`; mounts arrive in a staging bind and are moved to their place | the kernel refuses a bind whose source mount is in another namespace, however it is named — an `O_PATH` descriptor does not help, the check is on the mount. Propagation is the only thing that crosses. Verified, after the descriptor route was tried and refused |
+| One mount path | config mounts attach the same way `vp mount` does | a mount added at runtime that behaved differently from one in the file would be a second implementation of the only thing this program does |
+| Nesting | legal in a config, refused at runtime | order in a file is something its author chose; inserting into a live pod changes what the mounts above it mean while work is going on in them |
+| A lost terminal | is a detach, not an end | an agent halfway through something must not be killed by the disappearance of the thing that was watching it — which is the whole reason the daemon owns the pty |
+| Pushed binary identity | compared by hash, not version | a version string cannot tell one build of a development tree from another, and the symptom is a node quietly behaving like an older build. Same bad hour as the daemon's own build check, one machine out |
+| Dispatch with an unowned cwd | runs in the target's own home, said once | `vp @gpu05 rocm-smi` from your home directory has to work. A cwd belonging to a *third* machine is the dangerous case and stays refused |
+| Machines with no mounts | `hosts:` makes one a backend | a compute node with no data of its own is the case §6 is about, and it was unreachable while only mount owners counted |
 | Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; process startup is negligible against RTT |
 
 ## 12. Open questions
@@ -1214,7 +1277,7 @@ replays the buffer. Killing the pod kills everything inside it.
    allowlists, `--die-with-parent`) that our own root construction must re-derive.
 2. **How much the narrowed log costs in practice** — with the exec gate gone, a bundled
    binary's direct `execve` is unrecorded, including a destructive one against a mount
-   (§3, *What this costs*). Is the dispatching shell's coverage enough in real sessions, or
+   (§3, *What this costs*). Is the recording shell's coverage enough in real sessions, or
    does something cheaper than seccomp — read-only mounts by default, FUSE-level write
    logging — have to make up the difference?
 3. **rclone as a dependency** — vendor the binary, require it, or reconsider a custom
@@ -1228,14 +1291,18 @@ replays the buffer. Killing the pod kills everything inside it.
    start when the bound cannot be met, or write to a node-specific scratch that is already
    quota'd?
 6. **Backend switch mid-command** — a session's live remote shell may be busy when `vp use`
-   or `b` arrives. Queue the switch, refuse it, or open a second shell and leave the first
-   running?
+   or `b` arrives. Built as: open a second shell and leave the first running, with its cwd
+   and jobs intact. That is the behaviour people expect from tabs, and it is what makes
+   moving cheap — but it means a pod can hold several idle shells on several machines, and
+   nothing evicts them yet.
 7. **`host_access` defaults** — ship per-agent presets so the first run is not empty?
 8. **Reverse-mount transport** — sshfs slave over `ssh -R`, rclone serving sftp back
    through the tunnel, or a push-copy? Caching runs the opposite direction here.
-9. **Bind-shim accumulation** — one mount per distinct binary. Is there a ceiling worth
-   caring about, and do shims need eviction? Measured in practice: a full Claude Code
-   session shims a handful, so this is not urgent.
+9. **Relay without rclone** — `via: relay` wants this machine to serve a mount back to a
+   node, and the only credential-free server available is `rclone serve sftp`. sshfs's slave
+   mode would work with OpenSSH's `sftp-server`, but that serves the whole filesystem with
+   your permissions — including `~/.claude` — which is the opposite of the promise. So relay
+   depends on rclone being here. Accept the dependency, or is there a server worth writing?
 10. **Live-shell recovery** — a session-bound remote shell is state that a link drop
    destroys. Reopen it silently at the last known cwd, or surface the gap, given §7a's rule
    about never silently re-running a partially-applied command?
@@ -1251,12 +1318,22 @@ replays the buffer. Killing the pod kills everything inside it.
    only ever append?
 14. **Daemon upgrades** — the daemon outlives the binary that spawned it, so after an
    upgrade the running one is stale. `doctor` reports the mismatch; should the daemon
-   instead hand over, or refuse a client whose build differs?
+   instead hand over, or refuse a client whose build differs? A node's copy is now compared
+   by hash and re-pushed when it differs, which is the same problem solved one machine out —
+   the daemon could do the same to itself.
+15. **Idle shells and idle node pods** — a session that visited three machines holds three
+   shells; a pod that dispatched once to gpu05 holds a namespace there until `down`. Both
+   are cheap and neither is free. Evict on idleness, or leave them until the lease does it?
+16. **`/vp/bin` wrappers are fixed at `up`** — `remote_tools:` becomes a directory of
+   wrappers when the pod is built, and `vp mount` cannot add one to a running pod because
+   `/vp` is read-only by then. Rebuild the directory on change (it is a tmpfs vpinit owns),
+   or accept that new tools need `up`?
 
 ## 13. Milestones
 
-**v1 = M0-M2, built. v2 = M3-M7, not started.** M6a is the first distributed piece and is
-split out deliberately, so a single-node pod is trusted before a control plane sits on it.
+**M0-M2 were v1. M3-M6 replaced it and are built and verified; M6a and M7 are not.**
+M6a was split out deliberately, so a single-node pod is working and trusted before a
+control plane sits on it.
 
 - **M0 — the trick works. [done, then superseded]** Pod, seccomp exec gate, lazy bind-shim
   redirect, local binds only. It did work: Claude Code ran inside it with every exec
@@ -1267,60 +1344,93 @@ split out deliberately, so a single-node pod is trusted before a control plane s
 - **M2 — lifecycle. [done — v1 shipped here]** `vpinit`, detach/attach, PTY buffer, the
   event stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`, `doctor`.
 
-**v2 is a turn, not a continuation.** M3-M5 below assume §3's backend model. They are
-ordered so that each one is usable on its own.
+**v2 is a turn, not a continuation.** M3-M6 assume §3's backend model. They were built in
+order so that each one was usable on its own.
 
-- **M3 — backends.** Not started. Delete the exec gate, `vpsh`-as-shim, the bind-shim
-  machinery and most of `gate.go`. Add: per-session backend state, one live shell per
-  session per backend, the dispatching `$SHELL`, `/vp/bin` wrappers replacing `remote_tools`
-  shims, `vp use` / `vp backend` / `vp @host`. Success is `cd` persisting in an attached
-  gpu03 session, and the log still showing every shelled command.
-  *Net negative lines, which is the point.*
-- **M4 — live config.** Not started. `vp mount` / `vp unmount` into a running pod, a
-  swappable route table, `vp hosts` listing unmounted machines, `vp save`, the mount
-  allowlist. Mechanically cheap — §9 lists the four pieces that already exist — and it is
-  what lets an agent add a machine without losing its own context.
-- **M5 — the TUI.** Not started. The cockpit of §9: machines, sessions, activity, and
-  handoff on `⏎`. `console.go` is the rough draft; the new work is the handoff and the
-  keymap.
-- **M6 — node pods.** Not started. `vpnode` pushed on consent; a pod on one backend, built
-  as that node's system layer with the composed zone over it; `requires:` checked at `up`;
-  rclone on the node with a local-disk cache and write-back on close; `prefetch:`; `via:
-  auto` with its probe and explanation; the forwarded-agent credential proxy. Also `toolbin`
-  pushes and port forwards, which share the consent path.
-  Native binds for mounts the node owns, cached mounts for the rest.
-  Success is a training run whose data lives on gpu03, whose GPUs are gpu05's, and whose
-  every path is the same string on all three machines.
-  **Deliberately excludes the control plane** — one node, mounts fixed at `up`. §6a's
-  replication is M6a, so that the single-node case is working and trusted before anything
-  distributed is built on it.
-- **M6a — the control plane.** Not started, and the first genuinely distributed piece.
+- **M3 — backends. [done]** The exec gate, `vpsh`-as-shim, the bind-shim machinery,
+  `gate.go` and `seccomp.go` are gone. Per-session backend state, one live shell per session
+  per backend, the recording `$SHELL`, `/vp/bin` wrappers, `vp use` / `vp backend` /
+  `vp @host`, `VIBEPOD_BACKEND`, and the generated agent brief — which is now the primary
+  mechanism rather than a nicety, and is therefore built and tested rather than specified.
+  Verified by the two things §3 promised: `cd` persisting in an attached session on another
+  machine, and the log still showing every shelled command.
+  *Not net negative in lines: the gate's 350 came out, but the live shell, the brief and the
+  mount list are new capability rather than a swap.*
+- **M4 — live config. [done]** `vp mount` / `vp unmount` into a running pod, the route table
+  as an atomic pointer, `vp hosts` listing unmounted machines, `vp save`, the mount
+  allowlist. The piece §9 predicted would be the obstacle — the frozen route table — was the
+  easy half. The obstacle was the kernel: a bind whose source mount belongs to another mount
+  namespace is refused outright, so a mount the daemon makes reaches the pod only by
+  propagation, through a staging bind vpinit releases immediately. §11 records the route
+  that was tried first and refused.
+- **M5 — the cockpit. [done]** Machines, sessions, mounts and the live log; `m`, `u`, `b`,
+  `⏎`, `/`. Handoff rather than nesting, and the three bugs running it found are in the
+  commit: a blocking read loop, a session ended by a vanished terminal, and a shell judged
+  before its session was finished being built.
+- **M6 — node pods. [done, minus the transport half]** `vpnode` pushed on consent; a pod on a
+  backend built as that machine's system layer with the composed zone over it; `requires:`
+  checked before anything is copied; native binds for what the node owns and cached mounts
+  for the rest; `cache:` and `prefetch:`; dispatch and live shells inside the node pod.
+  Success was a command whose data lives on one machine, whose directory is the same string
+  on all of them, and which runs in a pod on a third.
+  **Deliberately excludes the control plane**, so a `vp mount` after a node pod exists is a
+  refusal naming the mount rather than a silent divergence.
+  Still missing: `via: relay` for a node with no path to the data, the forwarded-agent
+  credential proxy, `toolbin:` pushes and port forwards. A node uses its own ssh config, so
+  nothing is stored anywhere it was not already.
+- **M6a — the control plane. Not started**, and the first genuinely distributed piece.
   Per-mount generations, reconcile-on-reconnect, per-mount staleness surfaced in `vp ps` and
-  the TUI, dispatch refusal on a stale mount, append-only runtime ordering with the shadow
-  guard, two-phase unmount with the dirty-flush refusal, the lease, and adoption on
-  reconnect. Plus what replication does to the cache: per-file write tokens, invalidation
-  fanned out per mount to every holder, the origin-overlap refusal, and the connection
-  budget — §6a, *Many mounts, many caches*. This is what makes `vp mount` safe with more than one backend; until it lands,
-  a second backend means `down` and `up`.
-- **M7 — polish.** Not started. Reverse mounts (`expose_to:`) for "edit here, run there",
-  `sync` mode, and the rest of the tree's views from §9: `-x` to expand a remote subtree, `--running`,
-  `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
+  the cockpit, dispatch refusal on a stale mount (the *refusal* exists; the convergence does
+  not), append-only runtime ordering with the shadow guard (built), two-phase unmount with
+  the dirty-flush refusal, the lease, and adoption on reconnect. Plus what replication does
+  to the cache: per-file write tokens, invalidation fanned out per mount to every holder,
+  the origin-overlap refusal (built) and the connection budget. Until it lands, adding a
+  mount to a pod that has node pods means `down` and `up`.
+- **M7 — polish. Not started.** Reverse mounts (`expose_to:`) for "edit here, run there",
+  `sync` mode, and the rest of the tree's views from §9: `-x` to expand a remote subtree,
+  `--running`, `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
 
-### Gaps inside v1's own surface
+### What building M3-M6 cost, and what it found
 
-Specified here, not built in v1. Two of the three are absorbed by the v2 work above; the
-first is not, and matters more in v2 than it did in v1.
+Recorded because the design was wrong about two of these, and because each was found by
+running the thing rather than by reading it.
 
-- **The generated `CLAUDE.md` fragment** (§9, and a locked decision in §11). Half of
-  "knowing where things ran" — the half aimed at the agent — was never built. In v1 the
-  agent inherited routing whether it knew or not, so this was a nicety. **In v2 it is the
-  primary mechanism**: with no exec gate, an agent that has not been told about `vp` will
-  simply run everything in the pod, over FUSE, on the wrong machine. Build it in M3, not
-  after.
-- **`VIBEPOD_TARGET`** (§9) — never exported, so a prompt cannot show the target without
-  asking. Becomes `VIBEPOD_BACKEND` and falls out of M3.
-- **The `@host cmd` per-command override** (§5) — `@` ended up naming machines for
-  navigation instead, and the one-off override had no spelling. Specified in M3.
+- **A bind cannot cross a mount namespace.** `vp mount` was specified as "the route table
+  becomes swappable", which was the trivial part. The kernel refuses a bind whose source
+  mount is in another namespace — including through an `O_PATH` descriptor, because the check
+  is on the mount rather than the path — so the pod's root became `MS_SLAVE` and mounts
+  arrive by propagation into a staging bind. That also forced config mounts onto the same
+  path as runtime ones, which is better than what was specified.
+- **A daemonizing child inherits your pipes.** The readiness pipe a node pod reports through
+  leaked into `sshfs`, which daemonizes and held it open, so `up` hung *after everything had
+  already worked* — the worst shape of bug. Inherited descriptors do not carry
+  close-on-exec.
+- **`fusermount` will not touch a mount whose server died**, leaving a directory that fails
+  every access and cannot be removed. Plain `umount` still detaches it. This is why a node
+  kills, unmounts and clears before building, in that order: a namespace holding a bind pins
+  the filesystem, so unmounting first does nothing.
+- **A version string cannot identify a build.** The pushed binary is compared by hash.
+- **One ssh pty cannot be two sessions' controlling terminal**, so a shell in a node pod gets
+  a terminal of the pod's own and `nodeexec` relays. Without it there is no job control two
+  hops out; with it `fg` works.
+- **`hosts:` had no way to reach the daemon**, so a compute machine with no data of its own —
+  the case §6 exists for — was not a backend at all.
+
+### Gaps inside v1's own surface — all three closed in M3
+
+Specified but never built in v1, and each one mattered more in v2 than it had before:
+
+- **The generated agent brief** (§9, and a locked decision in §11). In v1 the agent
+  inherited its routing whether it knew or not, so telling it was a nicety. In v2 it is the
+  mechanism — with no exec gate, an agent that has not been told about `vp` runs everything
+  in the pod, over the network, on the wrong machine. Built in M3, linked at `/CLAUDE.md` and
+  `/AGENTS.md` inside the pod, regenerated when the mounts change, and readable with
+  `vp brief`.
+- **`VIBEPOD_TARGET`** — never exported, so a prompt could not show the machine without
+  asking. It is `VIBEPOD_BACKEND` now, set at session start, with `vp backend` as the live
+  answer for anything that needs one after a move.
+- **The `@host cmd` per-command override** — `@` had ended up naming machines for navigation
+  and the one-off override had no spelling. It is the shortest thing in the interface now.
 
 ### Built after the plan
 
