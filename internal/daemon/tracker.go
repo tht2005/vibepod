@@ -26,6 +26,9 @@ type execRec struct {
 	Start   time.Time
 	End     time.Time
 	Code    *int
+	// ExecID names the pid file a dispatched command left on the machine it went
+	// to, which is what lets `vp tree -x` find its children there.
+	ExecID string
 }
 
 func (r *execRec) done() bool { return !r.End.IsZero() }
@@ -252,5 +255,6 @@ func nodeOf(r *execRec) *proto.TreeNode {
 	return &proto.TreeNode{
 		PID: r.PID, Argv: r.Argv, Target: r.Target, State: state,
 		ElapsedMS: r.elapsedMS(), Code: r.Code, Session: r.Session,
+		StartedMS: r.Start.UnixMilli(), ExecID: r.ExecID,
 	}
 }

@@ -315,6 +315,20 @@ type TreeNode struct {
 	Code      *int       `json:"code,omitempty"`
 	Session   string     `json:"session,omitempty"`
 	Children  []TreeNode `json:"children,omitempty"`
+	// StartedMS is when it started, in Unix milliseconds, so `--since` can ask
+	// about age rather than duration.
+	StartedMS int64  `json:"started_ms,omitempty"`
+	ExecID    string `json:"exec_id,omitempty"`
+	// Remote is what `vp tree -x` found running under a dispatched command on the
+	// machine it went to. Polled and approximate: vibepod sees what it dispatched,
+	// not what that spawned, and does not pretend otherwise.
+	Remote []RemoteProc `json:"remote,omitempty"`
+}
+
+// RemoteProc is one process seen under a dispatched command by polling `ps`.
+type RemoteProc struct {
+	PID  int    `json:"pid"`
+	Args string `json:"args"`
 }
 
 // HostInfo is one machine a pod can run commands on. The pod itself counts as

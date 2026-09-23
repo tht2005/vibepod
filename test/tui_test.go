@@ -27,15 +27,17 @@ func TestCockpitShowsTheMachinesTheSessionsAndTheLog(t *testing.T) {
 	dir := livePod(t, "e2e-tui")
 	r := cockpit(t, dir, "e2e-tui")
 	defer r.stop()
+	// The cockpit draws as soon as it has anything and fills in as answers
+	// arrive, so each of these is waited for rather than expected in frame one.
 	for _, want := range []string{"MACHINES", "SESSIONS", "ACTIVITY", "MOUNTS",
 		"vptest", "backend", "⏎ attach", "q quit"} {
-		if !strings.Contains(r.out.String(), want) {
+		if !r.waitFor(t, want, 10*time.Second) {
 			t.Errorf("the cockpit does not show %q:\n%s", want, r.out.String())
 		}
 	}
 	// A machine it could mount but has not is listed with the command that would
 	// mount it: "what else is there" is the question `m` answers.
-	if !strings.Contains(r.out.String(), "vp mount vptest2") {
+	if !r.waitFor(t, "vp mount vptest2", 10*time.Second) {
 		t.Errorf("the cockpit does not offer the unmounted machine:\n%s",
 			r.out.String())
 	}

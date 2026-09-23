@@ -2,9 +2,13 @@ package daemon
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
 
 	"vibepod/internal/event"
 	"vibepod/internal/proto"
+	"vibepod/internal/route"
 )
 
 // streamLog replays what has happened and, if asked, keeps going.
@@ -56,5 +60,46 @@ func (d *Daemon) treeOf(m *proto.Msg) (*proto.Tree, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.tree(m.All), nil
+	t := s.tree(m.All)
+	if m.Detail == "expand" {
+		s.expandRemote(t)
+	}
+	return t, nil
+}
+
+// expandRemote is `vp tree -x`: for each command still running on another
+// machine, ask that machine what is running under it. vibepod knows what it
+// dispatched and not what that spawned, so this is a poll, it is marked as one,
+// and it only happens when asked.
+func (s *podState) expandRemote(t *proto.Tree) {
+	var wg sync.WaitGroup
+	var walk func(n *proto.TreeNode)
+	walk = func(n *proto.TreeNode) {
+		if n.State == "running" && n.ExecID != "" && n.Target != route.Pod {
+			wg.Add(1)
+			go func(n *proto.TreeNode) {
+				defer wg.Done()
+				lines, err := s.d.pool.Host(n.Target).Children(n.ExecID)
+				if err != nil {
+					return
+				}
+				for _, l := range lines {
+					pid, args, _ := strings.Cut(l, " ")
+					var p int
+					fmt.Sscan(pid, &p)
+					n.Remote = append(n.Remote, proto.RemoteProc{PID: p,
+						Args: strings.TrimSpace(args)})
+				}
+			}(n)
+		}
+		for i := range n.Children {
+			walk(&n.Children[i])
+		}
+	}
+	for i := range t.Sessions {
+		for j := range t.Sessions[i].Nodes {
+			walk(&t.Sessions[i].Nodes[j])
+		}
+	}
+	wg.Wait()
 }

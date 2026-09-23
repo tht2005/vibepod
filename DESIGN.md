@@ -1393,9 +1393,13 @@ order so that each one was usable on its own.
   Building it found that node pods were keyed by pod name alone, so two ssh aliases for one
   machine shared a pod and the second `node add` adopted the first's — they are keyed by
   pod *and* alias now.
-- **M7 — polish. Not started.** Reverse mounts (`expose_to:`) for "edit here, run there",
-  `sync` mode, and the rest of the tree's views from §9: `-x` to expand a remote subtree,
-  `--running`, `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
+- **M7 — polish. [tree views done; the rest not started]** The tree's views from §9 are
+  built: `-x` polls each running remote command's children and marks them as polled,
+  `--running`, `--failed --since 10m`, `vp tree <pid>` for one subtree, and
+  `--mounts`/`--exec` for one half — all renderings of the one tree the daemon already
+  sends. Reverse mounts (`expose_to:`) and `sync` mode are not built: both need this machine
+  to *serve* a directory to another, which is the same missing piece as `via: relay`, and
+  the only credential-safe server for it is `rclone serve sftp` (§12).
 
 ### What building M3-M6 cost, and what it found
 

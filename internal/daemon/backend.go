@@ -247,6 +247,9 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 	}
 	s.markUsed(backend)
 	id := fmt.Sprintf("%s-%d", s.name, execSeq.Add(1))
+	s.mu.Lock()
+	rec.ExecID = id
+	s.mu.Unlock()
 	if r.onStart != nil {
 		r.onStart(host, id)
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -365,7 +366,13 @@ func cmdTree(args []string) error {
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	all := fs.Bool("all", false, "include completed commands instead of a count")
 	follow := fs.Bool("f", false, "stream changes as NDJSON instead of a snapshot")
-	if err := fs.Parse(args); err != nil {
+	expand := fs.Bool("x", false, "ask each machine what is running under its commands")
+	running := fs.Bool("running", false, "only what is still running")
+	failed := fs.Bool("failed", false, "only what exited non-zero")
+	since := fs.Duration("since", 0, "only what started within this long, e.g. 10m")
+	mountsOnly := fs.Bool("mounts", false, "only the mounts half")
+	execOnly := fs.Bool("exec", false, "only the sessions half")
+	if err := fs.Parse(reorder(args)); err != nil {
 		return err
 	}
 	if *follow {
@@ -373,12 +380,28 @@ func cmdTree(args []string) error {
 		// following either is the same act: subscribe to it.
 		return streamEvents(fs.Arg(0))
 	}
+	// `vp tree 412` is one subtree; `vp tree work` is one pod. A number is a pid,
+	// because a pod called 412 is not a thing anyone does.
+	podName, root := "", 0
+	for _, a := range fs.Args() {
+		if n, err := strconv.Atoi(a); err == nil {
+			root = n
+		} else {
+			podName = a
+		}
+	}
 	c, err := connect()
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	reply, err := call(c, &proto.Msg{Op: proto.OpTree, Pod: podArg(fs.Arg(0)), All: *all})
+	m := &proto.Msg{Op: proto.OpTree, Pod: podArg(podName),
+		// What broke recently is in the history, which is only sent when asked.
+		All: *all || *failed || *since > 0}
+	if *expand {
+		m.Detail = "expand"
+	}
+	reply, err := call(c, m)
 	if err != nil {
 		return err
 	}
@@ -386,13 +409,126 @@ func cmdTree(args []string) error {
 	if t == nil {
 		return fmt.Errorf("no tree returned")
 	}
+	keep := treeFilter{running: *running, failed: *failed, root: root}
+	if *since > 0 {
+		keep.after = time.Now().Add(-*since).UnixMilli()
+	}
+	if keep.active() {
+		t = keep.apply(t)
+	}
+	if *mountsOnly {
+		t.Sessions = nil
+	}
+	if *execOnly {
+		t.Mounts = nil
+	}
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(t)
 	}
-	renderTree(t, *all)
+	renderTree(t, m.All, !*execOnly, !*mountsOnly)
 	return nil
+}
+
+// reorder puts flags before operands, so `vp tree work --running` works as well as
+// `vp tree --running work`. Go's flag package stops at the first operand.
+func reorder(args []string) []string {
+	var flags, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
+			if a == "--since" || a == "-since" {
+				if i+1 < len(args) {
+					i++
+					flags = append(flags, args[i])
+				}
+			}
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return append(flags, rest...)
+}
+
+// treeFilter is the views of §9 that are questions rather than layouts: what is
+// still running, what broke recently, one subtree. Done here, over the tree the
+// daemon already sends, because they are renderings of one data source.
+type treeFilter struct {
+	running bool
+	failed  bool
+	after   int64
+	root    int
+}
+
+func (f treeFilter) active() bool {
+	return f.running || f.failed || f.after > 0 || f.root > 0
+}
+
+func (f treeFilter) match(n proto.TreeNode) bool {
+	if f.running && n.State != "running" {
+		return false
+	}
+	if f.failed && (n.Code == nil || *n.Code == 0) {
+		return false
+	}
+	if f.after > 0 && n.StartedMS < f.after {
+		return false
+	}
+	return true
+}
+
+// prune keeps a node if it matches or anything under it does, so the answer still
+// shows *where* a failing command ran — its parents are the context.
+func (f treeFilter) prune(n proto.TreeNode) (proto.TreeNode, bool) {
+	var kids []proto.TreeNode
+	for _, c := range n.Children {
+		if k, ok := f.prune(c); ok {
+			kids = append(kids, k)
+		}
+	}
+	n.Children = kids
+	return n, f.match(n) || len(kids) > 0
+}
+
+func find(nodes []proto.TreeNode, pid int) *proto.TreeNode {
+	for i := range nodes {
+		if nodes[i].PID == pid {
+			return &nodes[i]
+		}
+		if n := find(nodes[i].Children, pid); n != nil {
+			return n
+		}
+	}
+	return nil
+}
+
+func (f treeFilter) apply(t *proto.Tree) *proto.Tree {
+	out := *t
+	out.Sessions = nil
+	out.Completed = 0
+	for _, s := range t.Sessions {
+		nodes := s.Nodes
+		if f.root > 0 {
+			n := find(nodes, f.root)
+			if n == nil {
+				continue
+			}
+			nodes = []proto.TreeNode{*n}
+		}
+		var kept []proto.TreeNode
+		for _, n := range nodes {
+			if k, ok := f.prune(n); ok {
+				kept = append(kept, k)
+			}
+		}
+		if len(kept) > 0 {
+			s.Nodes = kept
+			out.Sessions = append(out.Sessions, s)
+		}
+	}
+	return &out
 }
 
 // streamEvents is the daemon's own event stream, one object per line. The
@@ -421,10 +557,18 @@ func streamEvents(pod string) error {
 	}
 }
 
-func renderTree(t *proto.Tree, all bool) {
+func renderTree(t *proto.Tree, all, showMounts, showExec bool) {
 	fmt.Printf("%s · running %s · new sessions open on %s\n\n", t.Pod, t.Uptime,
 		t.Default)
+	if showMounts {
+		renderMounts(t)
+	}
+	if showExec {
+		renderSessions(t, all)
+	}
+}
 
+func renderMounts(t *proto.Tree) {
 	fmt.Println("mounts")
 	for i, m := range t.Mounts {
 		fmt.Printf("%s %-28s ← %-34s %-6s %s\n", branch(i, len(t.Mounts)),
@@ -435,7 +579,11 @@ func renderTree(t *proto.Tree, all bool) {
 			fmt.Printf("%s    meant for → %s\n", cont(i, len(t.Mounts)), m.ExecOn)
 		}
 	}
-	fmt.Println("\nsessions")
+	fmt.Println()
+}
+
+func renderSessions(t *proto.Tree, all bool) {
+	fmt.Println("sessions")
 	if len(t.Sessions) == 0 {
 		fmt.Println("  (none)")
 	}
@@ -477,6 +625,16 @@ func renderNode(n proto.TreeNode, prefix string, last bool) {
 	fmt.Printf("%s%s %-40s %-8s %7s %s\n", prefix, tee,
 		trim(condense(strings.Join(n.Argv, " ")), 40), n.Target, dur(n.ElapsedMS),
 		mark)
+	// What `-x` found on the far side, marked as polled: vibepod saw it by asking
+	// `ps`, not by starting it, and the difference is worth keeping visible.
+	for i, r := range n.Remote {
+		t := "├┄"
+		if i == len(n.Remote)-1 && len(n.Children) == 0 {
+			t = "└┄"
+		}
+		fmt.Printf("%s%s %-40s %-8s %s\n", next, t, trim(r.Args, 40), n.Target,
+			"(polled)")
+	}
 	for i, c := range n.Children {
 		renderNode(c, next, i == len(n.Children)-1)
 	}

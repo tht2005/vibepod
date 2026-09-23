@@ -158,3 +158,24 @@ func joinArgs(argv []string) string {
 	}
 	return strings.Join(out, " ")
 }
+
+// Children lists what is running under a dispatched command, by polling `ps` over
+// the multiplexed connection. Polled, so approximate: a process that started and
+// ended between two looks is not there, and one inside a node pod's own pid
+// namespace appears under that pod rather than under this command.
+func (h *Host) Children(id string) ([]string, error) {
+	script := fmt.Sprintf(`d=%s; p=$(cat "$d/%s" 2>/dev/null) || exit 0; `+
+		`ps -o pid=,args= --ppid "$p" 2>/dev/null; exit 0`, runDirExpr, id)
+	args := append(h.Opts(), h.Alias, "sh -c "+quote(script))
+	out, err := exec.Command("ssh", args...).Output()
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, l := range strings.Split(string(out), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines, nil
+}
