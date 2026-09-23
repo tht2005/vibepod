@@ -2,6 +2,22 @@ package route
 
 import "testing"
 
+func TestPathTranslation(t *testing.T) {
+	tbl := New(Pod, []Rule{
+		{Prefix: "/srv/api", Target: "prod", RemotePrefix: "/srv/api"},
+		{Prefix: "/staging-api", Target: "staging", RemotePrefix: "/srv/api"},
+	})
+	// Path identity: the directory means the same thing on both machines.
+	if d := Resolve(tbl, "/srv/api/src", ""); d.Dir != "/srv/api/src" {
+		t.Errorf("identity mount rewrote the path: %q", d.Dir)
+	}
+	// An explicit at: is the one case that needs translating back.
+	d := Resolve(tbl, "/staging-api/src", "")
+	if d.Target != "staging" || d.Dir != "/srv/api/src" {
+		t.Errorf("at: override resolved to %+v", d)
+	}
+}
+
 func TestRoutePrecedence(t *testing.T) {
 	tbl := New(Pod, []Rule{
 		{Prefix: "/srv", Target: "prod"},

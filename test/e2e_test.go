@@ -66,8 +66,37 @@ func setup(m *testing.M) (int, error) {
 	}
 	projectDir = tmp
 
+	// A real remote, if this machine can host one. Tests that need it skip
+	// when it is missing rather than failing for the wrong reason.
+	ssh, err = startSSHD(filepath.Join(tmp, "sshd"), 2223)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "e2e: remote tests will be skipped:", err)
+	} else {
+		defer ssh.stop()
+		remoteSrv = filepath.Join(tmp, "srv")
+		if err := os.MkdirAll(remoteSrv, 0o755); err != nil {
+			return 0, err
+		}
+		if err := os.WriteFile(filepath.Join(remoteSrv, "data.txt"),
+			[]byte("served from the remote\n"), 0o644); err != nil {
+			return 0, err
+		}
+		remoteDir = filepath.Join(tmp, "remote-project")
+		if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+			return 0, err
+		}
+		if err := os.WriteFile(filepath.Join(remoteDir, "vibepod.yaml"), []byte(
+			"pod: e2e-remote\nmounts:\n  - remote: vptest:"+remoteSrv+
+				"\n  - local: "+workDir+"\nexec:\n  default: pod\n"), 0o644); err != nil {
+			return 0, err
+		}
+	}
+
 	daemonP = exec.Command(filepath.Join(binDir, "vibepod"), "daemon", "-f")
 	daemonP.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+runDir)
+	if ssh != nil {
+		daemonP.Env = append(daemonP.Env, "VIBEPOD_SSH_CONFIG="+ssh.configFile)
+	}
 	daemonP.Stderr = os.Stderr
 	if err := daemonP.Start(); err != nil {
 		return 0, err
@@ -82,7 +111,12 @@ func setup(m *testing.M) (int, error) {
 	return m.Run(), nil
 }
 
-var projectDir string
+var (
+	projectDir string
+	remoteDir  string // project whose mount lives on the fixture host
+	remoteSrv  string // the directory the fixture serves
+	ssh        *sshFixture
+)
 
 func waitSock(path string) error {
 	deadline := time.Now().Add(5 * time.Second)
@@ -98,9 +132,17 @@ func waitSock(path string) error {
 // vpctl runs the client the way a user would, from the project directory.
 func vpctl(t *testing.T, args ...string) (string, string, int) {
 	t.Helper()
+	return vpctlIn(t, projectDir, args...)
+}
+
+func vpctlIn(t *testing.T, dir string, args ...string) (string, string, int) {
+	t.Helper()
 	cmd := exec.Command(filepath.Join(binDir, "vpctl"), args...)
-	cmd.Dir = projectDir
+	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+runDir)
+	if ssh != nil {
+		cmd.Env = append(cmd.Env, "VIBEPOD_SSH_CONFIG="+ssh.configFile)
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -188,5 +230,77 @@ func TestPsListsTheRunningPod(t *testing.T) {
 	}
 	if !strings.Contains(out, "e2e") {
 		t.Errorf("ps did not list the pod:\n%s", out)
+	}
+}
+
+// --- M1: remotes -----------------------------------------------------------
+
+// onRemote runs a shell command in the pod that has a remote mount.
+func onRemote(t *testing.T, script string) (string, string, int) {
+	t.Helper()
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	return vpctlIn(t, remoteDir, "run", "--", "/bin/sh", "-c", script)
+}
+
+// The whole premise: a command whose directory belongs to another machine
+// runs there, without the agent knowing anything about it.
+func TestCwdDecidesTheMachine(t *testing.T) {
+	out, errOut, code := onRemote(t, "cd "+remoteSrv+" && /usr/bin/env | grep -c SSH_CONNECTION")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if strings.TrimSpace(out) != "1" {
+		t.Errorf("command in a remote directory did not run over ssh: %q", out)
+	}
+}
+
+// ...and the converse: a local directory stays in the pod. Without this, the
+// routing rule would be "everything goes remote", which is not a rule.
+func TestLocalDirectoryStaysInThePod(t *testing.T) {
+	out, _, code := onRemote(t, "cd "+workDir+" && /usr/bin/env | grep -c SSH_CONNECTION || true")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if strings.TrimSpace(out) != "0" {
+		t.Errorf("command in a local directory was shipped to a remote: %q", out)
+	}
+}
+
+func TestRemoteFilesReadThroughTheMount(t *testing.T) {
+	// Read it with a pod-local tool, so this exercises FUSE and not ssh.
+	out, _, code := onRemote(t, "cd "+workDir+" && /usr/bin/cat "+
+		filepath.Join(remoteSrv, "data.txt"))
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(out, "served from the remote") {
+		t.Errorf("mount did not serve the remote file: %q", out)
+	}
+}
+
+// A routed command writes on the remote; the mount must show it afterwards.
+// This is the case a cached network filesystem gets wrong, and the one
+// vibepod can get right because it knows when the command finished.
+func TestWritesByARoutedCommandAreVisible(t *testing.T) {
+	name := "written-remotely.txt"
+	_, errOut, code := onRemote(t, "cd "+remoteSrv+" && /usr/bin/tee "+name+" </dev/null")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	out, _, _ := onRemote(t, "cd "+workDir+" && /usr/bin/ls "+remoteSrv)
+	if !strings.Contains(out, name) {
+		t.Errorf("a file written by a routed command is not visible through the mount: %q", out)
+	}
+}
+
+func TestRemoteExitCodeIsProxied(t *testing.T) {
+	for _, want := range []int{0, 3, 42} {
+		_, _, got := onRemote(t, fmt.Sprintf("cd %s && /usr/bin/env sh -c 'exit %d'",
+			remoteSrv, want))
+		if got != want {
+			t.Errorf("remote exit %d came back as %d", want, got)
+		}
 	}
 }

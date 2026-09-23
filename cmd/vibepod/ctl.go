@@ -86,9 +86,10 @@ func loadSpec(name string, shimAll bool) (*proto.Msg, error) {
 	if name != "" {
 		res.Name = name
 	}
-	if len(res.Remotes) > 0 {
-		return nil, fmt.Errorf("remote mounts are not implemented in this build "+
-			"(%s:%s)", res.Remotes[0].Host, res.Remotes[0].Path)
+	remotes := make([]proto.RemoteMount, 0, len(res.Remotes))
+	for _, rm := range res.Remotes {
+		remotes = append(remotes, proto.RemoteMount{Host: rm.Host, Path: rm.Path,
+			At: rm.At, ReadOnly: rm.ReadOnly, Mode: rm.Mode})
 	}
 	return &proto.Msg{
 		Op: proto.OpUp,
@@ -98,6 +99,7 @@ func loadSpec(name string, shimAll bool) (*proto.Msg, error) {
 			Hostname: res.Name,
 		},
 		Routes:      res.Routes,
+		Remotes:     remotes,
 		ExecDefault: res.ExecDefault,
 		ShimAll:     shimAll,
 	}, nil

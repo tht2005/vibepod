@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"vibepod/internal/fs"
 	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/route"
@@ -23,11 +24,13 @@ type podState struct {
 	table   *route.Table
 	shimAll bool
 	podLn   *net.UnixListener
+	fs      *fs.Manager
 
 	mu       sync.Mutex
 	shims    map[string]string // shadowed path -> stashed original
 	sessions map[string]*session
 	pins     map[string]string // session id -> pinned target
+	used     map[string]bool   // hosts this pod has routed to
 
 	rpcMu   sync.Mutex
 	nextID  uint64
@@ -164,5 +167,33 @@ func (s *podState) close() {
 	if s.podLn != nil {
 		_ = s.podLn.Close()
 	}
+	// Kill the pod first: its processes hold the mounts open.
 	s.p.Kill()
+	if s.fs != nil {
+		s.fs.Unmount()
+	}
+	for _, h := range s.hostsUsed() {
+		_ = s.d.pool.Host(h).Cleanup()
+	}
+}
+
+// hostsUsed lists the machines this pod ever routed to, so its remote state
+// can be cleaned up when it goes down.
+func (s *podState) hostsUsed() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.used))
+	for h := range s.used {
+		out = append(out, h)
+	}
+	return out
+}
+
+func (s *podState) markUsed(host string) {
+	s.mu.Lock()
+	if s.used == nil {
+		s.used = map[string]bool{}
+	}
+	s.used[host] = true
+	s.mu.Unlock()
 }

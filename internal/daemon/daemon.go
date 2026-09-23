@@ -16,14 +16,17 @@ import (
 	"syscall"
 	"time"
 
+	"vibepod/internal/fs"
 	"vibepod/internal/pod"
 	"vibepod/internal/proto"
+	"vibepod/internal/remote"
 	"vibepod/internal/route"
 )
 
 type Daemon struct {
 	runDir string
 	logger *log.Logger
+	pool   *remote.Pool
 
 	mu   sync.Mutex
 	pods map[string]*podState
@@ -43,8 +46,13 @@ func RunDir() string {
 
 func HostSock() string { return filepath.Join(RunDir(), "host.sock") }
 
-func New(runDir string, logger *log.Logger) *Daemon {
-	return &Daemon{runDir: runDir, logger: logger, pods: map[string]*podState{}}
+func New(runDir string, logger *log.Logger) (*Daemon, error) {
+	pool, err := remote.NewPool(filepath.Join(runDir, "ssh"))
+	if err != nil {
+		return nil, err
+	}
+	return &Daemon{runDir: runDir, logger: logger, pool: pool,
+		pods: map[string]*podState{}}, nil
 }
 
 func (d *Daemon) logf(format string, a ...any) {
@@ -76,6 +84,7 @@ func (d *Daemon) shutdown() {
 	for _, s := range pods {
 		s.close()
 	}
+	d.pool.Close()
 }
 
 // handle serves one client. host is false for connections arriving on a pod
@@ -164,16 +173,29 @@ func (d *Daemon) up(m *proto.Msg) error {
 	}
 	rules := make([]route.Rule, 0, len(m.Routes))
 	for _, r := range m.Routes {
-		rules = append(rules, route.Rule{Prefix: r.Prefix, Target: r.Target})
+		rules = append(rules, route.Rule{Prefix: r.Prefix, Target: r.Target,
+			RemotePrefix: r.RemotePrefix})
+	}
+
+	// Remote directories are mounted on the host first, then bound in with the
+	// rest of the pod's filesystem.
+	fsm, err := d.mountRemotes(m, podRun)
+	if err != nil {
+		ln.Close()
+		return err
 	}
 
 	p, err := pod.Start(m.Spec)
 	if err != nil {
+		if fsm != nil {
+			fsm.Unmount()
+		}
 		ln.Close()
 		return err
 	}
 	s := newPodState(d, name, p, route.New(m.ExecDefault, rules), m.ShimAll)
 	s.podLn = ln
+	s.fs = fsm
 
 	d.mu.Lock()
 	d.pods[name] = s
@@ -184,6 +206,45 @@ func (d *Daemon) up(m *proto.Msg) error {
 	go d.servePodSocket(s)
 	d.logf("pod %s up (vpinit pid %d)", name, p.Pid)
 	return nil
+}
+
+// mountRemotes brings up every remote mount this pod needs, and refuses the
+// pod if any of them cannot be reached — at up time, where a person is
+// watching, rather than mid-run where an agent would meet it.
+func (d *Daemon) mountRemotes(m *proto.Msg, podRun string) (*fs.Manager, error) {
+	if len(m.Remotes) == 0 {
+		return nil, nil
+	}
+	backend, err := fs.Pick()
+	if err != nil {
+		return nil, err
+	}
+	fsm := fs.NewManager(backend)
+	for i, rm := range m.Remotes {
+		if rm.Mode != "" && rm.Mode != "fuse" {
+			fsm.Unmount()
+			return nil, fmt.Errorf("mount mode %q is not implemented yet", rm.Mode)
+		}
+		host := d.pool.Host(rm.Host)
+		if err := host.Warm(); err != nil {
+			fsm.Unmount()
+			return nil, err
+		}
+		point := filepath.Join(podRun, "mnt", fmt.Sprintf("%d", i))
+		mount := &fs.Mount{
+			Host: rm.Host, RemotePath: rm.Path, MountPoint: point,
+			At: rm.At, ReadOnly: rm.ReadOnly,
+		}
+		if err := fsm.Add(mount, host.SSHCommand()); err != nil {
+			fsm.Unmount()
+			return nil, err
+		}
+		m.Spec.Binds = append(m.Spec.Binds,
+			proto.Bind{Src: point, Dst: rm.At, ReadOnly: rm.ReadOnly})
+		d.logf("pod %s: mounted %s:%s at %s via %s", m.Spec.Name, rm.Host, rm.Path,
+			rm.At, backend.Name())
+	}
+	return fsm, nil
 }
 
 func (d *Daemon) ps() []proto.PodInfo {

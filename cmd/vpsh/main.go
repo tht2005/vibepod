@@ -10,6 +10,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -56,10 +57,22 @@ func main() {
 	if err := c.Send(m, 0, 1, 2); err != nil {
 		fail("cannot send the command: %v", err)
 	}
+	// A routed command runs on another machine, where ssh will not forward a
+	// Ctrl-C without a PTY. Pass signals to the daemon instead; it kills the
+	// remote process over a second multiplexed channel.
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+	go func() {
+		for s := range sigs {
+			_ = c.Send(&proto.Msg{Op: proto.OpSignal, Sig: int(s.(syscall.Signal))})
+		}
+	}()
+
 	reply, _, err := c.Recv()
 	if err != nil {
 		fail("no answer from the daemon: %v", err)
 	}
+	signal.Stop(sigs)
 	switch reply.Op {
 	case proto.OpRunLocal:
 		// Run the original, which the daemon stashed before shadowing it.

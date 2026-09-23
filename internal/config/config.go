@@ -177,7 +177,8 @@ func (c *Config) Resolve() (*Resolved, error) {
 			}
 			r.Remotes = append(r.Remotes, RemoteMount{Host: host, Path: path,
 				At: at, ReadOnly: m.ReadOnly, Mode: mode})
-			r.Routes = append(r.Routes, proto.Route{Prefix: at, Target: target})
+			r.Routes = append(r.Routes, proto.Route{Prefix: at, Target: target,
+				RemotePrefix: path})
 
 		default:
 			return nil, fmt.Errorf("a mount needs local: or remote:")

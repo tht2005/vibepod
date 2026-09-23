@@ -69,8 +69,21 @@ type Spec struct {
 
 // Route is one cwd-to-machine rule, as resolved by vpctl from the config.
 type Route struct {
-	Prefix string `json:"prefix"`
-	Target string `json:"target"`
+	Prefix       string `json:"prefix"`
+	Target       string `json:"target"`
+	RemotePrefix string `json:"remote_prefix,omitempty"`
+}
+
+// RemoteMount is a directory on another machine to mount on the host and bind
+// into the pod. FUSE cannot be mounted from inside: the pod has no
+// capabilities and setuid is inert there, which is also why the agent cannot
+// tamper with a mount.
+type RemoteMount struct {
+	Host     string `json:"host"`
+	Path     string `json:"path"`
+	At       string `json:"at"`
+	ReadOnly bool   `json:"ro,omitempty"`
+	Mode     string `json:"mode,omitempty"`
 }
 
 // Msg is the single envelope for every link. Fields are shared rather than
@@ -100,7 +113,8 @@ type Msg struct {
 	Sig  int `json:"sig,omitempty"`
 	Code int `json:"code,omitempty"`
 
-	Routes      []Route `json:"routes,omitempty"`
+	Routes      []Route       `json:"routes,omitempty"`
+	Remotes     []RemoteMount `json:"remotes,omitempty"`
 	ExecDefault string  `json:"exec_default,omitempty"`
 	ShimAll     bool    `json:"shim_all,omitempty"`
 

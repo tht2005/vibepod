@@ -45,7 +45,10 @@ func runDaemon(args []string) error {
 	}
 	defer os.Remove(sock)
 
-	d := daemon.New(runDir, logger)
+	d, err := daemon.New(runDir, logger)
+	if err != nil {
+		return err
+	}
 	stop := make(chan os.Signal, 2)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
