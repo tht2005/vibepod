@@ -9,9 +9,13 @@ import (
 	"vibepod/internal/sys"
 )
 
-// execRec is one observed program launch. The exec gate sees every one of
-// them, which is why vibepod can answer "what is running, and where" in a way
-// pstree cannot: pstree stops at the machine boundary.
+// execRec is one command vibepod was told about: a line the pod's $SHELL
+// recorded, or a command `vp` dispatched. That is why vibepod can answer "what
+// is running, and where" in a way pstree cannot — pstree stops at the machine
+// boundary.
+//
+// It is no longer every execve. §3 records what that costs: a bundled binary
+// that spawns another at an absolute path is invisible here.
 type execRec struct {
 	PID     int
 	PPID    int
@@ -39,21 +43,24 @@ func (r *execRec) elapsedMS() int64 {
 // far less than not growing without limit.
 const maxExecs = 4000
 
-// recordExec notes a new program.
+// recordExec notes a new command.
 //
-// A pid can run several programs in turn — a shell commonly execs its last
-// command in place rather than forking — so an exec on a pid that is already
-// tracked is the *end* of what it was running. Treating it as an overwrite
-// would leave the tree attributing a shell's children to whatever it became.
+// A pid can report several commands in turn — the pod's $SHELL records a line and
+// then execs it, and a dispatching wrapper is one process per command — so a
+// record on a pid that is already tracked is the *end* of what it was running.
+// Treating it as an overwrite would leave the tree attributing a shell's children
+// to whatever it became.
 func (s *podState) recordExec(r *execRec) {
 	var replaced *execRec
 	s.mu.Lock()
-	if old, ok := s.execs[r.PID]; ok && !old.done() {
+	if old, ok := s.execs[r.PID]; ok && r.PID != 0 && !old.done() {
 		old.End = time.Now()
 		replaced = old
 		s.retire(old)
 	}
-	s.execs[r.PID] = r
+	if r.PID != 0 {
+		s.execs[r.PID] = r
+	}
 	s.mu.Unlock()
 
 	if replaced != nil {
@@ -82,15 +89,22 @@ func (s *podState) publishExit(r *execRec, detail string) {
 	})
 }
 
-// retarget corrects a record once vpsh reports where the command actually
-// went. The gate has to decide before the process has an identity; vpsh knows
-// the session, and therefore any pin.
-func (s *podState) retarget(pid int, target string) {
+// finishExec closes a record whose command vibepod was the parent of, which is
+// every dispatched one. A pod-local command is only observed, so its status stays
+// absent rather than invented — see watchExits.
+func (s *podState) finishExec(r *execRec, code int) {
 	s.mu.Lock()
-	if r, ok := s.execs[pid]; ok {
-		r.Target = target
+	if r.End.IsZero() {
+		r.End = time.Now()
 	}
+	c := code
+	r.Code = &c
+	if r.PID != 0 {
+		delete(s.execs, r.PID)
+	}
+	s.retire(r)
 	s.mu.Unlock()
+	s.publishExit(r, "")
 }
 
 // watchExits notices when tracked processes end.
@@ -153,44 +167,23 @@ func (s *podState) tree(all bool) *proto.Tree {
 	if all {
 		recs = append(recs, s.history...)
 	}
-	sessions := make([]string, 0, len(s.sessions))
-	for id := range s.sessions {
-		sessions = append(sessions, id)
-	}
 	s.mu.Unlock()
+	backends := map[string]string{}
+	for _, info := range s.live() {
+		backends[info.ID] = info.Backend
+	}
 	sort.Slice(recs, func(i, j int) bool { return recs[i].Start.Before(recs[j].Start) })
-	sort.Strings(sessions)
 
 	t := &proto.Tree{
-		Pod:         s.name,
-		Uptime:      time.Since(s.started).Truncate(time.Second).String(),
-		ExecDefault: s.table.Default,
+		Pod:     s.name,
+		Uptime:  time.Since(s.started).Truncate(time.Second).String(),
+		Default: s.table().Default,
 	}
-	for _, b := range s.p.Spec.Binds {
-		m := proto.TreeMount{At: b.Dst, Source: b.Src, Kind: "bind",
-			ReadOnly: b.ReadOnly, Target: "pod"}
-		t.Mounts = append(t.Mounts, m)
-	}
-	if s.fs != nil {
-		for i, fm := range s.fs.Mounts() {
-			// Remote mounts were appended to Binds in the same order.
-			idx := len(t.Mounts) - len(s.fs.Mounts()) + i
-			if idx >= 0 && idx < len(t.Mounts) {
-				t.Mounts[idx].Kind = s.fs.Backend()
-				t.Mounts[idx].Source = fm.Host + ":" + fm.RemotePath
-				t.Mounts[idx].Target = fm.Host
-			}
-		}
-	}
-	for _, r := range s.table.Rules() {
-		if r.Target == "pod" {
-			continue
-		}
-		for i := range t.Mounts {
-			if t.Mounts[i].At == r.Prefix {
-				t.Mounts[i].Target = r.Target
-			}
-		}
+	// The live mount list, in the order the mounts were added — which is the
+	// order that decides what shadows what, so it is the order to show.
+	for _, m := range s.mountList() {
+		t.Mounts = append(t.Mounts, proto.TreeMount{At: m.At, Source: m.source(),
+			Kind: m.Kind, Owner: m.Owner, ExecOn: m.ExecOn, ReadOnly: m.ReadOnly})
 	}
 
 	byPID := map[int]*proto.TreeNode{}
@@ -229,9 +222,16 @@ func (s *podState) tree(all bool) *proto.Tree {
 			id = "detached"
 		}
 		if sess[id] == nil {
-			sess[id] = &proto.TreeSession{ID: id}
+			sess[id] = &proto.TreeSession{ID: id, Backend: backends[id]}
 		}
 		sess[id].Nodes = append(sess[id].Nodes, *n)
+	}
+	// A session with nothing running is still a session, and which machine it is
+	// on is the fact the tree exists to show.
+	for id, backend := range backends {
+		if sess[id] == nil {
+			sess[id] = &proto.TreeSession{ID: id, Backend: backend}
+		}
 	}
 	ids := make([]string, 0, len(sess))
 	for id := range sess {

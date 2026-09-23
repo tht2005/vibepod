@@ -1,8 +1,10 @@
-// Package route decides which machine a command runs on.
+// Package route answers one question: what is this directory called on that
+// machine?
 //
-// The rule is "cwd decides", so an agent inherits routing without being told
-// anything: it runs commands where its files are, which is what it would do on
-// a normal machine.
+// It used to answer two, and the other one was wrong. v1 inferred the machine
+// from the working directory, through a seccomp exec gate; DESIGN.md §3 records
+// why that was removed. The machine is now chosen — it is the session's
+// backend — so all that is left here is the path map.
 package route
 
 import (
@@ -11,33 +13,31 @@ import (
 	"strings"
 )
 
-// Pod is the target meaning "run here, in the pod".
+// Pod is the backend meaning "run here, in the pod".
 const Pod = "pod"
 
-// Rule maps a directory subtree to the machine that owns it.
+// Rule maps a directory subtree in the pod to the machine whose filesystem it
+// is, and to what that machine calls it.
 type Rule struct {
 	Prefix string // pod-absolute path
-	Target string // Pod, or an ssh_config host alias
-	// RemotePrefix is where that subtree lives on Target. Under path identity
-	// it equals Prefix, and only an explicit `at:` makes them differ.
-	RemotePrefix string
+	Owner  string // Pod, or the ssh alias whose disk this is
+	// RemotePath is what Owner calls this subtree. Under path identity it
+	// equals Prefix, and only an explicit `at:` makes them differ.
+	RemotePath string
+	// ExecOn is a suggestion, not a rule: "the machine this directory is
+	// meant to run on". §5 — it is surfaced by `vp hosts`, the tree and the
+	// generated agent brief, and it never moves a command on its own.
+	ExecOn string
 }
 
-// Decision is a resolved route: the machine, and the directory to run in as
-// that machine sees it.
-type Decision struct {
-	Target string
-	Dir    string
-}
-
-// Table is the resolved route set for one pod.
+// Table is the resolved mount set for one pod.
 type Table struct {
 	rules   []Rule // longest prefix first
-	Default string
+	Default string // the backend a new session opens on
 }
 
-// New sorts rules so that the most specific match wins, which is what makes
-// an "at:" override of a nested directory behave the way a reader expects.
+// New sorts rules so that the most specific match wins, which is what makes an
+// `at:` override of a nested directory behave the way a reader expects.
 func New(def string, rules []Rule) *Table {
 	if def == "" {
 		def = Pod
@@ -49,58 +49,70 @@ func New(def string, rules []Rule) *Table {
 	return &Table{rules: sorted, Default: def}
 }
 
-// Resolve maps a working directory to a machine and the directory to use
-// there, in the precedence order of DESIGN.md §5: a session pin beats the
-// directory, the directory beats the default.
-func Resolve(t *Table, cwd, pin string) Decision {
-	// The pod's own machinery always runs locally, whatever the pin says:
-	// MCP servers and agent helpers must never be shipped to a remote.
-	if under(cwd, "/vp") {
-		return Decision{Target: Pod, Dir: cwd}
-	}
-	if pin != "" && pin != "auto" {
-		// A pin says nothing about paths, so the directory is passed through
-		// unchanged: it works when the target can see it, and fails visibly
-		// when it cannot.
-		return Decision{Target: pin, Dir: translate(t, cwd, pin)}
-	}
-	if t == nil {
-		return Decision{Target: Pod, Dir: cwd}
-	}
-	for _, r := range t.rules {
-		if under(cwd, r.Prefix) {
-			return Decision{Target: r.Target, Dir: rebase(cwd, r.Prefix, r.RemotePrefix)}
-		}
-	}
-	return Decision{Target: t.Default, Dir: cwd}
-}
-
-// Route is the target alone, for callers that do not need a directory.
-func Route(t *Table, cwd, pin string) string { return Resolve(t, cwd, pin).Target }
-
-// translate finds a rule that both contains cwd and belongs to the pinned
-// host, so an explicit `at:` still maps correctly under a pin.
-func translate(t *Table, cwd, pin string) string {
-	if t == nil {
+// Dir is what cwd is called on backend.
+//
+// Under path identity the answer is cwd itself, and that is the answer in every
+// case except an explicit `at:` — a mount deliberately given a different name
+// in the pod than it has at home. Then the two differ, and only the machine
+// that owns the subtree knows the other name.
+func Dir(t *Table, cwd, backend string) string {
+	if t == nil || backend == Pod {
 		return cwd
 	}
 	for _, r := range t.rules {
-		if r.Target == pin && under(cwd, r.Prefix) {
-			return rebase(cwd, r.Prefix, r.RemotePrefix)
+		if r.Owner == backend && under(cwd, r.Prefix) {
+			return rebase(cwd, r.Prefix, r.RemotePath)
 		}
 	}
 	return cwd
 }
 
-func rebase(cwd, prefix, remotePrefix string) string {
-	if remotePrefix == "" || remotePrefix == prefix {
+// Owner is the machine whose filesystem this directory is, which is not the
+// same question as where a command in it runs.
+func Owner(t *Table, cwd string) string {
+	if t == nil {
+		return Pod
+	}
+	for _, r := range t.rules {
+		if under(cwd, r.Prefix) {
+			return r.Owner
+		}
+	}
+	return Pod
+}
+
+// Suggest is the backend this directory says it would rather run on, or "".
+func Suggest(t *Table, cwd string) string {
+	if t == nil {
+		return ""
+	}
+	for _, r := range t.rules {
+		if under(cwd, r.Prefix) {
+			if r.ExecOn != "" {
+				return r.ExecOn
+			}
+			if r.Owner != Pod {
+				return r.Owner
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// Private reports whether a path is the pod's own machinery, which never
+// crosses to another machine: the socket, the wrappers, the agent's brief.
+func Private(path string) bool { return under(path, "/vp") }
+
+func rebase(cwd, prefix, remotePath string) string {
+	if remotePath == "" || remotePath == prefix {
 		return cwd
 	}
 	rest := strings.TrimPrefix(filepath.Clean(cwd), filepath.Clean(prefix))
-	return filepath.Join(remotePrefix, rest)
+	return filepath.Join(remotePath, rest)
 }
 
-// Rules exposes the table for rendering (vpctl tree).
+// Rules exposes the table for rendering (vp tree, vp hosts).
 func (t *Table) Rules() []Rule { return t.rules }
 
 func under(path, prefix string) bool {

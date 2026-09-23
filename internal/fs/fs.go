@@ -23,6 +23,10 @@ type Mount struct {
 	At         string // where it appears in the pod
 	ReadOnly   bool
 	backend    Backend
+	// rcAddr is this mount's own control address. Per mount, not per backend: a
+	// pod with three mounts runs three rclone processes, and one shared field
+	// would leave every invalidation going to whichever mounted last.
+	rcAddr string
 }
 
 // Backend is a way of making a remote directory readable locally. The choice
@@ -98,6 +102,20 @@ func (mg *Manager) InvalidateAfter(host string) {
 			continue
 		}
 	}
+}
+
+// Remove releases one mount, for `vp unmount`. The pod's bind is detached by
+// vpinit first; this is the FUSE mount underneath it.
+func (mg *Manager) Remove(m *Mount) {
+	mg.mu.Lock()
+	for i, x := range mg.mounts {
+		if x == m {
+			mg.mounts = append(mg.mounts[:i], mg.mounts[i+1:]...)
+			break
+		}
+	}
+	mg.mu.Unlock()
+	unmountPoint(m.MountPoint)
 }
 
 // Unmount releases every mount, lazily so that a dead link does not wedge

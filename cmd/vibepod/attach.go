@@ -1,11 +1,13 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/sys"
 	"vibepod/internal/term"
@@ -21,7 +23,7 @@ import (
 // terminal.
 func attachSend(c *proto.Conn, m *proto.Msg) (*term.State, error) {
 	if !term.IsTTY(os.Stdin) {
-		return nil, fmt.Errorf("this needs a terminal; use `vpctl run -- cmd` instead")
+		return nil, fmt.Errorf("this needs a terminal; use `vp run -- cmd` instead")
 	}
 	state, err := term.MakeRaw(os.Stdin.Fd())
 	if err != nil {
@@ -79,7 +81,7 @@ func sendInput(c *proto.Conn, b []byte) bool {
 }
 
 // attachOwningStdin is the whole flow for a command whose process exists only
-// to be that session: vpctl shell, vpctl attach, vpctl run on a terminal.
+// to be that session: vp shell, vp attach, vp run on a terminal.
 func attachOwningStdin(c *proto.Conn, m *proto.Msg) (int, error) {
 	state, err := attachSend(c, m)
 	if err != nil {
@@ -112,7 +114,7 @@ func attachOwningStdin(c *proto.Conn, m *proto.Msg) (int, error) {
 	}
 	if detached {
 		state.Restore()
-		fmt.Printf("\r\n[detached — vpctl attach %s to return]\r\n", m.Pod)
+		fmt.Printf("\r\n[detached — vp attach %s to return]\r\n", m.Pod)
 	}
 	return code, nil
 }
@@ -121,35 +123,37 @@ func attachOwningStdin(c *proto.Conn, m *proto.Msg) (int, error) {
 // `docker exec -it` does. A pod supports as many as you like, each with its
 // own working directory.
 func cmdShell(args []string) int {
-	name := ""
-	if len(args) > 0 {
-		name = args[0]
+	fs := flag.NewFlagSet("shell", flag.ContinueOnError)
+	on := fs.String("on", "", "open it on this machine instead of the pod's default")
+	if err := fs.Parse(args); err != nil {
+		return 2
 	}
-	m, err := loadSpec(name, false)
+	name := fs.Arg(0)
+	m, err := loadSpec(name)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
 	}
 	c, err := connect()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
 	}
 	defer c.Close()
 	if err := ensureUp(c, m); err != nil {
-		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
 	}
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
+	// The pod's own $SHELL, so that an interactive session's commands are
+	// recorded like any other. vpsh execs the user's real shell immediately; a
+	// session whose backend is another machine never reaches it at all, because
+	// that session *is* a shell over there.
 	code, err := attachOwningStdin(c, &proto.Msg{
-		Op: proto.OpSession, Pod: m.Spec.Name, Argv: []string{shell},
-		Env: os.Environ(), Cwd: podCwd(m.Spec.Binds),
+		Op: proto.OpSession, Pod: m.Spec.Name, Argv: []string{pod.ShellPath},
+		Env: os.Environ(), Cwd: podCwd(m.Mounts), Backend: *on,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
 	}
 	return code
@@ -157,29 +161,29 @@ func cmdShell(args []string) int {
 
 // cmdAttach reconnects to a session that kept running without you.
 func cmdAttach(args []string) int {
-	pod, session := "", ""
+	name, session := "", ""
 	if len(args) > 0 {
-		pod = args[0]
+		name = args[0]
 	}
 	if len(args) > 1 {
 		session = args[1]
 	}
-	if pod == "" {
-		if m, err := loadSpec("", false); err == nil {
-			pod = m.Spec.Name
+	if name == "" {
+		if m, err := loadSpec(""); err == nil {
+			name = m.Spec.Name
 		}
 	}
 	c, err := connect()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
 	}
 	defer c.Close()
 	code, err := attachOwningStdin(c, &proto.Msg{
-		Op: proto.OpAttach, Pod: pod, Session: session,
+		Op: proto.OpAttach, Pod: name, Session: session,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
 	}
 	return code

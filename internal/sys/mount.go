@@ -25,7 +25,8 @@ func Mount(src, dst, fstype string, flags uintptr, data string) error {
 }
 
 // BindOver binds src onto dst, creating dst as a file or directory to match.
-// This is the shim mechanism: dst is an existing binary, src is vpsh.
+// Every mount a pod has is one of these, whether it was made at `up` or an hour
+// later — vpinit keeps a thread with CAP_SYS_ADMIN for exactly that reason.
 func BindOver(src, dst string, readonly bool) error {
 	st, err := os.Stat(src)
 	if err != nil {
@@ -52,6 +53,16 @@ func BindOver(src, dst string, readonly bool) error {
 	}
 	if readonly {
 		return RemountReadOnly(dst)
+	}
+	return nil
+}
+
+// Unbind detaches a mount lazily, so a dead link cannot wedge the pod. Lazily
+// is the only honest option here: a process may still have a file open under it,
+// and the alternative is refusing to unmount a directory nobody can reach.
+func Unbind(dst string) error {
+	if err := syscall.Unmount(dst, syscall.MNT_DETACH); err != nil {
+		return fmt.Errorf("unmount %s: %w", dst, err)
 	}
 	return nil
 }

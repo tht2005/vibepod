@@ -1,10 +1,11 @@
-// Command vibepod is the whole program. It answers to several names:
+// Command vibepod is the whole program. It answers to four names:
 //
-//	vpctl    the user-facing client
-//	vibepod  the user daemon (vibepod daemon)
+//	vibepod  the cockpit and the pod's lifecycle — and the user daemon
+//	vp       the verb surface, inside a pod and out
 //	vpinit   PID 1 inside a pod (vibepod vpinit)
 //
-// vpsh is a separate binary; see its package comment for why.
+// vpsh is a separate binary: it is the pod's $SHELL, and a shell that linked in
+// the whole client would be a strange thing to put on the front of every command.
 package main
 
 import (
@@ -17,10 +18,7 @@ import (
 
 func main() {
 	args := os.Args[1:]
-	switch filepath.Base(os.Args[0]) {
-	case "vpctl":
-		os.Exit(runCtl(args))
-	}
+	name := filepath.Base(os.Args[0])
 	if len(args) > 0 {
 		switch args[0] {
 		case "vpinit":
@@ -37,5 +35,9 @@ func main() {
 			return
 		}
 	}
-	os.Exit(runCtl(args))
+	if name == "vpctl" {
+		fmt.Fprintln(os.Stderr, "vibepod: vpctl is now `vp` (and `vibepod` for the "+
+			"cockpit, up, down and doctor)")
+	}
+	os.Exit(runCli(args, name != "vp"))
 }

@@ -1,9 +1,9 @@
 # vibepod
 #
-# Two binaries: vibepod (which also answers to vpctl and vpinit) and vpsh.
-# vpsh is separate because a shim is never invoked under its own name — the
-# kernel reaches it through a bind mount, and argv[0] is whatever the caller
-# passed — so it identifies itself by /proc/self/exe instead.
+# Two binaries: vibepod (which also answers to vp and vpinit) and vpsh.
+# vpsh is separate because it is the pod's $$SHELL: it goes on the front of every
+# command an agent runs, and a shell that linked in the whole client would be a
+# strange thing to put there.
 
 VERSION := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 LDFLAGS := -X vibepod/internal/daemon.Version=$(VERSION)
@@ -17,10 +17,11 @@ build:
 	@mkdir -p bin
 	go build -ldflags "$(LDFLAGS)" -o bin/vibepod ./cmd/vibepod
 	go build -o bin/vpsh ./cmd/vpsh
-	@ln -sf vibepod bin/vpctl
+	@ln -sf vibepod bin/vp
 
-# The end-to-end tests create user namespaces, install seccomp filters and run
-# a real sshd on a high port, so they exercise the parts no unit test can.
+# The end-to-end tests create user namespaces and run a real sshd on a high port,
+# so they exercise the parts no unit test can: the kernel's cooperation, and a
+# live shell on another machine.
 test: build
 	go test ./... -count=1
 
@@ -32,10 +33,10 @@ install: build
 	install -d $(PREFIX)/bin
 	install -m755 bin/vibepod $(PREFIX)/bin/vibepod
 	install -m755 bin/vpsh $(PREFIX)/bin/vpsh
-	ln -sf vibepod $(PREFIX)/bin/vpctl
+	ln -sf vibepod $(PREFIX)/bin/vp
 
 doctor: build
-	./bin/vpctl doctor
+	./bin/vibepod doctor
 
 clean:
 	rm -rf bin

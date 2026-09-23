@@ -2,40 +2,68 @@ package route
 
 import "testing"
 
-func TestPathTranslation(t *testing.T) {
+func TestDirNamesADirectoryOnTheChosenMachine(t *testing.T) {
 	tbl := New(Pod, []Rule{
-		{Prefix: "/srv/api", Target: "prod", RemotePrefix: "/srv/api"},
-		{Prefix: "/staging-api", Target: "staging", RemotePrefix: "/srv/api"},
+		{Prefix: "/srv/api", Owner: "prod", RemotePath: "/srv/api"},
+		{Prefix: "/staging-api", Owner: "staging", RemotePath: "/srv/api"},
 	})
-	// Path identity: the directory means the same thing on both machines.
-	if d := Resolve(tbl, "/srv/api/src", ""); d.Dir != "/srv/api/src" {
-		t.Errorf("identity mount rewrote the path: %q", d.Dir)
+	// Path identity: the directory means the same thing on both machines, so
+	// there is nothing to translate and nothing that can go wrong.
+	if d := Dir(tbl, "/srv/api/src", "prod"); d != "/srv/api/src" {
+		t.Errorf("identity mount rewrote the path: %q", d)
 	}
-	// An explicit at: is the one case that needs translating back.
-	d := Resolve(tbl, "/staging-api/src", "")
-	if d.Target != "staging" || d.Dir != "/srv/api/src" {
-		t.Errorf("at: override resolved to %+v", d)
+	// An explicit at: is the one case that needs naming back.
+	if d := Dir(tbl, "/staging-api/src", "staging"); d != "/srv/api/src" {
+		t.Errorf("at: override named %q on staging", d)
+	}
+	// A machine that owns none of this path gets it unchanged, and finds out
+	// for itself whether it has one — which fails visibly rather than wrongly.
+	if d := Dir(tbl, "/staging-api/src", "gpu03"); d != "/staging-api/src" {
+		t.Errorf("a path was rewritten for a machine that owns no part of it: %q", d)
+	}
+	if d := Dir(tbl, "/srv/api/src", Pod); d != "/srv/api/src" {
+		t.Errorf("the pod's own path was rewritten: %q", d)
 	}
 }
 
-func TestRoutePrecedence(t *testing.T) {
+func TestOwnerIsTheMostSpecificMount(t *testing.T) {
 	tbl := New(Pod, []Rule{
-		{Prefix: "/srv", Target: "prod"},
-		{Prefix: "/srv/api/vendor", Target: Pod},
-		{Prefix: "/home/u/proj", Target: "gpu-box"},
+		{Prefix: "/srv", Owner: "prod"},
+		{Prefix: "/srv/api/vendor", Owner: Pod},
+		{Prefix: "/home/u/proj", Owner: Pod, ExecOn: "gpu-box"},
 	})
-	cases := []struct{ cwd, pin, want string }{
-		{"/srv/api", "", "prod"},
-		{"/srv/api/vendor/x", "", Pod},      // most specific rule wins
-		{"/home/u/proj/src", "", "gpu-box"}, // exec_on, not the mount owner
-		{"/elsewhere", "", Pod},             // falls back to the default
-		{"/srv/api", "gpu-box", "gpu-box"},  // a session pin overrides the directory
-		{"/vp/real/x", "gpu-box", Pod},      // pod machinery is never shipped out
-		{"/srvvv", "", Pod},                 // prefix match is path-aware
+	cases := []struct{ cwd, want string }{
+		{"/srv/api", "prod"},
+		{"/srv/api/vendor/x", Pod}, // the most specific rule wins
+		{"/home/u/proj/src", Pod},  // local files, whatever exec_on suggests
+		{"/elsewhere", Pod},
+		{"/srvvv", Pod}, // prefix matching is path-aware
 	}
 	for _, c := range cases {
-		if got := Route(tbl, c.cwd, c.pin); got != c.want {
-			t.Errorf("Route(%q, pin=%q) = %q, want %q", c.cwd, c.pin, got, c.want)
+		if got := Owner(tbl, c.cwd); got != c.want {
+			t.Errorf("Owner(%q) = %q, want %q", c.cwd, got, c.want)
 		}
+	}
+	// exec_on is a suggestion and says so; the mount's owner is the fallback
+	// suggestion for a remote directory.
+	if s := Suggest(tbl, "/home/u/proj/src"); s != "gpu-box" {
+		t.Errorf("exec_on was not surfaced as a suggestion: %q", s)
+	}
+	if s := Suggest(tbl, "/srv/api"); s != "prod" {
+		t.Errorf("a remote mount should suggest its owner, got %q", s)
+	}
+	if s := Suggest(tbl, "/srv/api/vendor/x"); s != "" {
+		t.Errorf("a local subtree suggested %q", s)
+	}
+}
+
+func TestPodMachineryIsPrivate(t *testing.T) {
+	for _, p := range []string{"/vp", "/vp/bin/vp", "/vp/run/pod.sock"} {
+		if !Private(p) {
+			t.Errorf("%s should be private to the pod", p)
+		}
+	}
+	if Private("/vpsomething") {
+		t.Error("prefix matching is not path-aware")
 	}
 }

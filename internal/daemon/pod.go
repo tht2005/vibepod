@@ -1,21 +1,17 @@
 package daemon
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"net"
-	"path/filepath"
-	"sync"
-	"time"
-
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"vibepod/internal/fs"
 	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/route"
-	"vibepod/internal/term"
 )
 
 // podState is everything the daemon keeps about one running pod.
@@ -24,23 +20,43 @@ type podState struct {
 	name    string
 	started time.Time
 	p       *pod.Pod
-	table   *route.Table
-	shimAll bool
 	podLn   *net.UnixListener
 	fs      *fs.Manager
+	// configPath is the file this pod was created from, so `vp save` writes
+	// back to it rather than guessing.
+	configPath string
 
-	shimOnce sync.Mutex
+	// tbl is swapped, never mutated. Three goroutines read it — the pod
+	// socket, the tree, and every dispatch — and `vp mount` replaces it while
+	// they do, which is the one piece §9 named as frozen.
+	tbl atomic.Pointer[route.Table]
 
 	mu       sync.Mutex
-	shims    map[string]string // shadowed path -> stashed original
 	sessions map[string]*session
-	pins     map[string]string // session id -> pinned target
-	// envMode is how much of a caller's environment crosses to a remote.
-	envMode    EnvPolicy
-	used       map[string]bool // hosts this pod has routed to
+	// backends is the heart of v2: one machine per session, chosen and never
+	// inferred. Absent means the pod's default.
+	backends map[string]string
+	// toldLocal remembers which sessions have already been told that their
+	// shell stays in the pod even though their backend is elsewhere. Said once
+	// is information; said every command is noise.
+	toldLocal map[string]bool
+	// mounts is the live mount list, in the order the mounts were added.
+	// Order is part of the state: it decides what shadows what.
+	mounts []*mountRec
+	// toolHosts maps a name in /vp/bin to the machine the config said has it.
+	toolHosts map[string]string
+	canMount  []string
+	envMode   EnvPolicy
+	used      map[string]bool // machines this pod has reached
+	// waits is how a pod process's exit code gets back to whoever started it.
+	// vpinit reports exits by pid, and a session can hold several processes —
+	// one shell per backend it has visited — so the pid is the only key that
+	// identifies one.
+	waits      map[int]chan int
 	sessionSeq int
+	mountCount int
 	// pendingSession names the session whose first process has been asked for
-	// but has not yet reached execve.
+	// but has not yet started.
 	pendingSession string
 	execs          map[int]*execRec // the program each live pid is running
 	history        []*execRec       // programs that have ended
@@ -52,36 +68,24 @@ type podState struct {
 	pending map[uint64]chan rpcReply
 }
 
-type session struct {
-	id   string
-	kind string // "console", "shell", "agent"
-	pid  int
-	argv []string
-	// env is the baseline this session started with. A routed command carries
-	// the difference between its own environment and this, which is exactly
-	// what the caller set and nothing else.
-	env  []string
-	done chan int
-
-	master *os.File
-	ring   *term.Ring
-
-	mu      sync.Mutex
-	clients map[*attachment]bool
-}
-
-func newPodState(d *Daemon, name string, p *pod.Pod, t *route.Table, shimAll bool) *podState {
-	return &podState{
-		d: d, name: name, p: p, table: t, shimAll: shimAll,
-		started:  time.Now(),
-		shims:    map[string]string{},
-		sessions: map[string]*session{},
-		pins:     map[string]string{},
-		execs:    map[int]*execRec{},
-		pending:  map[uint64]chan rpcReply{},
-		stopped:  make(chan struct{}),
+func newPodState(d *Daemon, name string, p *pod.Pod, t *route.Table) *podState {
+	s := &podState{
+		d: d, name: name, p: p,
+		started:   time.Now(),
+		sessions:  map[string]*session{},
+		backends:  map[string]string{},
+		toldLocal: map[string]bool{},
+		waits:     map[int]chan int{},
+		execs:     map[int]*execRec{},
+		pending:   map[uint64]chan rpcReply{},
+		stopped:   make(chan struct{}),
 	}
+	s.tbl.Store(t)
+	return s
 }
+
+// table is the current path map. Callers must not hold it across a mount.
+func (s *podState) table() *route.Table { return s.tbl.Load() }
 
 // readLoop demultiplexes vpinit's replies. Requests carry an id; anything
 // without one is an event.
@@ -95,11 +99,12 @@ func (s *podState) readLoop() {
 		}
 		if m.Op == proto.OpExited {
 			s.mu.Lock()
-			sess := s.sessions[m.Session]
+			ch := s.waits[m.Pid]
+			delete(s.waits, m.Pid)
 			s.mu.Unlock()
-			if sess != nil {
+			if ch != nil {
 				select {
-				case sess.done <- m.Code:
+				case ch <- m.Code:
 				default:
 				}
 			}
@@ -117,15 +122,15 @@ func (s *podState) readLoop() {
 	}
 }
 
-// call sends a request to vpinit and waits for its reply. Everything it is
-// used for is a local syscall away, so a slow reply means something is wrong
-// rather than merely busy.
 // rpcReply pairs vpinit's answer with any descriptor it handed back.
 type rpcReply struct {
 	msg *proto.Msg
 	fds []int
 }
 
+// call sends a request to vpinit and waits for its reply. Everything it is used
+// for is a local syscall away, so a slow reply means something is wrong rather
+// than merely busy.
 func (s *podState) call(m *proto.Msg, fds ...int) (*proto.Msg, error) {
 	r, err := s.callFD(m, fds...)
 	if err != nil {
@@ -165,56 +170,53 @@ func (s *podState) callFD(m *proto.Msg, fds ...int) (rpcReply, error) {
 	}
 }
 
-// ensureShim makes vpsh stand in for path, stashing the original first so the
-// shim can still run it. Called while the calling process is frozen in execve,
-// so it must finish before the reply or the redirect misses.
-func (s *podState) ensureShim(path string) (string, error) {
-	// One binding per binary, even when several processes reach it at once:
-	// a second bind would stack a shim on top of a shim.
-	s.shimOnce.Lock()
-	defer s.shimOnce.Unlock()
-
+// spawnInPod starts a process in the pod and returns its pid and a channel that
+// will carry its exit code. Registering the waiter before the spawn is not
+// tidiness: vpinit reports the exit, and a short-lived process can finish before
+// the reply to the spawn has been read.
+func (s *podState) spawnInPod(m *proto.Msg, fds ...int) (int, chan int, *os.File, error) {
+	wait := make(chan int, 1)
+	s.claimSession(m.Session)
+	reply, err := s.callFD(m, fds...)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	var master *os.File
+	if len(reply.fds) == 1 {
+		master = os.NewFile(uintptr(reply.fds[0]), "pty")
+	} else {
+		closeAll(reply.fds)
+	}
+	pid := reply.msg.Pid
 	s.mu.Lock()
-	if stash, ok := s.shims[path]; ok {
+	s.waits[pid] = wait
+	s.mu.Unlock()
+	return pid, wait, master, nil
+}
+
+// runToCompletion starts a process in the pod and waits for it, which is what
+// `vp @pod cmd` and a non-terminal `vp run` both are.
+func (s *podState) runToCompletion(m *proto.Msg, fds []int) (int, error) {
+	pid, wait, master, err := s.spawnInPod(m, fds...)
+	if err != nil {
+		return 0, err
+	}
+	if master != nil {
+		master.Close()
+	}
+	select {
+	case code := <-wait:
+		return code, nil
+	case <-s.stopped:
+		s.mu.Lock()
+		delete(s.waits, pid)
 		s.mu.Unlock()
-		return stash, nil
+		return 0, fmt.Errorf("pod %s went down while %v was running", s.name, m.Argv)
 	}
-	s.mu.Unlock()
-
-	sum := sha256.Sum256([]byte(path))
-	stash := filepath.Join(pod.StashDir,
-		hex.EncodeToString(sum[:8])+"-"+filepath.Base(path))
-
-	// Order matters: once vpsh is bound over path, the original is
-	// unreachable by name.
-	if _, err := s.call(&proto.Msg{Op: proto.OpBind, Src: path, Dst: stash}); err != nil {
-		return "", fmt.Errorf("stash %s: %w", path, err)
-	}
-	if _, err := s.call(&proto.Msg{Op: proto.OpBind, Src: pod.ShimPath, Dst: path}); err != nil {
-		return "", fmt.Errorf("shim %s: %w", path, err)
-	}
-	s.mu.Lock()
-	s.shims[path] = stash
-	s.mu.Unlock()
-	s.d.logf("pod %s: shimmed %s (stash %s)", s.name, path, stash)
-	return stash, nil
 }
 
-// stashOf reports where the original of a shadowed binary now lives.
-func (s *podState) stashOf(path string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	stash, ok := s.shims[path]
-	return stash, ok
-}
-
-// claimSession labels a session's first process.
-//
-// The exec gate reads a process's environment before execve replaces it, so
-// the very first exec of a session still carries vpinit's environment and not
-// the session token. Everything descended from it inherits the token
-// normally; only the root needs this. It is identified by its parent, which
-// is vpinit itself.
+// claimSession labels a session's first process, which is identified by having
+// vpinit as its parent.
 func (s *podState) claimSession(id string) {
 	s.mu.Lock()
 	s.pendingSession = id
@@ -233,7 +235,7 @@ func (s *podState) sessionForRoot(ppid int) string {
 }
 
 // baselineEnv is the environment a session started with, against which a
-// command's own environment is a delta.
+// dispatched command's environment is a delta.
 func (s *podState) baselineEnv(sessionID string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -241,12 +243,6 @@ func (s *podState) baselineEnv(sessionID string) []string {
 		return sess.env
 	}
 	return nil
-}
-
-func (s *podState) pinOf(sessionID string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.pins[sessionID]
 }
 
 func (s *podState) close() {
@@ -258,7 +254,18 @@ func (s *podState) close() {
 	if s.podLn != nil {
 		_ = s.podLn.Close()
 	}
-	// Kill the pod first: its processes hold the mounts open.
+	// Live shells on other machines first: each is an ssh, and killing the pod
+	// does not reach them.
+	s.mu.Lock()
+	sessions := make([]*session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+	for _, sess := range sessions {
+		sess.close()
+	}
+	// Then the pod: its processes hold the mounts open.
 	s.p.Kill()
 	if s.fs != nil {
 		s.fs.Unmount()
@@ -268,8 +275,8 @@ func (s *podState) close() {
 	}
 }
 
-// hostsUsed lists the machines this pod ever routed to, so its remote state
-// can be cleaned up when it goes down.
+// hostsUsed lists the machines this pod ever reached, so its remote state can
+// be cleaned up when it goes down.
 func (s *podState) hostsUsed() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()

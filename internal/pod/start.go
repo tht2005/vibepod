@@ -12,15 +12,14 @@ import (
 
 // Pod is the daemon's handle on a running pod.
 type Pod struct {
-	Spec   *proto.Spec
-	Pid    int // host pid of vpinit
-	Conn   *proto.Conn
-	GateFD int // seccomp listener: every exec in the pod arrives here
-	cmd    *exec.Cmd
+	Spec *proto.Spec
+	Pid  int // host pid of vpinit
+	Conn *proto.Conn
+	cmd  *exec.Cmd
 }
 
-// Start clones vpinit into fresh namespaces and waits for it to hand back the
-// exec gate.
+// Start clones vpinit into fresh namespaces and waits for it to say the pod
+// exists.
 //
 // The capability hand-off is the subtle part: the child holds a full set in the
 // new user namespace, but execve would drop it for a non-root euid, so
@@ -68,6 +67,7 @@ func Start(spec *proto.Spec) (*Pod, error) {
 		return nil, fmt.Errorf("send spec: %w", err)
 	}
 	m, fds, err := conn.Recv()
+	closeAll(fds)
 	if err != nil {
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("await pod: %w", err)
@@ -76,26 +76,17 @@ func Start(spec *proto.Spec) (*Pod, error) {
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("vpinit: %s", m.Err)
 	}
-	if m.Op != proto.OpHello || len(fds) != 1 {
+	if m.Op != proto.OpHello {
 		_ = cmd.Process.Kill()
-		return nil, fmt.Errorf("expected hello with the listener fd, got %q with %d fds",
-			m.Op, len(fds))
+		return nil, fmt.Errorf("expected hello from vpinit, got %q", m.Op)
 	}
-	p := &Pod{Spec: spec, Pid: cmd.Process.Pid, Conn: conn, GateFD: fds[0], cmd: cmd}
-	if err := conn.Send(&proto.Msg{Op: proto.OpOK}); err != nil {
-		p.Kill()
-		return nil, err
-	}
-	return p, nil
+	return &Pod{Spec: spec, Pid: cmd.Process.Pid, Conn: conn, cmd: cmd}, nil
 }
 
 func (p *Pod) Kill() {
 	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
 		_, _ = p.cmd.Process.Wait()
-	}
-	if p.GateFD > 0 {
-		syscall.Close(p.GateFD)
 	}
 	if p.Conn != nil {
 		_ = p.Conn.Close()

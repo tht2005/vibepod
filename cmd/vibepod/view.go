@@ -13,10 +13,10 @@ import (
 	"vibepod/internal/proto"
 )
 
-// podArg resolves which pod a command means, in the order that surprises
-// least: what you named, then the pod you are inside, then the one this
-// project declares. An agent in a pod never has to know its own name, and a
-// person in a project directory never has to type one.
+// podArg resolves which pod a command means, in the order that surprises least:
+// what you named, then the pod you are inside, then the one this project
+// declares. An agent in a pod never has to know its own name, and a person in a
+// project directory never has to type one.
 func podArg(name string) string {
 	if name != "" {
 		return name
@@ -24,10 +24,33 @@ func podArg(name string) string {
 	if p := os.Getenv("VIBEPOD_POD"); p != "" {
 		return p
 	}
-	if m, err := loadSpec("", false); err == nil {
+	if m, err := loadSpec(""); err == nil {
 		return m.Spec.Name
 	}
 	return ""
+}
+
+// cmdCd exists for the cockpit, which is the only caller that *can* change a
+// working directory — its own. Anywhere else a process changing its caller's
+// directory is impossible, so this says so and points at the composable form
+// rather than failing silently.
+func cmdCd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: vp cd @machine[/subdir]")
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	dir, target, err := machineDir(c, podArg(""), args[0])
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("cannot change the working directory of the shell that "+
+		"called me.\n  In the cockpit, `cd %s` works.\n"+
+		"  In a shell:  cd \"$(vp where -q %s)\"\n"+
+		"  That is %s, on @%s", args[0], args[0], short(dir), target)
 }
 
 // cmdLog renders what has run and where. log and tree pair rather than
@@ -76,28 +99,53 @@ func cmdLog(args []string) error {
 	}
 }
 
-// shellNames are wrappers, not commands.
+// condense makes an agent's shell wrapper readable. Display only: the event
+// stream and --json carry the line exactly as it was written, because that is
+// what the log is for.
 //
-// A shell is never routed — it stays in the pod by design, so that an agent's
-// generated wrapper keeps its environment snapshot and its cwd tracking — and
-// everything it runs is logged in its own right. Printing both says the same
-// thing twice, and the second line is the one that carries a machine.
-var shellNames = map[string]bool{
-	"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true,
-	"fish": true, "busybox": true,
-}
-
-func isShell(argv []string) bool {
-	if len(argv) == 0 {
-		return false
+// The wrapper is real and measured — Claude Code runs every command as
+// `zsh -c 'source <snapshot> && setopt … && eval <the command> && pwd -P >| …'`
+// — and printing it whole fills the log with forty characters of prelude and
+// none of the command. Each rule below removes one part of that shape and
+// nothing else; anything it does not recognise is printed untouched.
+func condense(line string) string {
+	// The prelude: a chain of `… && …` whose early links are the environment
+	// snapshot and shell options.
+	for {
+		head, rest, ok := strings.Cut(line, " && ")
+		if !ok {
+			break
+		}
+		h := strings.TrimSpace(head)
+		if strings.HasPrefix(h, "source ") || strings.HasPrefix(h, ". ") ||
+			strings.HasPrefix(h, "setopt ") || strings.HasPrefix(h, "shopt ") ||
+			strings.HasPrefix(h, "unsetopt ") {
+			line = rest
+			continue
+		}
+		break
 	}
-	return shellNames[filepath.Base(argv[0])]
+	// The cwd capture at the end, which is how the agent tracks `cd` between
+	// calls — bookkeeping, not a command.
+	for _, sep := range []string{" && pwd -P", " ; pwd -P", "; pwd -P"} {
+		if i := strings.Index(line, sep); i > 0 {
+			line = line[:i]
+		}
+	}
+	line = strings.TrimSpace(line)
+	// `eval '<the command>'`, which is the command itself with one layer of
+	// quoting around it.
+	if rest, ok := strings.CutPrefix(line, "eval "); ok {
+		rest = strings.TrimSpace(rest)
+		if len(rest) > 1 && (rest[0] == '\'' || rest[0] == '"') &&
+			rest[len(rest)-1] == rest[0] {
+			line = strings.ReplaceAll(rest[1:len(rest)-1], "'\\''", "'")
+		}
+	}
+	return strings.TrimSpace(line)
 }
 
 func logLine(e event.Event, follow, all bool) string {
-	if !all && isShell(e.Argv) {
-		return ""
-	}
 	ts := "        "
 	if t, err := time.Parse(time.RFC3339Nano, e.Time); err == nil {
 		ts = t.Format("15:04:05")
@@ -115,18 +163,24 @@ func logLine(e event.Event, follow, all bool) string {
 			}
 		}
 		return fmt.Sprintf("%s  %-8s %-40s %s %s", ts, e.Target,
-			trim(strings.Join(e.Argv, " "), 40), mark, dur(e.ElapsedMS))
+			trim(condense(strings.Join(e.Argv, " ")), 40), mark, dur(e.ElapsedMS))
 	case event.KindExec:
 		if !follow {
 			return "" // unfinished work belongs to the tree
 		}
 		return fmt.Sprintf("%s  %-8s %-40s ●", ts, e.Target,
-			trim(strings.Join(e.Argv, " "), 40))
+			trim(condense(strings.Join(e.Argv, " ")), 40))
 	case event.KindPod:
 		return fmt.Sprintf("%s  %-8s pod %s %s", ts, "-", e.Pod, e.Detail)
+	case event.KindSession:
+		if !follow {
+			return ""
+		}
+		return fmt.Sprintf("%s  %-8s session %s %s", ts, orDash(e.Target),
+			e.Session, e.Detail)
 	case event.KindNotice:
 		return fmt.Sprintf("%s  %-8s %-40s %s", ts, e.Target,
-			trim(strings.Join(e.Argv, " "), 40), e.Detail)
+			trim(condense(strings.Join(e.Argv, " ")), 40), e.Detail)
 	}
 	return ""
 }
@@ -166,6 +220,11 @@ func renderHosts(hosts []proto.HostInfo) string {
 		switch {
 		case h.Local:
 			status = "here"
+		case !h.Mounted:
+			// A machine in your ssh config that this pod has not mounted. It is
+			// listed because `vp mount` can reach it, which is the answer to
+			// "what else is there".
+			status = "not mounted"
 		case !h.Connected:
 			status = "not connected"
 		}
@@ -173,8 +232,11 @@ func renderHosts(hosts []proto.HostInfo) string {
 			status += " · default"
 		}
 		dir := "(no directory of its own)"
-		if len(h.Dirs) > 0 {
+		switch {
+		case len(h.Dirs) > 0:
 			dir = short(h.Dirs[0])
+		case !h.Mounted:
+			dir = "vp mount " + h.Name + ":/path"
 		}
 		fmt.Fprintf(&b, "  @%-10s %-20s %s\n", h.Name, status, dir)
 		for _, extra := range h.Dirs[1:] {
@@ -231,14 +293,26 @@ func cmdWhere(args []string) error {
 		return err
 	}
 	if *quiet {
-		fmt.Println(reply.Target)
+		fmt.Println(reply.Backend)
 		return nil
 	}
-	if reply.Target == "pod" {
-		fmt.Printf("%s runs here, in the pod\n", short(cwd))
-		return nil
+	// Two facts, deliberately separate, because v1 conflated them and got both
+	// wrong: whose files these are, and where a command here would run.
+	owner := "this machine"
+	if reply.Target != "pod" {
+		owner = "@" + reply.Target
 	}
-	fmt.Printf("%s runs on @%s, as %s\n", short(cwd), reply.Target, reply.Path)
+	if reply.Backend == "pod" {
+		fmt.Printf("%s belongs to %s; commands from this session run here, in the pod\n",
+			short(cwd), owner)
+	} else {
+		fmt.Printf("%s belongs to %s; commands from this session run on @%s, where it is %s\n",
+			short(cwd), owner, reply.Backend, reply.Path)
+	}
+	if reply.Detail != "" && reply.Detail != reply.Backend {
+		fmt.Printf("  this directory suggests @%s — `vp use %s`\n",
+			reply.Detail, reply.Detail)
+	}
 	return nil
 }
 
@@ -344,22 +418,32 @@ func streamEvents(pod string) error {
 }
 
 func renderTree(t *proto.Tree, all bool) {
-	fmt.Printf("%s · running %s · exec: %s\n\n", t.Pod, t.Uptime, t.ExecDefault)
+	fmt.Printf("%s · running %s · new sessions open on %s\n\n", t.Pod, t.Uptime,
+		t.Default)
 
 	fmt.Println("mounts")
 	for i, m := range t.Mounts {
 		fmt.Printf("%s %-28s ← %-34s %-6s %s\n", branch(i, len(t.Mounts)),
 			trim(short(m.At), 28), trim(short(m.Source), 34), m.Kind, rw(m.ReadOnly))
-		if m.Target != "" && m.Target != "pod" {
-			fmt.Printf("%s    exec_on → %s\n", cont(i, len(t.Mounts)), m.Target)
+		// A suggestion, printed as one: it is what the directory says it is for,
+		// not where anything actually goes.
+		if m.ExecOn != "" {
+			fmt.Printf("%s    meant for → %s\n", cont(i, len(t.Mounts)), m.ExecOn)
 		}
 	}
-	fmt.Println("\nexec")
+	fmt.Println("\nsessions")
 	if len(t.Sessions) == 0 {
-		fmt.Println("  (nothing running)")
+		fmt.Println("  (none)")
 	}
 	for i, s := range t.Sessions {
-		fmt.Printf("%s session %s\n", branch(i, len(t.Sessions)), s.ID)
+		label := fmt.Sprintf("session %s", s.ID)
+		if s.Backend != "" {
+			label += "  on " + s.Backend
+		}
+		if s.Kind != "" {
+			label += "  (" + s.Kind + ")"
+		}
+		fmt.Printf("%s %s\n", branch(i, len(t.Sessions)), label)
 		prefix := "│  "
 		if i == len(t.Sessions)-1 {
 			prefix = "   "
@@ -369,7 +453,7 @@ func renderTree(t *proto.Tree, all bool) {
 		}
 	}
 	if !all && t.Completed > 0 {
-		fmt.Printf("\n(%d completed — vpctl tree --all to expand)\n", t.Completed)
+		fmt.Printf("\n(%d completed — `vp tree --all` to expand)\n", t.Completed)
 	}
 }
 
@@ -387,7 +471,8 @@ func renderNode(n proto.TreeNode, prefix string, last bool) {
 		mark = fmt.Sprintf("✗ %d", *n.Code)
 	}
 	fmt.Printf("%s%s %-40s %-8s %7s %s\n", prefix, tee,
-		trim(strings.Join(n.Argv, " "), 40), n.Target, dur(n.ElapsedMS), mark)
+		trim(condense(strings.Join(n.Argv, " ")), 40), n.Target, dur(n.ElapsedMS),
+		mark)
 	for i, c := range n.Children {
 		renderNode(c, next, i == len(n.Children)-1)
 	}
@@ -405,6 +490,13 @@ func cont(i, n int) string {
 		return "  "
 	}
 	return "│ "
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func rw(ro bool) string {
@@ -435,9 +527,44 @@ func short(p string) string {
 	return p
 }
 
+// trim shortens a string to n printable columns, leaving escape sequences whole:
+// cutting one in half leaves the terminal in whatever mode it named.
 func trim(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	if !strings.ContainsRune(s, 0x1b) && len(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	var b strings.Builder
+	count, esc := 0, false
+	for _, r := range s {
+		if esc {
+			b.WriteRune(r)
+			if r == 'm' || r == 'K' || r == 'J' || r == 'H' {
+				esc = false
+			}
+			continue
+		}
+		if r == 0x1b {
+			esc = true
+			b.WriteRune(r)
+			continue
+		}
+		if count == n-1 && visibleLen(s) > n {
+			b.WriteString("…")
+			// Close anything that was opened, so the rest of the line is not
+			// painted in whatever colour we cut away from.
+			if strings.ContainsRune(s, 0x1b) {
+				b.WriteString(reset)
+			}
+			return b.String()
+		}
+		if count >= n {
+			break
+		}
+		b.WriteRune(r)
+		count++
+	}
+	return b.String()
 }

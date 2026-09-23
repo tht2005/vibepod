@@ -50,18 +50,8 @@ func RunInit() error {
 		return err
 	}
 
-	gateFD, err := sys.InstallExecGate()
-	if err != nil {
-		return fmt.Errorf("install exec gate: %w", err)
-	}
-	if err := conn.Send(&proto.Msg{Op: proto.OpHello, Pid: os.Getpid()}, gateFD); err != nil {
-		return fmt.Errorf("export listener fd: %w", err)
-	}
-	syscall.Close(gateFD)
-	if m, _, err := conn.Recv(); err != nil {
-		return fmt.Errorf("await gate ack: %w", err)
-	} else if m.Op != proto.OpOK {
-		return fmt.Errorf("gate not accepted: %s", m.Err)
+	if err := conn.Send(&proto.Msg{Op: proto.OpHello, Pid: os.Getpid()}); err != nil {
+		return fmt.Errorf("announce the pod: %w", err)
 	}
 
 	in := &initServer{
@@ -96,6 +86,7 @@ type initServer struct {
 type bindReq struct {
 	src, dst string
 	readonly bool
+	remove   bool
 	reply    chan error
 }
 
@@ -112,12 +103,17 @@ type spawnRes struct {
 }
 
 // mountWorker is pinned to the one thread that keeps CAP_SYS_ADMIN. Every
-// mount in the pod happens here, for the pod's whole life: lazy shims arrive
-// long after startup.
+// mount in the pod happens here, for the pod's whole life — which is what makes
+// `vp mount` into a running pod possible at all: a machine added an hour in is
+// the same bind as one named in the config.
 func (s *initServer) mountWorker(ready chan<- error) {
 	runtime.LockOSThread()
 	ready <- nil
 	for req := range s.binds {
+		if req.remove {
+			req.reply <- sys.Unbind(req.dst)
+			continue
+		}
 		req.reply <- sys.BindOver(req.src, req.dst, req.readonly)
 	}
 }
@@ -140,11 +136,11 @@ func (s *initServer) spawnWorker(ready chan<- error) {
 
 // serve dispatches, and never waits.
 //
-// This matters more than it looks. Starting a process means forking and
-// waiting for its execve to complete — and that execve traps to the daemon,
-// which may need to ask vpinit to bind a shim before it will let it through.
-// A serve loop that waited for the spawn it was performing would be waiting
-// on a message it is itself responsible for reading.
+// A serve loop that waited for the work it dispatched would be waiting on a
+// message it is itself responsible for reading. That cost a real deadlock once,
+// when a spawn's execve had to be answered by this same loop; the gate that
+// caused it is gone, but a bind requested while a spawn is in flight has the
+// same shape, so the rule stays.
 func (s *initServer) serve() error {
 	for {
 		m, fds, err := s.conn.Recv()
@@ -153,7 +149,7 @@ func (s *initServer) serve() error {
 			return nil
 		}
 		switch m.Op {
-		case proto.OpBind:
+		case proto.OpBind, proto.OpUnbind:
 			go s.handleBind(m)
 		case proto.OpSpawn:
 			go s.handleSpawn(m, fds)
@@ -169,7 +165,8 @@ func (s *initServer) serve() error {
 
 func (s *initServer) handleBind(m *proto.Msg) {
 	reply := make(chan error, 1)
-	s.binds <- &bindReq{src: m.Src, dst: m.Dst, readonly: m.ReadOnly, reply: reply}
+	s.binds <- &bindReq{src: m.Src, dst: m.Dst, readonly: m.ReadOnly,
+		remove: m.Op == proto.OpUnbind, reply: reply}
 	if err := <-reply; err != nil {
 		s.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
 		return

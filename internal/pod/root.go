@@ -12,16 +12,26 @@ import (
 )
 
 // Paths inside a pod. /vp is the pod's own machinery: the socket back to the
-// daemon, the shim binary, and the stash of the binaries the shim shadows.
+// daemon, the two binaries, and the wrappers that lead PATH.
 const (
-	VpDir    = "/vp"
-	RunDir   = "/vp/run"
-	SockPath = "/vp/run/pod.sock"
-	ShimPath = "/vp/bin/vpsh"
-	CtlPath  = "/vp/bin/vpctl"
-	BinDir   = "/vp/bin"
-	StashDir = "/vp/real"
+	VpDir     = "/vp"
+	RunDir    = "/vp/run"
+	SockPath  = "/vp/run/pod.sock"
+	ShellPath = "/vp/bin/vpsh"
+	VpPath    = "/vp/bin/vp"
+	BinDir    = "/vp/bin"
+	// BriefPath is the generated agent instruction file. It lives under
+	// /vp/run, which is a bind of the pod's own runtime directory on the host,
+	// so the daemon can rewrite it when a mount is added without asking vpinit
+	// for anything.
+	BriefPath = "/vp/run/brief.md"
 )
+
+// briefLinks are where an agent will actually look. All three read a project
+// instruction file from the working directory upwards, so a copy at the root of
+// the pod's filesystem is found without anyone editing a repository — which is
+// the point: the pod must not write into the user's checkout.
+var briefLinks = []string{"/CLAUDE.md", "/AGENTS.md"}
 
 // systemBinds are mounted read-only into every pod. They are the host's own
 // toolchain, which is the point: nothing is installed to run an agent here.
@@ -87,6 +97,9 @@ func buildRoot(spec *proto.Spec) error {
 	if err := buildVp(in(VpDir), spec); err != nil {
 		return err
 	}
+	if err := writeBrief(root, spec); err != nil {
+		return err
+	}
 
 	// User mounts last: a later mount may legitimately sit on top of /usr etc.
 	// only if the caller asked for it, and vpctl up has already refused the
@@ -150,7 +163,7 @@ func buildDev(dev string) error {
 }
 
 // buildVp lays out the pod's machinery and then makes the directory
-// unwritable, so the agent cannot plant anything where a shim will land.
+// unwritable, so nothing in the pod can replace a wrapper that leads PATH.
 func buildVp(vp string, spec *proto.Spec) error {
 	if err := os.MkdirAll(vp, 0o755); err != nil {
 		return err
@@ -158,7 +171,7 @@ func buildVp(vp string, spec *proto.Spec) error {
 	if err := sys.Mount("tmpfs", vp, "tmpfs", sys.MsNosuid, "mode=755"); err != nil {
 		return err
 	}
-	for _, d := range []string{"run", "bin", "real"} {
+	for _, d := range []string{"run", "bin"} {
 		if err := os.MkdirAll(filepath.Join(vp, d), 0o755); err != nil {
 			return err
 		}
@@ -166,28 +179,64 @@ func buildVp(vp string, spec *proto.Spec) error {
 	if err := sys.BindOver(spec.RunDir, filepath.Join(vp, "run"), false); err != nil {
 		return err
 	}
-	if err := sys.BindOver(spec.ShimBin, filepath.Join(vp, "bin", "vpsh"), true); err != nil {
+	// The pod's $SHELL, which records a command line and then runs it.
+	if err := sys.BindOver(spec.ShellBin, filepath.Join(vp, "bin", "vpsh"), true); err != nil {
 		return err
 	}
 	// The agent's own view of vibepod: read-only, and limited by which socket
 	// it can reach rather than by what the binary can do.
 	if spec.CtlBin != "" {
-		if err := sys.BindOver(spec.CtlBin, filepath.Join(vp, "bin", "vpctl"), true); err != nil {
+		if err := sys.BindOver(spec.CtlBin, filepath.Join(vp, "bin", "vp"), true); err != nil {
 			return err
 		}
 	}
-	// Tools that exist only on a remote get a shim of their own, since there
-	// is nothing here to shadow. /vp/bin leads PATH, so a bare `rocm-smi`
-	// finds this and is routed like everything else; an absolute path to a
-	// binary this machine does not have still fails, as it must.
-	for _, name := range spec.RemoteTools {
+	// A wrapper per tool the agent should not run here: one that exists only on
+	// a remote, or one that exists in both places and belongs on the other.
+	// /vp/bin leads PATH, so a bare `rocm-smi` finds this; an absolute path to
+	// a binary this machine does not have still fails, as it must.
+	for _, name := range spec.Tools {
 		if name == "" || strings.ContainsRune(name, '/') {
 			continue
 		}
-		dst := filepath.Join(vp, "bin", name)
-		if err := sys.BindOver(spec.ShimBin, dst, true); err != nil {
-			return fmt.Errorf("remote tool %s: %w", name, err)
+		if err := writeWrapper(filepath.Join(vp, "bin", name), name); err != nil {
+			return fmt.Errorf("wrapper for %s: %w", name, err)
 		}
 	}
 	return os.Chmod(vp, 0o555)
+}
+
+// writeWrapper is the whole of what replaced the bind-shims: three lines that
+// hand the command to `vp`, which asks the daemon which machine this session is
+// on. No kernel help, nothing to unmount, and it is what `remote_tools:` always
+// meant.
+func writeWrapper(path, name string) error {
+	script := fmt.Sprintf("#!/bin/sh\n"+
+		"# vibepod: %s runs on this session's backend.\n"+
+		"exec %s tool %s \"$@\"\n", name, VpPath, name)
+	return os.WriteFile(path, []byte(script), 0o555)
+}
+
+// writeBrief puts the generated instruction file where an agent will find it,
+// and links it from the root of the pod's filesystem.
+//
+// With no exec gate this is not a nicety: an agent that has not been told about
+// `vp` will run everything in the pod, over FUSE, on the wrong machine.
+func writeBrief(root string, spec *proto.Spec) error {
+	if spec.Brief == "" {
+		return nil
+	}
+	if err := os.WriteFile(filepath.Join(spec.RunDir, "brief.md"),
+		[]byte(spec.Brief), 0o644); err != nil {
+		return err
+	}
+	for _, link := range briefLinks {
+		p := filepath.Join(root, link)
+		if _, err := os.Lstat(p); err == nil {
+			continue
+		}
+		if err := os.Symlink(BriefPath, p); err != nil && !os.IsExist(err) {
+			return err
+		}
+	}
+	return nil
 }
