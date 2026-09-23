@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
+	"vibepod/internal/config"
 	"vibepod/internal/proto"
 	"vibepod/internal/term"
 )
@@ -185,13 +185,13 @@ func cmdBackend() error {
 // with them.
 func cmdMount(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vp mount <host>:/path [at]")
+		return fmt.Errorf("usage: vp mount <host>:/remote/path[:/pod/path]")
 	}
-	host, path, ok := strings.Cut(args[0], ":")
-	if !ok || host == "" || !strings.HasPrefix(path, "/") {
-		return fmt.Errorf("mount takes host:/absolute/path, not %q", args[0])
+	host, path, at, err := config.ParseRemote(args[0])
+	if err != nil {
+		return err
 	}
-	spec := proto.MountSpec{Host: host, Path: filepath.Clean(path)}
+	spec := proto.MountSpec{Host: host, Path: path, At: at}
 	if len(args) > 1 {
 		spec.At = args[1]
 	}
@@ -204,7 +204,7 @@ func cmdMount(args []string) error {
 		Mounts: []proto.MountSpec{spec}}); err != nil {
 		return err
 	}
-	at := spec.At
+	at = spec.At
 	if at == "" {
 		at = spec.Path
 	}

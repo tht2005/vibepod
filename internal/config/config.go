@@ -300,12 +300,18 @@ func (c *Config) Resolve() (*Resolved, error) {
 				ReadOnly: m.ReadOnly, ExecOn: m.ExecOn})
 
 		case m.Remote != "":
-			host, path, ok := strings.Cut(m.Remote, ":")
-			if !ok || host == "" || !strings.HasPrefix(path, "/") {
-				return nil, fmt.Errorf("remote mount %q must be host:/absolute/path", m.Remote)
+			host, path, inline, err := ParseRemote(m.Remote)
+			if err != nil {
+				return nil, fmt.Errorf("remote mount: %w", err)
 			}
-			path = filepath.Clean(path)
+			if inline != "" && m.At != "" && filepath.Clean(inline) != filepath.Clean(m.At) {
+				return nil, fmt.Errorf("remote mount %q names its pod path twice, "+
+					"differently: %s and at: %s", m.Remote, inline, m.At)
+			}
 			at := path
+			if inline != "" {
+				at = inline
+			}
 			if m.At != "" {
 				at = m.At
 			}
@@ -395,7 +401,7 @@ func (c *Config) HostList() []string {
 		add(h)
 	}
 	for _, m := range c.Mounts {
-		if host, _, ok := strings.Cut(m.Remote, ":"); ok {
+		if host, _, _, err := ParseRemote(m.Remote); err == nil {
 			add(host)
 		}
 		add(m.ExecOn)
@@ -449,4 +455,25 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// ParseRemote reads a remote mount as a person writes it:
+//
+//	gpu03:/data/imagenet              the pod sees it at /data/imagenet
+//	gpu03:/data/imagenet:/datasets    ...or at /datasets
+//
+// The third part is `at:` in one string. It is unambiguous because both paths are
+// absolute: the pod path is whatever follows the *last* ":/", so a remote path
+// containing a colon still works as long as its pod path is given too.
+func ParseRemote(s string) (host, path, at string, err error) {
+	host, rest, ok := strings.Cut(s, ":")
+	if !ok || host == "" || !strings.HasPrefix(rest, "/") {
+		return "", "", "", fmt.Errorf("%q must be host:/remote/path, optionally "+
+			"followed by :/pod/path", s)
+	}
+	path = rest
+	if i := strings.LastIndex(rest, ":/"); i > 0 {
+		path, at = rest[:i], rest[i+1:]
+	}
+	return host, filepath.Clean(path), at, nil
 }

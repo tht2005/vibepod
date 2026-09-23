@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"vibepod/internal/config"
 	"vibepod/internal/event"
 	"vibepod/internal/proto"
 	"vibepod/internal/sys"
@@ -337,12 +338,12 @@ func (co *cockpit) run1(verb string, args ...string) {
 		if len(args) == 0 {
 			return
 		}
-		host, path, ok := strings.Cut(args[0], ":")
-		if !ok || !strings.HasPrefix(path, "/") {
-			co.say("mount takes host:/absolute/path")
+		host, path, at, err := config.ParseRemote(args[0])
+		if err != nil {
+			co.say(err.Error())
 			return
 		}
-		spec := proto.MountSpec{Host: host, Path: path}
+		spec := proto.MountSpec{Host: host, Path: path, At: at}
 		if len(args) > 1 {
 			spec.At = args[1]
 		}

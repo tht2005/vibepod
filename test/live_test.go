@@ -278,3 +278,16 @@ func TestHostsListsMachinesThisPodHasNotMounted(t *testing.T) {
 }
 
 var _ = fmt.Sprint
+
+// host:/remote/path:/pod/path is `at:` in one string, on the command line as in the
+// config.
+func TestMountTakesThePodPathInline(t *testing.T) {
+	dir := livePod(t, "e2e-inline")
+	if out, errOut, code := vpIn(t, dir, "mount", "vptest2:"+remoteAlt+":/second"); code != 0 {
+		t.Fatalf("mount: %s %s", out, errOut)
+	}
+	out, errOut, code := vpIn(t, dir, "run", "--", "/bin/sh", "-c", "/usr/bin/cat /second/second.txt")
+	if code != 0 || !strings.Contains(out, "from the second machine") {
+		t.Errorf("the mount is not at its inline pod path (exit %d): %q %q", code, out, errOut)
+	}
+}
