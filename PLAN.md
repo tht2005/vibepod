@@ -77,27 +77,81 @@ The `pod.Sandbox` interface stays, so bwrap can return for pods that need no liv
 - **Dependencies:** `gopkg.in/yaml.v3` only. PTY and termios are hand-rolled (~70 lines)
   rather than pulling a terminal library.
 
-## 3. Build order and gates
+## 3. Build order and gates — all passed
 
-Each gate is an automated test that must pass before the next stage starts.
+Each gate is an automated test in `test/`. They create user namespaces, install
+seccomp filters, run a real sshd on a high port, and drive real terminals,
+because the parts of vibepod worth doubting are exactly the parts a mock would
+not exercise.
 
-**G0 — the trick works** (`internal/pod`, `internal/gate`, `internal/shim`)
-- native pod, seccomp gate, lazy bind-shim, stash, `vpctl run`
-- gate: a test binary run inside the pod is redirected to `vpsh`, which reports the
-  original argv and cwd, then executes the stashed original and proxies its exit code
+**G0 — the trick works.** A binary run in the pod is redirected to `vpsh`,
+which reports the original argv and cwd and then runs the stashed original.
+Also: pod processes hold `CapEff: 0` and their `mount()` returns EPERM, so the
+agent cannot unpick its own routing.
 
-**G1 — remotes** (`internal/config`, `route`, `remote`, `fs`)
-- `vibepod.yaml`, cwd routing, ssh ControlMaster pool, sshfs mount, remote exec with
-  streamed stdio and forwarded signals
-- gate: an integration test against a local sshd fixture on port 2222 — mount a directory,
-  run a command whose cwd is inside it, assert it executed on the "remote"
+**G1 — remotes.** Against the sshd fixture: a command whose cwd is a remote
+mount runs over ssh, one in a local directory does not, remote files read
+through the mount, and a file written by a routed command is visible afterwards.
+An unreachable host exits 75 with an error naming vibepod.
 
-**G2 — lifecycle** (`internal/daemon`, `event`, `term`, `ui`)
-- daemon persistence, sessions, PTY + detach/attach, NDJSON event stream, `log`, `tree`,
-  `ps`, `down`, the console
-- gate: create a pod, run a command, detach, reattach and see the scrollback; `tree --json`
-  reports the live exec with its target
+**G2 — lifecycle.** Detach with `Ctrl-\`, reattach, and the scrollback replays
+while the session is still live. Several sessions on one pod with independent
+working directories. `tree --json` parses; the log shows each command's machine
+and the exit status of the routed ones. The console runs commands, names their
+routes, and keeps the keyboard afterwards.
 
-**G3 — verify v1**
-- run Claude Code inside a pod with every exec intercepted and cwd tracking intact
-- `doctor`, failure injection (link drop → exit 75), shim accumulation check
+**G3 — verify v1.** `claude -p` produces **byte-identical output inside a pod
+and outside it**, with every exec intercepted — which is the claim M0 existed
+to test.
+
+## 4. What verification found
+
+Six real bugs, none of which a unit test would have reached:
+
+1. **A read-only remount must repeat the flags the userns locked**, or EPERM.
+   runc does this; we now read them back from `mountinfo` first.
+2. **Capabilities are per-thread**, and Go forks from whichever thread it
+   likes. Clearing the ambient set on one goroutine left others able to hand
+   `CAP_SYS_ADMIN` to the agent. `vpinit` now pins a mounter thread that keeps
+   the capability and a spawner thread that has none.
+3. **A spawn/bind deadlock.** vpinit waited for the spawn it was performing,
+   but that spawn's `execve` traps to the daemon, which may need vpinit to bind
+   a shim first. Every earlier test missed it because a shell is never shimmed:
+   only a session whose *first* program needs one deadlocks.
+4. **No DNS in the pod.** `/etc/resolv.conf` is a symlink into `/run` on a
+   systemd-resolved machine. The symptom was an agent that started perfectly
+   and then timed out on its first API call.
+5. **The daemon must not read a client's terminal.** A read blocked on a tty
+   does not reliably return when the descriptor is closed, so the daemon went
+   on eating keystrokes after a session ended. Input is now messages; output
+   stays on a passed descriptor.
+6. **`up` was not atomic.** Two terminals opening the same project each built a
+   whole pod and one was orphaned, with a session attached to it.
+
+And two things that were not bugs but were *dishonest*, which matters more for
+a tool whose pitch is "your agent runs commands on prod":
+
+- the log reported a route for commands that were never shimmed, so a shell —
+  which always runs locally — was recorded as running on the remote
+- it printed a tick for exits it never observed; vibepod is not the parent of a
+  pod-local exec, so that status is now absent rather than invented
+
+## 5. Deviations from DESIGN.md
+
+- **`vpsh` is a separate binary.** argv[0] dispatch cannot work for a shim: it
+  is never invoked under its own name. It identifies itself by
+  `/proc/self/exe`, which resolves through the bind mount.
+- **Session pins live in the daemon**, keyed by an inherited `VIBEPOD_SESSION`
+  token, rather than in a `VIBEPOD_EXEC` environment variable. A process cannot
+  set its parent's environment, so `vpctl use` could not have worked that way.
+- **sshfs ships as a backend**, not only rclone, because rclone is not
+  installed here and requiring it would block the whole M1 path. rclone is
+  preferred when present; `doctor` says which is in use and what the difference
+  costs.
+
+## 6. Milestones
+
+M0, M1 and M2 are done, which is v1. M3 (credential proxy, toolbin, port
+forwards, reverse mounts) and M4 (`expose_to` fan-out, `sync` mode) are not
+started; `exec_on:` parses and routes but needs M3's reverse mounts to be
+useful, and says so at `up` time.

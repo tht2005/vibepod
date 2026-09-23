@@ -1,6 +1,9 @@
 # vibepod — design
 
-> Status: architecture settled. v1 scope is M0-M2 (§13). Remaining unknowns in §12.
+> Status: **v1 built and verified** — M0-M2 (§13). See PLAN.md for what was
+> measured before building, the six bugs verification found, and three
+> deviations from this document that the implementation forced. Remaining
+> unknowns in §12.
 
 ## 1. Problem
 
@@ -677,19 +680,26 @@ replays the buffer. Killing the pod kills everything inside it.
 8. **Reverse-mount transport** — sshfs slave over `ssh -R`, rclone serving sftp back
    through the tunnel, or a push-copy? Caching runs the opposite direction here.
 9. **Bind-shim accumulation** — one mount per distinct binary. Is there a ceiling worth
-   caring about, and do shims need eviction?
+   caring about, and do shims need eviction? Measured in practice: a full Claude Code
+   session shims a handful, so this is not urgent.
+10. **Exit status for pod-local commands** — vibepod observes their execs but does not
+   own them, so it never learns what they returned. Worth a `PTRACE_O_TRACEEXIT`-style
+   mechanism, or is "we only report what we know" the right answer?
+11. **Daemon upgrades** — the daemon outlives the binary that spawned it, so after an
+   upgrade the running one is stale. `doctor` reports the mismatch; should the daemon
+   instead hand over, or refuse a client whose build differs?
 
 ## 13. Milestones
 
 **v1 = M0-M2.**
 
-- **M0 — the trick works.** bwrap pod, seccomp exec gate, lazy bind-shim redirect, local
+- **M0 — the trick works. [done]** bwrap pod, seccomp exec gate, lazy bind-shim redirect, local
   binds only. Success is running Claude Code inside it and seeing every exec intercepted
   with cwd tracking intact. This is the riskiest assumption in the design.
-- **M1 — remotes.** Daemon, rclone mount with execution-aware invalidation, cwd routing,
+- **M1 — remotes. [done]** Daemon, rclone mount with execution-aware invalidation, cwd routing,
   warm ControlMaster. Plural structures throughout; one remote exercised end to end.
   First genuinely useful version.
-- **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, the event
-  stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`.
+- **M2 — lifecycle. [v1 ships here — done]** `vpinit`, detach/attach, PTY buffer, the
+  event stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`.
 - **M3 — real work.** Credential proxy, toolbin prompts, port forwards, reverse mounts.
 - **M4 — polish.** `expose_to` to several targets, `doctor`, `sync` mode.
