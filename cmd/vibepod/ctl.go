@@ -1,0 +1,283 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/tabwriter"
+
+	"vibepod/internal/config"
+	"vibepod/internal/proto"
+)
+
+const usage = `vpctl - run your agent here, run its commands where the code lives
+
+  vpctl up [name]              create a pod, detached
+  vpctl run [name] -- cmd...   run a command in a pod, creating it if needed
+  vpctl shell [name]           an interactive shell in a pod
+  vpctl ps                     running pods
+  vpctl down [name]            stop a pod and release its mounts
+  vpctl doctor                 check this machine can host a pod
+
+A pod takes its name and mounts from ./vibepod.yaml unless you name one.
+`
+
+func runCtl(args []string) int {
+	if len(args) == 0 {
+		fmt.Print(usage)
+		return 2
+	}
+	var err error
+	switch args[0] {
+	case "up":
+		err = cmdUp(args[1:])
+	case "run":
+		return cmdRun(args[1:])
+	case "shell":
+		return cmdRun(append([]string{"--"}, shellArgs(args[1:])...))
+	case "ps":
+		err = cmdPs()
+	case "down":
+		err = cmdDown(args[1:])
+	case "doctor":
+		err = cmdDoctor()
+	case "-h", "--help", "help":
+		fmt.Print(usage)
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "vpctl: unknown command %q\n\n%s", args[0], usage)
+		return 2
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		return 1
+	}
+	return 0
+}
+
+func shellArgs(args []string) []string {
+	sh := os.Getenv("SHELL")
+	if sh == "" {
+		sh = "/bin/sh"
+	}
+	return append(args, sh)
+}
+
+// loadSpec turns the project config into an up request.
+func loadSpec(name string, shimAll bool) (*proto.Msg, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	path, found := config.Find(cwd)
+	if !found {
+		return nil, fmt.Errorf("no vibepod.yaml here or above %s", cwd)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	res, err := cfg.Resolve()
+	if err != nil {
+		return nil, err
+	}
+	if name != "" {
+		res.Name = name
+	}
+	if len(res.Remotes) > 0 {
+		return nil, fmt.Errorf("remote mounts are not implemented in this build "+
+			"(%s:%s)", res.Remotes[0].Host, res.Remotes[0].Path)
+	}
+	return &proto.Msg{
+		Op: proto.OpUp,
+		Spec: &proto.Spec{
+			Name:     res.Name,
+			Binds:    res.Binds,
+			Hostname: res.Name,
+		},
+		Routes:      res.Routes,
+		ExecDefault: res.ExecDefault,
+		ShimAll:     shimAll,
+	}, nil
+}
+
+func cmdUp(args []string) error {
+	fs := flag.NewFlagSet("up", flag.ContinueOnError)
+	shimAll := fs.Bool("shim-all", false, "shim every binary, whatever the route (debugging)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	name := fs.Arg(0)
+	m, err := loadSpec(name, *shimAll)
+	if err != nil {
+		return err
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if _, err := call(c, m); err != nil {
+		return err
+	}
+	fmt.Printf("pod %s is up\n", m.Spec.Name)
+	return nil
+}
+
+// cmdRun starts a process in a pod on this terminal's own descriptors.
+func cmdRun(args []string) int {
+	// Split on "--" before parsing flags: everything after it belongs to the
+	// command being run, including any flags of its own.
+	head, rest := args, []string(nil)
+	if i := indexOf(args, "--"); i >= 0 {
+		head, rest = args[:i], args[i+1:]
+	}
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	shimAll := fs.Bool("shim-all", false, "shim every binary, whatever the route (debugging)")
+	if err := fs.Parse(head); err != nil {
+		return 2
+	}
+	name := fs.Arg(0)
+	if len(rest) == 0 {
+		rest = fs.Args()
+		if len(rest) > 0 {
+			name, rest = "", rest
+		}
+	}
+	if len(rest) == 0 {
+		fmt.Fprintln(os.Stderr, "vpctl run: nothing to run; use -- cmd args")
+		return 2
+	}
+
+	m, err := loadSpec(name, *shimAll)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		return 1
+	}
+	c, err := connect()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		return 1
+	}
+	defer c.Close()
+	if _, err := call(c, m); err != nil &&
+		!strings.Contains(err.Error(), "already running") {
+		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		return 1
+	}
+	reply, err := call(c, &proto.Msg{
+		Op:   proto.OpSession,
+		Pod:  m.Spec.Name,
+		Argv: rest,
+		Env:  os.Environ(),
+		Cwd:  podCwd(m.Spec.Binds),
+		TTY:  false,
+	}, 0, 1, 2)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "vpctl:", err)
+		return 1
+	}
+	return reply.Code
+}
+
+// podCwd keeps the caller's directory when the pod can see it, which is the
+// common case in a project, and falls back to the first mount.
+func podCwd(binds []proto.Bind) string {
+	cwd, err := os.Getwd()
+	if err == nil {
+		for _, b := range binds {
+			if cwd == b.Dst || strings.HasPrefix(cwd, strings.TrimSuffix(b.Dst, "/")+"/") {
+				return cwd
+			}
+		}
+	}
+	if len(binds) > 0 {
+		return binds[0].Dst
+	}
+	return "/"
+}
+
+func cmdPs() error {
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	reply, err := call(c, &proto.Msg{Op: proto.OpPs})
+	if err != nil {
+		return err
+	}
+	if len(reply.Pods) == 0 {
+		fmt.Println("no pods running")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "POD\tPID\tSESSIONS\tMOUNTS\tUPTIME")
+	for _, p := range reply.Pods {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n", p.Name, p.Pid, p.Sessions, p.Mounts, p.Uptime)
+	}
+	return w.Flush()
+}
+
+func cmdDown(args []string) error {
+	name := ""
+	if len(args) > 0 {
+		name = args[0]
+	}
+	if name == "" {
+		if m, err := loadSpec("", false); err == nil {
+			name = m.Spec.Name
+		}
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if _, err := call(c, &proto.Msg{Op: proto.OpDown, Pod: name}); err != nil {
+		return err
+	}
+	fmt.Printf("pod %s is down\n", name)
+	return nil
+}
+
+func indexOf(list []string, s string) int {
+	for i, x := range list {
+		if x == s {
+			return i
+		}
+	}
+	return -1
+}
+
+func cmdDoctor() error {
+	self, _ := os.Executable()
+	checks := []struct {
+		name string
+		err  error
+	}{
+		{"vpsh binary", statErr(filepath.Join(filepath.Dir(self), "vpsh"))},
+		{"unprivileged user namespaces", checkUserns()},
+		{"seccomp user notification", checkSeccomp()},
+	}
+	bad := 0
+	for _, c := range checks {
+		if c.err != nil {
+			bad++
+			fmt.Printf("  ✗ %-32s %v\n", c.name, c.err)
+		} else {
+			fmt.Printf("  ✓ %-32s\n", c.name)
+		}
+	}
+	if bad > 0 {
+		return fmt.Errorf("%d check(s) failed", bad)
+	}
+	return nil
+}
+
+func statErr(p string) error {
+	_, err := os.Stat(p)
+	return err
+}
