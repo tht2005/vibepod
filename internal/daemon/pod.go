@@ -69,6 +69,8 @@ type podState struct {
 	credentials map[string]bool
 	agents      map[string]string
 	toolbin     map[string]bool
+	syncs       map[string]*syncState
+	syncSeq     int
 	arch        map[string]string
 	homes       map[string]string
 	// ports are the forwards this pod opened, closed when it goes down.
@@ -301,6 +303,9 @@ func (s *podState) close() {
 	for _, sess := range sessions {
 		sess.close()
 	}
+	// Synced copies go back first: the local copy is about to be deleted, and
+	// anything edited in it exists nowhere else.
+	s.flushSyncs()
 	// Forwards ride the multiplexed connections, so they go before anything tears
 	// those down.
 	s.closePorts()

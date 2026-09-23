@@ -86,8 +86,15 @@ func (s *podState) rebuildRoutes() {
 // added at runtime that behaved differently from one in the config would be a
 // second implementation of the only thing this program does.
 func (s *podState) addMount(rm proto.MountSpec, pr *Progress, runtime bool) (*mountRec, error) {
-	if rm.Mode != "" && rm.Mode != "fuse" {
-		return nil, fmt.Errorf("mount mode %q is not implemented yet", rm.Mode)
+	switch rm.Mode {
+	case "", "fuse":
+	case "sync":
+		// A synced copy is a plain directory, and a plain directory reaches a pod
+		// that already exists by no route the kernel allows. It is set at `up`.
+		return nil, fmt.Errorf("mode: sync is set at `up`, not added to a running " +
+			"pod; mount it as fuse now, or put it in vibepod.yaml")
+	default:
+		return nil, fmt.Errorf("mount mode %q is not one of fuse or sync", rm.Mode)
 	}
 	at := rm.At
 	if at == "" {

@@ -288,6 +288,10 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 	}
 	req := remote.Req{Dir: dir, Argv: r.argv, Env: env, TTY: r.tty, ID: id}
 	copy(req.Files[:], r.files[:3])
+	// A synced directory is a local copy: push what changed here before the command
+	// runs over there, and pull what it changed afterwards.
+	s.beforeDispatch(backend)
+	defer s.afterDispatch(backend)
 	code, err := host.Run(req)
 	// 127 from the remote script means its final `exec` found no such program, so
 	// nothing ran — the one exit status after which trying again cannot repeat a

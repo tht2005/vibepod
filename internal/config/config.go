@@ -344,6 +344,10 @@ func (c *Config) Resolve() (*Resolved, error) {
 			if mode == "" {
 				mode = "fuse"
 			}
+			if mode != "fuse" && mode != "sync" {
+				return nil, fmt.Errorf("mount %s: mode must be fuse or sync, not %q",
+					m.Remote, m.Mode)
+			}
 			switch m.Via {
 			case "", "auto", "direct", "relay":
 			default:

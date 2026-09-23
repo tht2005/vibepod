@@ -546,7 +546,12 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	s.podLn = ln
 
 	// Local directories are binds the pod builds for itself, so they travel in
-	// the spec and exist the moment the pod does.
+	// the spec and exist the moment the pod does. A synced directory is one too:
+	// a local copy, pulled now.
+	if err := s.planSynced(m, pr); err != nil {
+		s.closeFailed(ln)
+		return err
+	}
 	s.planLocal(m)
 	m.Spec.Brief = s.brief()
 
@@ -609,12 +614,46 @@ func (s *podState) planLocal(m *proto.Msg) {
 	s.rebuildRoutes()
 }
 
+// planSynced makes the local copy for each `mode: sync` mount and adds it to the
+// spec as a bind, since a plain directory reaches the pod at build time or not at
+// all.
+func (s *podState) planSynced(m *proto.Msg, pr *Progress) error {
+	for _, ms := range m.Mounts {
+		if ms.Host == "" || ms.Mode != "sync" {
+			continue
+		}
+		at := ms.At
+		if at == "" {
+			at = ms.Path
+		}
+		pr.step("connecting to %s… ", ms.Host)
+		if err := s.d.pool.Host(ms.Host).Warm(); err != nil {
+			pr.failed()
+			return err
+		}
+		pr.ok("connected")
+		local, err := s.startSync(at, ms.Host, ms.Path, pr)
+		if err != nil {
+			return err
+		}
+		rec := &mountRec{At: at, Src: local, Owner: ms.Host, RemotePath: ms.Path,
+			ExecOn: ms.ExecOn, Kind: "sync", ReadOnly: ms.ReadOnly,
+			Gen: s.bumpGeneration()}
+		s.mu.Lock()
+		s.mounts = append(s.mounts, rec)
+		s.mu.Unlock()
+		m.Spec.Binds = append(m.Spec.Binds,
+			proto.Bind{Src: local, Dst: at, ReadOnly: ms.ReadOnly})
+	}
+	return nil
+}
+
 // attachRemotes brings up every remote mount the config asked for and refuses
 // the pod if one cannot be reached — at up time, where a person is watching,
 // rather than mid-run where an agent would meet it.
 func (s *podState) attachRemotes(m *proto.Msg, pr *Progress) error {
 	for _, ms := range m.Mounts {
-		if ms.Host == "" {
+		if ms.Host == "" || ms.Mode == "sync" {
 			continue
 		}
 		rec, err := s.addMount(ms, pr, false)
