@@ -241,6 +241,10 @@ type Msg struct {
 	Path    string   `json:"path,omitempty"`
 	Target  string   `json:"target,omitempty"`
 	TTY     bool     `json:"tty,omitempty"`
+	// Framed asks for a session's output with vibepod's markers left in and
+	// banners replaced by markers: the client is `vp shell`, which parses the
+	// stream into command blocks rather than showing it raw.
+	Framed bool `json:"framed,omitempty"`
 	// Backend is the machine a session's commands run on: "pod", or an ssh
 	// alias. Per-session, never global.
 	Backend string `json:"backend,omitempty"`
@@ -437,6 +441,7 @@ type SessionInfo struct {
 	ID      string   `json:"id"`
 	Kind    string   `json:"kind,omitempty"`
 	Backend string   `json:"backend"`
+	Framed  bool     `json:"framed,omitempty"`
 	Argv    []string `json:"argv,omitempty"`
 	Uptime  string   `json:"uptime,omitempty"`
 }

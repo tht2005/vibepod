@@ -39,6 +39,17 @@ type ptyRun struct {
 	master *os.File
 	cmd    *exec.Cmd
 	out    bytes.Buffer
+	done   chan struct{}
+}
+
+// exited is whether the command has ended on its own.
+func (r *ptyRun) exited() bool {
+	select {
+	case <-r.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func onPTY(t *testing.T, args ...string) *ptyRun {
@@ -47,6 +58,12 @@ func onPTY(t *testing.T, args ...string) *ptyRun {
 }
 
 func onPTYIn(t *testing.T, dir string, args ...string) *ptyRun {
+	t.Helper()
+	return onPTYEnv(t, dir, nil, args...)
+}
+
+// onPTYEnv is onPTYIn with more environment, which wins over the defaults.
+func onPTYEnv(t *testing.T, dir string, env []string, args ...string) *ptyRun {
 	t.Helper()
 	master, slave, err := sys.OpenPTY()
 	if err != nil {
@@ -61,6 +78,7 @@ func onPTYIn(t *testing.T, dir string, args ...string) *ptyRun {
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+runDir, "SHELL=/bin/sh",
 		"TERM=dumb", "PS1=$ ")
+	cmd.Env = append(cmd.Env, env...)
 	if ssh != nil {
 		cmd.Env = append(cmd.Env, "VIBEPOD_SSH_CONFIG="+ssh.configFile)
 	}
@@ -70,7 +88,11 @@ func onPTYIn(t *testing.T, dir string, args ...string) *ptyRun {
 		t.Fatalf("start %v: %v", args, err)
 	}
 	slave.Close()
-	r := &ptyRun{master: master, cmd: cmd}
+	r := &ptyRun{master: master, cmd: cmd, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		close(r.done)
+	}()
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -126,7 +148,10 @@ func (r *ptyRun) waitFor(t *testing.T, want string, d time.Duration) bool {
 func (r *ptyRun) stop() {
 	if r.cmd.Process != nil {
 		_ = r.cmd.Process.Kill()
-		_, _ = r.cmd.Process.Wait()
+		select {
+		case <-r.done:
+		case <-time.After(5 * time.Second):
+		}
 	}
 	r.master.Close()
 }
@@ -135,7 +160,7 @@ func (r *ptyRun) stop() {
 // point of the daemon owning the pty rather than the client.
 func TestDetachLeavesTheSessionRunningAndAttachReplaysIt(t *testing.T) {
 	marker := "marker-4f21c"
-	first := onPTY(t, "shell", "e2e")
+	first := onPTY(t, "shell", "--raw", "e2e")
 	defer first.stop()
 
 	if !first.waitFor(t, "$", 10*time.Second) {
@@ -168,9 +193,9 @@ func TestDetachLeavesTheSessionRunningAndAttachReplaysIt(t *testing.T) {
 // own backend, which is what makes `vp shell` useful next to a running agent
 // rather than instead of it.
 func TestSeveralSessionsOnOnePod(t *testing.T) {
-	first := onPTY(t, "shell", "e2e")
+	first := onPTY(t, "shell", "--raw", "e2e")
 	defer first.stop()
-	second := onPTY(t, "shell", "e2e")
+	second := onPTY(t, "shell", "--raw", "e2e")
 	defer second.stop()
 
 	for i, r := range []*ptyRun{first, second} {
@@ -216,7 +241,7 @@ func TestSeveralSessionsOnOnePod(t *testing.T) {
 // by not reproducing anything.
 func TestAnAttachedSessionOnAnotherMachineIsThatMachinesShell(t *testing.T) {
 	requireSSH(t)
-	r := onPTYIn(t, remoteDir, "shell", "-on", "vptest", "e2e-remote")
+	r := onPTYIn(t, remoteDir, "shell", "--raw", "-on", "vptest", "e2e-remote")
 	defer r.stop()
 	r.ready(t, 20*time.Second)
 	// It really is over there.
@@ -249,7 +274,7 @@ func TestAnAttachedSessionOnAnotherMachineIsThatMachinesShell(t *testing.T) {
 // one alone: switching back finds it with its cwd and its variables intact.
 func TestMovingAnAttachedSessionLeavesTheOtherShellAlone(t *testing.T) {
 	requireSSH(t)
-	r := onPTYIn(t, remoteDir, "shell", "e2e-remote")
+	r := onPTYIn(t, remoteDir, "shell", "--raw", "e2e-remote")
 	defer r.stop()
 	r.ready(t, 15*time.Second)
 	id := r.sessionID(t)

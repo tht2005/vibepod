@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/sys"
 	"vibepod/internal/term"
+	"vibepod/internal/ui"
 )
 
 // Attaching a terminal to a session has two halves, deliberately separated:
@@ -122,10 +125,14 @@ func attachOwningStdin(c *proto.Conn, m *proto.Msg) (int, error) {
 // cmdShell opens another independent terminal on a running pod, the way
 // `docker exec -it` does. A pod supports as many as you like, each with its
 // own working directory.
+//
+// On a terminal it is the block interface (internal/ui); --raw, or anything
+// that is not a terminal, gets the shell's own pty exactly as it is.
 func cmdShell(args []string) int {
 	fs := flag.NewFlagSet("shell", flag.ContinueOnError)
 	on := fs.String("on", "", "open it on this machine instead of the pod's default")
 	dir := fs.String("C", "", "start in this directory")
+	raw := fs.Bool("raw", false, "the shell's own terminal, without the block interface")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -161,15 +168,96 @@ func cmdShell(args []string) int {
 	// recorded like any other. vpsh execs the user's real shell immediately; a
 	// session whose backend is another machine never reaches it at all, because
 	// that session *is* a shell over there.
-	code, err := attachOwningStdin(c, &proto.Msg{
+	req := &proto.Msg{
 		Op: proto.OpSession, Pod: m.Spec.Name, Argv: []string{pod.ShellPath},
 		Env: os.Environ(), Cwd: start, Backend: *on,
-	})
+	}
+	var code int
+	if *raw || !framable() {
+		code, err = attachOwningStdin(c, req)
+	} else {
+		code, _, err = attachFramed(c, req)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
 	}
 	return code
+}
+
+// framable is whether the block interface can run here at all.
+func framable() bool { return term.IsTTY(os.Stdin) && term.IsTTY(os.Stdout) }
+
+// attachFramed runs a session through the block interface. ok is false, with
+// nothing done, when the session is one `vp shell` did not start: its shells
+// have no hooks, so it can only be shown raw.
+func attachFramed(c *proto.Conn, m *proto.Msg) (code int, ok bool, err error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return 0, false, err
+	}
+	defer r.Close()
+	rows, cols, _ := sys.GetWinsize(os.Stdin.Fd())
+	m.TTY, m.Framed = true, true
+	m.Rows, m.Cols = ui.EmuSize(rows, cols)
+	// A terminal the emulator understands, for what runs inside a block. A
+	// program that takes the whole screen gets the real terminal, and xterm is
+	// what every real terminal speaks.
+	if m.Op == proto.OpSession {
+		m.Env = setEnv(m.Env, "TERM", "xterm-256color")
+	}
+	fd := int(w.Fd())
+	err = c.Send(m, fd, fd, fd)
+	w.Close()
+	if err != nil {
+		return 0, false, err
+	}
+	reply, _, err := c.Recv()
+	if err != nil {
+		return 0, false, err
+	}
+	switch reply.Op {
+	case proto.OpErr:
+		return 0, false, fmt.Errorf("%s", reply.Err)
+	case proto.OpOK:
+		if !reply.Framed {
+			return 0, false, nil
+		}
+	default:
+		return 0, false, fmt.Errorf("unexpected reply %q", reply.Op)
+	}
+	res := ui.RunShell(ui.ShellConfig{Conn: c, Out: r, Pod: m.Pod,
+		Session: reply.Session, History: historyPath(), Rows: rows, Cols: cols})
+	if res.Err != nil {
+		return 0, true, res.Err
+	}
+	if res.Detached {
+		fmt.Printf("[detached — vp attach %s %s to return]\n", m.Pod, reply.Session)
+	}
+	return res.Code, true, nil
+}
+
+func setEnv(env []string, k, v string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if !strings.HasPrefix(e, k+"=") {
+			out = append(out, e)
+		}
+	}
+	return append(out, k+"="+v)
+}
+
+// historyPath is `vp shell`'s history: one per user, like a shell's.
+func historyPath() string {
+	base := os.Getenv("XDG_STATE_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		base = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(base, "vibepod", "history")
 }
 
 // cmdAttach reconnects to a session that kept running without you.
@@ -192,6 +280,20 @@ func cmdAttach(args []string) int {
 		return 1
 	}
 	defer c.Close()
+	// A session `vp shell` started comes back as blocks; any other — a console,
+	// a raw shell — the way it was.
+	if framable() {
+		code, ok, err := attachFramed(c, &proto.Msg{
+			Op: proto.OpAttach, Pod: name, Session: session,
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "vibepod:", err)
+			return 1
+		}
+		if ok {
+			return code
+		}
+	}
 	code, err := attachOwningStdin(c, &proto.Msg{
 		Op: proto.OpAttach, Pod: name, Session: session,
 	})

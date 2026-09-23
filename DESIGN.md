@@ -940,7 +940,7 @@ vp mount <host>:<path> [at]   connect and mount into a running pod
 vp unmount <path|@host>       unmount and disconnect
 vp cd @host                   go to a machine's directory
 vp where [@host]              what this directory is called on a machine, or the reverse
-vp shell [pod] [-on host] [-C dir]   another independent terminal into a running pod
+vp shell [pod] [-on host] [-C dir] [--raw]   another independent terminal into a running pod
 vp attach [pod] [session]     reattach to a detached session
 vp ps                         pods, sessions, backends
 vp tree [pod]                 mounts and live session/exec structure
@@ -979,6 +979,55 @@ sandbox whose purpose was containment. So unlike the guardrail ruling below, it 
 unrestricted — any host already in your ssh config is allowed, anything else is refused, and
 when a TUI is attached an agent's mount request surfaces as a one-key confirmation.
 
+### `vp shell`: blocks over a persistent shell
+
+`vp shell` draws a terminal the way Claude Code and Codex do: an input line at
+the bottom, each command's output above it as a block that shows its machine,
+directory, exit code and duration. It is printed inline, into the terminal's own
+scrollback, rather than into an alt-screen, so the terminal still scrolls,
+searches and copies, and the blocks outlive the program.
+
+**The shell underneath is unchanged.** It is the daemon's pty and the session's
+login shell, in the pod or over ssh, with its cwd, jobs and environment. Only the
+reading of its output is new. The design choice was between this and running
+each line as its own process. That would have allowed parallel blocks, but it
+loses `cd`, `export`, `source` and aliases. Those are the reason §3 holds a
+shell open at all.
+
+**Boundaries come from the shell, via FinalTerm's OSC 133** (A prompt, B input,
+C output, D exit code), the same markers Warp, iTerm2 and kitty read. vibepod
+*types* the hooks into a shell the first time it sees it. Typing works
+identically in the pod, over ssh and inside a node pod, and it installs
+nothing. The hooks wrap the prompt rather than replace it, so a raw attach
+still shows the user's own prompt. They are idempotent and kept out of history.
+The daemon adds its own OSC 7717 for what only it knows: which machine's shell
+the session is now showing, and where replayed scrollback ends.
+
+**A running block is a terminal emulator** (charmbracelet/x/vt), and every key
+goes to the program, re-encoded for the modes it asked for. That is what makes
+a Python REPL, `sudo`, `read`, tqdm and Claude Code's inline UI work. The
+alternative was detecting "interactive" from the pty's termios, and that fails
+for exactly the case that matters: over ssh the local pty is always raw.
+Lines the program scrolls off are final and go to the scrollback as they
+leave. The pty is kept at the block's size, so what a program lays out fits
+where it is drawn. A program that enters the **alternate screen gets the real
+terminal** until it leaves: the stream reader cuts the output at that escape,
+before anything drawn there can reach the emulator, and Bubble Tea steps aside
+the way it does for `$EDITOR`.
+
+**Reattach rebuilds state from the markers.** A framed client gets the shell's
+ring buffer bracketed by 7717 marks, and the markers in it say whether the
+shell is at a prompt or inside a command. A running command comes back as its
+block. A shell with no markers in its whole ring has never had the hooks, so it
+gets them. A session `vp shell` did not start has no hooks at all, and the
+daemon tells a framed client so up front, so it never types into whatever that
+session is running. `vp attach` then falls back to raw.
+
+Costs: bash and zsh only; fish and others fall back to raw with a note. On a
+bash older than 4.4, which has no PS0 to mark output start, the block shows the
+echoed line. A background job's output printed while you are at the prompt is
+not shown.
+
 ### The TUI
 
 Bare `vibepod` opens a cockpit: machines, sessions, and the live log, keyboard-driven.
@@ -1004,9 +1053,12 @@ backend, `⏎` attaches, `/` filters the log, `q` quits.
 
 #### Handoff, not nesting
 
-`⏎` does not render a terminal inside a pane. It **leaves the alt-screen, restores the
-terminal to exactly what the program expects, attaches raw, and redraws on detach** — what
-`lazygit` does with `$EDITOR`.
+`⏎` does not render a terminal inside a pane. It **leaves the alt-screen, runs `vp attach`
+on the real terminal, and redraws when it returns** — what `lazygit` does with `$EDITOR`.
+`vp attach` decides how the session is shown (blocks for a `vp shell` session, raw for
+anything else), so every door into a session shows it the same way. Both the cockpit and
+`vp shell` are drawn with Bubble Tea and Lip Gloss, in the terminal's own sixteen colours
+so they follow the user's theme.
 
 This is deliberate, and it is the reason the TUI is a cockpit rather than a multiplexer.
 Running Claude Code inside a homemade multiplexer means nested alt-screens, mouse reporting
@@ -1234,6 +1286,7 @@ replays the buffer. Killing the pod kills everything inside it.
 | Navigation | by machine (`vp cd @host`), never plain `cd` | path identity makes paths long; a directory can be named `@host`, and a `cd` that guessed would silently change machines |
 | Prompt | full path plus the machine it runs on | the path is the honest cost of path identity; the machine is what you need before pressing return |
 | Sessions | many per pod | `vp shell` attaches independent terminals, `docker exec -it` style |
+| `vp shell` | blocks over the persistent shell, inline, OSC 133 hooks typed in | per-command blocks without giving up `cd`/`export`/`source`; native scrollback; `--raw` keeps the pty as it was |
 | Live config | every `vibepod.yaml` field changeable at runtime; `vp save` snapshots | a config that needs a restart costs you the session and the agent's context to add one machine |
 | Reverse mounts | `expose_to:`, sharing the compute-node mechanism | "edit locally, run on the big machine" is impossible without them, and it is the same path-reproduction problem with the origin changed — not a second mechanism |
 | Visibility | live exec log + generated `CLAUDE.md` | one mechanism per audience; no output annotation to corrupt parsed streams. The fragment carries more weight in v2: it is how the agent learns `vp` at all |
@@ -1466,6 +1519,9 @@ way round. Recorded so the document is not behind the code:
   because path identity makes paths too long to type.
 - **Setup progress and explained ssh failures** (§9) — a silent ten-second
   wait on an unreachable host was indistinguishable from a hang.
+- **`vp shell` as blocks** (§9) — the raw login shell gave no way to tell one
+  command's output from the next, which machine it ran on, or how it ended.
+  The cockpit moved to Bubble Tea with it.
 - **A daemon build check** — the daemon outlives the binary that spawned it and
   spawns `vpinit` from its own image, so a rebuild changed nothing until the old
   one went away.

@@ -176,7 +176,7 @@ func TestAShellOnANodeIsInsideItsPod(t *testing.T) {
 	if out, errOut, code := vpIn(t, dir, "node", "add", "vptest2"); code != 0 {
 		t.Fatalf("node add: %s %s", out, errOut)
 	}
-	r := onPTYIn(t, dir, "shell", "-on", "vptest2", "-C", remoteSrv, "e2e-node-shell")
+	r := onPTYIn(t, dir, "shell", "--raw", "-on", "vptest2", "-C", remoteSrv, "e2e-node-shell")
 	defer r.stop()
 	r.ready(t, 25*time.Second)
 	r.send("pwd\n")

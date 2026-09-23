@@ -296,12 +296,23 @@ func (k *ctlConn) runSession(m *proto.Msg, fds []int) {
 		_ = k.c.Errorf(m.ID, "%v", err)
 		return
 	}
+	// A framed client is told first whether it can have what it asked for. A
+	// session nobody framed has no hooks in its shells, so `vp shell` would
+	// wait forever for a prompt marker — or, worse, type its hooks into
+	// whatever program is running there. It attaches raw instead.
+	if m.Framed {
+		_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Framed: sess.framed,
+			Session: sess.id})
+		if !sess.framed {
+			return
+		}
+	}
 	detach := make(chan struct{})
 	k.mu.Lock()
 	k.sess, k.detach = sess, detach
 	k.mu.Unlock()
 
-	code, detached := sess.attach(files[1], detach)
+	code, detached := sess.attach(files[1], m.Framed, detach)
 	k.mu.Lock()
 	k.sess, k.detach = nil, nil
 	k.mu.Unlock()

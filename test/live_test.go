@@ -78,7 +78,7 @@ func TestMountIntoARunningPod(t *testing.T) {
 // is the whole reason this is not `down` and `up`.
 func TestAnOpenSessionSurvivesAMount(t *testing.T) {
 	dir := livePod(t, "e2e-live-sess")
-	r := onPTYIn(t, dir, "shell", "e2e-live-sess")
+	r := onPTYIn(t, dir, "shell", "--raw", "e2e-live-sess")
 	defer r.stop()
 	r.ready(t, 15*time.Second)
 	r.send("VP_BEFORE=yes\n")
@@ -199,11 +199,11 @@ func TestUnmountRefusesWhileASessionIsStandingThere(t *testing.T) {
 	if _, errOut, code := vpIn(t, dir, "mount", "vptest2:"+remoteAlt); code != 0 {
 		t.Fatalf("mount: %s", errOut)
 	}
-	r := onPTYIn(t, dir, "shell", "e2e-busy")
+	r := onPTYIn(t, dir, "shell", "--raw", "e2e-busy")
 	defer r.stop()
 	r.ready(t, 15*time.Second)
 	// The session's recorded directory is where it started, so start one there.
-	r2 := onPTYIn(t, dir, "shell", "-C", remoteAlt, "e2e-busy")
+	r2 := onPTYIn(t, dir, "shell", "--raw", "-C", remoteAlt, "e2e-busy")
 	defer r2.stop()
 	r2.ready(t, 15*time.Second)
 

@@ -181,7 +181,7 @@ vp where [@machine]           what this directory is called there, or the revers
 vp tree                       the mounts, and what is running on which machine
 vp log [-f]                   every command, and where it ran
 vp ps                         pods, sessions, backends
-vp shell [pod] [-on machine]  another terminal on a running pod
+vp shell [pod] [-on machine]  another terminal on a running pod (--raw: no blocks)
 vp attach [pod] [session]     return to a session you detached from
 vp run [pod] -- cmd ...       one command in a pod, creating it if needed
 vp brief                      the instructions the agent in this pod was given
@@ -191,6 +191,42 @@ vp brief                      the instructions the agent in this pod was given
 terminal that made them, like containers. A terminal that disappears without
 detaching is also a detach: an agent halfway through something is not killed by
 the disappearance of the thing that was watching it.
+
+## vp shell
+
+`vp shell` is a terminal in the style of Claude Code and Codex: a line to type
+at the bottom, and each command's output above it as a block that says which
+machine it ran on, in which directory, and how it ended.
+
+```
+▌ $ source .venv/bin/activate                         ~/gpu-intern-26 · gpu03
+▌ $ python train.py --epochs 3                        ~/gpu-intern-26 · gpu03
+▌ epoch 1  loss 0.93
+▌ epoch 2  loss 0.71
+▌ ✓ 41.2s
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ❯ run on gpu03                                                               │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ gpu03  ~/gpu-intern-26              ↑ history · alt+⏎ newline · ctrl+d exit
+```
+
+Underneath it is the same login shell as before, in the pod or over ssh, so
+`cd`, `export`, `source` and your aliases carry from one command to the next.
+When it first sees a shell (bash or zsh), vibepod types a few hooks into it
+that mark where each command's output begins and ends. Nothing is installed,
+and your prompt, rc files and history stay yours. A block's bar is coloured by
+machine. A finished block goes into the terminal's own scrollback, so scrolling,
+searching and copying work, and it is still there after you quit.
+
+While a command runs, every key goes to it, and its output is drawn by a
+terminal emulator. That means progress bars, a Python REPL, a password prompt
+and inline interfaces like Claude Code's all work. A program that takes the
+whole screen (vim, htop, less) gets the real terminal until it leaves. `vp use
+gpu03` typed at the prompt moves to that machine's shell.
+`ctrl+\` detaches, and `vp attach` brings the blocks back, including a command
+that was still running. `vp shell --raw` is the shell's own pty, without any of
+this. So is a shell whose hooks do not take (fish, for now), and it says so.
 
 ## The cockpit
 
@@ -213,9 +249,10 @@ MOUNTS                                   │
  backend gpu03 │ m mount  u unmount  b backend  ⏎ attach  ⇥ pane  / filter  q quit
 ```
 
-`⏎` does not draw a terminal inside a pane. It **leaves the alt-screen, hands the
-raw terminal to the session, and redraws when you come back** — what lazygit does
-with `$EDITOR`. Running an agent inside a homemade multiplexer means nested
+`⏎` does not draw a terminal inside a pane. It **leaves the alt-screen, runs
+`vp attach` on the real terminal, and redraws when you come back** — what
+lazygit does with `$EDITOR`. So a session `vp shell` started comes back as
+blocks, and any other session comes back raw. Running an agent inside a homemade multiplexer means nested
 alt-screens, mouse reporting fighting mouse reporting, mangled bracketed paste
 and resize storms; handoff costs a tenth of the work and has none of those
 failure modes. The detach key therefore belongs to the session, not to the

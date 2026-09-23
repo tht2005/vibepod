@@ -47,6 +47,10 @@ type session struct {
 	clients map[*attachment]bool
 	done    chan int
 	ended   bool
+	// framed is a session `vp shell` started: its shells carry vibepod's prompt
+	// hooks, so a framed client can find command boundaries in their output,
+	// and a raw one would only see the prompts they wrap.
+	framed bool
 }
 
 // shellHandle is one shell, in the pod or on another machine. Both kinds look
@@ -65,11 +69,36 @@ type shellHandle struct {
 // is exactly what detaching means.
 type attachment struct {
 	out    *os.File
+	framed bool
 	stop   chan struct{}
 	closed sync.Once
 }
 
 func (a *attachment) done() { a.closed.Do(func() { close(a.stop) }) }
+
+// frameMark is an OSC only vibepod emits, telling a framed client something
+// the stream itself cannot: which machine it is now looking at, and where the
+// replayed scrollback ends and live output begins.
+func frameMark(kv string) []byte { return []byte("\x1b]7717;" + kv + "\a") }
+
+// show puts a shell's scrollback in front of a client that has just started
+// looking at it. A framed client gets it bracketed, so it can rebuild the
+// shell's state — at a prompt, or halfway through a command — from the
+// markers inside and then know which bytes are new.
+func (a *attachment) show(backend, note string, snap []byte) error {
+	var b []byte
+	if a.framed {
+		b = append(frameMark("backend="+backend), snap...)
+		b = append(b, frameMark("replayed")...)
+	} else {
+		b = append([]byte(note), snap...)
+	}
+	if len(b) == 0 {
+		return nil
+	}
+	_, err := a.out.Write(b)
+	return err
+}
 
 func (sess *session) interactive() bool {
 	sess.mu.Lock()
@@ -109,6 +138,7 @@ func (s *podState) startSession(m *proto.Msg, kind string) (*session, error) {
 		shells:  map[string]*shellHandle{},
 		clients: map[*attachment]bool{},
 		done:    make(chan int, 1),
+		framed:  m.Framed,
 	}
 	s.mu.Lock()
 	s.sessions[id] = sess
@@ -252,12 +282,8 @@ func (sess *session) switchTo(s *podState, backend string) error {
 			"moves it back]\x1b[0m\r\n", sess.id)
 	}
 	for _, a := range clients {
-		if _, err := a.out.Write([]byte(banner)); err != nil {
+		if err := a.show(backend, banner, snap); err != nil {
 			a.done()
-			continue
-		}
-		if len(snap) > 0 {
-			_, _ = a.out.Write(snap)
 		}
 	}
 	return nil
@@ -305,6 +331,10 @@ func (sess *session) pump(s *podState, sh *shellHandle) {
 	for a := range sess.clients {
 		clients = append(clients, a)
 	}
+	var back []byte
+	if sess.primary != nil && !primary {
+		back = sess.primary.ring.Snapshot()
+	}
 	sess.mu.Unlock()
 
 	if primary {
@@ -332,7 +362,11 @@ func (sess *session) pump(s *podState, sh *shellHandle) {
 		note := fmt.Sprintf("\r\n\x1b[2m[vibepod: the shell on %s ended; back on %s]\x1b[0m\r\n",
 			sh.backend, fallback)
 		for _, a := range clients {
-			_, _ = a.out.Write([]byte(note))
+			if a.framed {
+				_ = a.show(fallback+";ended="+sh.backend, "", back)
+			} else {
+				_, _ = a.out.Write([]byte(note))
+			}
 		}
 	}
 	sh.master.Close()
@@ -356,18 +390,19 @@ func (sh *shellHandle) finish(code int) {
 // terminal: a read blocked on a tty does not reliably come back when the
 // descriptor is closed, and a daemon still holding that read goes on eating
 // keystrokes that belong to whoever comes next.
-func (sess *session) attach(out *os.File, detachCh <-chan struct{}) (code int, detached bool) {
-	a := &attachment{out: out, stop: make(chan struct{})}
+func (sess *session) attach(out *os.File, framed bool,
+	detachCh <-chan struct{}) (code int, detached bool) {
+	a := &attachment{out: out, framed: framed, stop: make(chan struct{})}
 	sess.mu.Lock()
 	var snap []byte
+	backend := ""
 	if sess.cur != nil {
 		snap = sess.cur.ring.Snapshot()
+		backend = sess.cur.backend
 	}
 	sess.clients[a] = true
 	sess.mu.Unlock()
-	if len(snap) > 0 {
-		_, _ = out.Write(snap)
-	}
+	_ = a.show(backend, "", snap)
 	defer func() {
 		sess.mu.Lock()
 		delete(sess.clients, a)
@@ -515,6 +550,7 @@ func (s *podState) live() []proto.SessionInfo {
 		}
 		out = append(out, proto.SessionInfo{
 			ID: id, Kind: sess.kind, Backend: backend, Argv: sess.argv,
+			Framed: sess.framed,
 			Uptime: time.Since(sess.started).Truncate(time.Second).String(),
 		})
 	}

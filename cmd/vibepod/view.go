@@ -738,3 +738,27 @@ func trim(s string, n int) string {
 	}
 	return b.String()
 }
+
+const (
+	dim   = "\x1b[2m"
+	bold  = "\x1b[1m"
+	reset = "\x1b[0m"
+)
+
+// visibleLen counts printable width, so an escape sequence does not eat a
+// column.
+func visibleLen(s string) int {
+	n, esc := 0, false
+	for _, r := range s {
+		switch {
+		case esc && (r == 'm' || r == 'K' || r == 'J' || r == 'H'):
+			esc = false
+		case esc:
+		case r == 0x1b:
+			esc = true
+		default:
+			n++
+		}
+	}
+	return n
+}
