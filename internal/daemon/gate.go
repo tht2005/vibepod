@@ -71,6 +71,14 @@ func (d *Daemon) handleExec(s *podState, n *sys.Notif) {
 	if !sys.NotifIDValid(s.p.GateFD, n.ID) {
 		return
 	}
+	// vibepod's own machinery is not a command anyone ran. A pod-local
+	// command that has been shimmed execs twice — the shim, then the stashed
+	// original — and recording both would show the user's command happening
+	// twice, which is worse than useless in a log whose job is to be trusted.
+	if strings.HasPrefix(path, pod.VpDir+"/") {
+		return
+	}
+
 	// Record every exec, not only the routed ones: the log exists to show what
 	// ran and where, and "here" is an answer.
 	argv, _ := execArgv(n)
