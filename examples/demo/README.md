@@ -137,9 +137,10 @@ beta's *own* directory, added after its pod was built, shows as "through a local
 FUSE hop" — a running namespace cannot be handed a new bind. `vp node drop beta`
 then `vp node add beta` rebuilds the pod and it becomes a plain bind.
 
-Directories on *this* machine (`project/`) are never in a node pod: that needs
-reverse mounts, which are not built. A command sent to beta from one of them runs
-in beta's home directory, and `vp log` says so once.
+Directories on *this* machine (`project/`) reach a node only if the mount says
+`expose_to: [beta]` (which needs rclone here, to serve it). Without that, a command
+sent to beta from one of them runs in beta's home directory, and `vp log` says so
+once.
 
 ## 9. The cockpit
 

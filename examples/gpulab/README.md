@@ -95,10 +95,14 @@ vp run -- sh -c 'cd /remote/vast0/duongnguyen/gpu-intern-26 && vp @aiotlab_3gpus
 vp node                              # what aiotlab holds
 ```
 
-**One requirement:** aiotlab mounts gpu03's directory *itself*, so aiotlab must be
-able to ssh to gpu03 with its own keys (or your forwarded agent). If it cannot, `vp
-node add` fails and says `aiotlab_3gpus_aiotlab cannot reach gpu03:…`. The
-fallback, relaying through this machine, is not built yet.
+aiotlab mounts gpu03's directory *itself* if it can ssh to gpu03 with its own
+keys. If it cannot, vibepod relays gpu03's data through your laptop instead and
+says so in `vp log` — which needs rclone on your laptop. Two alternatives:
+
+- lend aiotlab your ssh agent for this pod, so it can reach gpu03 directly:
+  `hosts: {aiotlab_3gpus_aiotlab: {forward_credentials: true}}`. The key stays on
+  your laptop; aiotlab can use it while the connection lives.
+- force a route with `via: direct` or `via: relay` on the mount.
 
 `vp node drop aiotlab_3gpus_aiotlab` removes the pod and its state from aiotlab.
 

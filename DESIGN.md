@@ -1,6 +1,6 @@
 # vibepod — design
 
-> Status: **v2 built and verified through M6a** (M0-M2 were v1; M3-M6a replaced it).
+> Status: **v2 built and verified, M3 through M7** (M0-M2 were v1).
 > v1 routed commands by working directory through a seccomp exec gate; using it
 > showed the mechanism cannot be made trustworthy, so v2 replaced it with an
 > explicit per-session **backend** and a live shell on it (§3), made the config a
@@ -8,11 +8,12 @@
 > compute-on-one-machine/data-on-another by running a pod on **every** backend so
 > the composed tree is uniform everywhere (§6a) rather than translating paths.
 >
-> What is not built: `via: relay`, the forwarded-agent credential proxy, `toolbin:`
-> pushes, port forwards, reverse mounts and `sync` mode. Per-file write tokens were
-> replaced by per-mount writer election, for a reason §11 records. §13 has the
-> milestone list and what each one cost; §12 the remaining unknowns. PLAN.md
-> records what was measured before v1.
+> Every milestone is built. Two departures from what this document first specified
+> are recorded where they were decided: per-file write tokens became per-mount
+> writer election (§11), and `sync` mode is kept consistent around execution rather
+> than continuously (§13). Relaying needs rclone on this machine. §13 has what each
+> milestone cost; §12 the remaining unknowns. PLAN.md records what was measured
+> before v1.
 
 ## 1. Problem
 
@@ -910,9 +911,11 @@ gitignored).
 Every field here is also settable while the pod runs (§9), and `vp save` writes the live
 state back. The file is a starting point and a snapshot, not a thing you restart for.
 
-Two fields in this example are not yet read: `via:` (a node uses its own ssh config, and the
-relay is unbuilt) and `lease:` (M6a). `toolbin:`, `ports:` and `expose_to:` are likewise
-accepted and unused. Everything else here is live.
+Every field in this example is read. Two that matter more than they look:
+`forward_credentials:` lends that machine your ssh agent for as long as the connection lives,
+and is off unless set; `expose_to:` is the only way a directory on this machine reaches
+another one. Mounts also take `host:/remote/path:/pod/path` in one string, and
+`mode: sync` for a local copy instead of a network mount.
 
 ## 9. Interface
 
@@ -1374,9 +1377,15 @@ order so that each one was usable on its own.
   on all of them, and which runs in a pod on a third.
   **Deliberately excludes the control plane**, so a `vp mount` after a node pod exists is a
   refusal naming the mount rather than a silent divergence.
-  Still missing: `via: relay` for a node with no path to the data, the forwarded-agent
-  credential proxy, `toolbin:` pushes and port forwards. A node uses its own ssh config, so
-  nothing is stored anywhere it was not already.
+  The rest of M6 followed: `via: auto|direct|relay`, relaying through this machine with
+  `rclone serve sftp` on its loopback and a reverse forward on the existing connection,
+  authenticated by a key made for that one tunnel; the forwarded-agent credential proxy,
+  opt-in per host with `forward_credentials:`; `toolbin:` copying a missing static tool,
+  retried only after an exit 127 that proves nothing ran; and port forwards. Running a node
+  on a real server's rclone (1.53, on aiotlab) found that it predates `--sftp-ssh`, that
+  `rclone mount --daemon` returns before the mount exists, and — the serious one — that
+  stopping a node pod did not flush write-back: a 20 MB file written and dropped straight
+  away arrived as 7.4 MB. All three are fixed and tested.
 - **M6a — the control plane. [done]** Per-mount generations; a reconciler that converges
   every node pod after `vp mount` and `vp unmount`, leaves an unreachable one behind rather
   than blocking, and catches it up when the lease loop hears from it again; per-mount
@@ -1387,19 +1396,20 @@ order so that each one was usable on its own.
   already running on a node; invalidation fanned out per mount to every other holder; and
   the connection budget, warned about before sshd starts refusing people.
   Per-file write tokens became per-mount writer election (§11). The flush and the
-  per-mount invalidation are rclone calls, and this machine has no rclone, so those two are
-  written against its API and verified only in the sshfs case, where there is nothing to
-  flush or forget.
+  per-mount invalidation are rclone calls; the suite now runs with a node side on rclone
+  1.53, which is what found that its flush endpoint was missing there.
   Building it found that node pods were keyed by pod name alone, so two ssh aliases for one
   machine shared a pod and the second `node add` adopted the first's — they are keyed by
   pod *and* alias now.
-- **M7 — polish. [tree views done; the rest not started]** The tree's views from §9 are
-  built: `-x` polls each running remote command's children and marks them as polled,
-  `--running`, `--failed --since 10m`, `vp tree <pid>` for one subtree, and
-  `--mounts`/`--exec` for one half — all renderings of the one tree the daemon already
-  sends. Reverse mounts (`expose_to:`) and `sync` mode are not built: both need this machine
-  to *serve* a directory to another, which is the same missing piece as `via: relay`, and
-  the only credential-safe server for it is `rclone serve sftp` (§12).
+- **M7 — polish. [done]** The tree's views from §9: `-x` polls each running remote
+  command's children and marks them as polled, `--running`, `--failed --since 10m`,
+  `vp tree <pid>` for one subtree, and `--mounts`/`--exec` for one half. Reverse mounts:
+  a local directory with a node in `expose_to:` is in that node's pod at the same path,
+  through the same relay. `sync` mode: a local copy pulled at `up`, pushed before a
+  command runs on its owner and pulled after — the same execution-aware rule as the
+  cache, and no timer — with deletions carried both ways and a changed-here,
+  deleted-there conflict kept and reported. Sync mounts are set at `up`, because a plain
+  directory cannot reach a pod that already exists.
 
 ### What building M3-M6 cost, and what it found
 

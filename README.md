@@ -281,13 +281,27 @@ judge. Your agent already gates commands, and pattern-matching shell strings for
 exception, and for a different reason: it opens a network path out of a sandbox
 whose purpose was containment.
 
-## Not built yet
+## Reaching data through this machine
 
-`via: relay` for a node with no path to the data machine, the forwarded-agent
-credential proxy, `toolbin:` pushes, port forwards, reverse mounts (`expose_to:`),
-`sync` mode, and the control plane that would let `vp mount` converge a pod that
-already has node pods — today that combination is a visible refusal naming the
-mount, and `down`/`up` replicates the new tree. `DESIGN.md` §13 has the list.
+A node pod mounts what it needs itself, from the machine that owns it. When it
+cannot — node-to-node ssh is firewalled on many clusters — `via: auto` (the default)
+notices and relays through this machine instead, and says why in `vp log`. A
+directory on *this* machine reaches a node only if its mount lists that node:
+
+```yaml
+  - local: ~/Git/proj
+    expose_to: [gpu05]         # in gpu05's pod at the same path: edit here, run there
+```
+
+The relay is `rclone serve sftp` on this machine's loopback, reached through a
+reverse forward on the ssh connection vibepod already holds, and authenticated by a
+key made for that one tunnel. It needs rclone here.
+
+Also available: `ports: [gpu03:8888]` (a remote port on localhost here),
+`forward_credentials: true` per host (lend that machine your ssh agent — off by
+default, and it is authority lent for as long as the connection lives),
+`toolbin: true` per host (copy a missing static tool there), and `mode: sync` (a
+local copy instead of a network mount, kept the same around each command).
 
 ## Layout
 
