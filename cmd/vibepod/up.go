@@ -51,13 +51,14 @@ func loadSpec(name string) (*proto.Msg, error) {
 		},
 		EnvPolicy: &proto.EnvPolicy{Mode: res.ForwardEnv.Mode,
 			Names: res.ForwardEnv.Names},
-		Mounts:    res.Mounts,
-		Ports:     res.Ports,
-		Machines:  res.Machines,
-		Detail:    res.Lease, // the lease, carried in the one free text field
-		ToolHosts: res.ToolHosts,
-		CanMount:  res.CanMount,
-		Config:    path,
+		Mounts:      res.Mounts,
+		Ports:       res.Ports,
+		Machines:    res.Machines,
+		Credentials: res.Credentials,
+		Detail:      res.Lease, // the lease, carried in the one free text field
+		ToolHosts:   res.ToolHosts,
+		CanMount:    res.CanMount,
+		Config:      path,
 		// The backend a new session opens on. Not a guess about anything: the
 		// machine is chosen, and this is the choice a session starts with.
 		Backend: res.Default,

@@ -273,6 +273,19 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 		s.d.logf("pod %s: %v on %s: not forwarding %s (they describe this machine)",
 			s.name, r.argv, backend, strings.Join(refused, ", "))
 	}
+	// On a machine trusted with this machine's ssh agent, a dispatched command gets
+	// it too — which is what makes `vp @gpu03 git push` work without a key on
+	// gpu03. Added after the environment filter on purpose: the caller's own
+	// SSH_AUTH_SOCK describes this machine and is refused; this one is the socket
+	// vibepod made on that machine.
+	if home := s.homeOf(backend); home != "" {
+		if sock, err := s.agentFor(backend, home); err == nil && sock != "" {
+			if np != nil {
+				sock = podAgentSock
+			}
+			env = append(env, "SSH_AUTH_SOCK="+sock)
+		}
+	}
 	req := remote.Req{Dir: dir, Argv: r.argv, Env: env, TTY: r.tty, ID: id}
 	copy(req.Files[:], r.files[:3])
 	code, err := host.Run(req)

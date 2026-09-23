@@ -202,6 +202,12 @@ func serve(specPath string) error {
 	if err := json.Unmarshal(b, &spec); err != nil {
 		return fail(fmt.Errorf("read the spec: %w", err))
 	}
+	// A trusted node reaches third machines with the agent of the machine that owns
+	// this pod, through a forwarded socket. Every ssh this process starts — sshfs,
+	// rclone — inherits it, and nothing else about the node's environment changes.
+	if spec.AgentSock != "" {
+		_ = os.Setenv("SSH_AUTH_SOCK", spec.AgentSock)
+	}
 	// A backend pushed into ~/.vp/bin is not on anyone's PATH. Put it there for
 	// this process only: nothing about the node's own environment is changed.
 	if home, err := os.UserHomeDir(); err == nil {

@@ -64,6 +64,11 @@ type podState struct {
 	relayLinks map[string]*relayLink
 	relaySeq   int
 	reach      map[string]string
+	// credentials are the machines allowed this machine's ssh agent, and agents the
+	// socket each one has, once forwarded.
+	credentials map[string]bool
+	agents      map[string]string
+	homes       map[string]string
 	// ports are the forwards this pod opened, closed when it goes down.
 	ports []proto.PortSpec
 	// lease is how long a node pod outlives silence from this daemon. It is the only

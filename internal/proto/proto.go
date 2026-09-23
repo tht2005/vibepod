@@ -209,6 +209,11 @@ type NodeSpec struct {
 	Hostname string   `json:"hostname,omitempty"`
 	// Cache bounds the on-node disk cache, as rclone spells it (e.g. "200G").
 	Cache string `json:"cache,omitempty"`
+	// AgentSock, when set, is a socket on this node that reaches the ssh agent of
+	// the machine that owns the pod. The node's own outbound ssh uses it; no key
+	// is ever copied. Present only for machines the config marked
+	// forward_credentials.
+	AgentSock string `json:"agent_sock,omitempty"`
 	// Lease is how long this pod outlives silence from the daemon before it
 	// flushes, unmounts and exits. Empty means forever, which is right for a
 	// machine you own and wrong for one you share.
@@ -279,6 +284,9 @@ type Msg struct {
 	// mount. A compute node with no data of its own is the case that needs this:
 	// it is named under `hosts:` and is a machine you dispatch to.
 	Machines []string `json:"machines,omitempty"`
+	// Credentials are the machines the config allowed to use this machine's ssh
+	// agent (forward_credentials: true). Everything else gets nothing.
+	Credentials []string `json:"credentials,omitempty"`
 	// Held is what a node pod reports it has, and Generation the desired state's
 	// version. Together they are the whole of the reconciler's input.
 	Held       []Held `json:"held,omitempty"`

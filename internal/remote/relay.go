@@ -47,13 +47,41 @@ func (h *Host) CancelReverse(remote, local int) {
 // CanReach asks a machine whether it can ssh to another by itself, with its own
 // config and keys. That is what `via: direct` depends on, and the question is put
 // to the node rather than answered here, because only the node knows.
-func (h *Host) CanReach(target string, extra []string) error {
+func (h *Host) CanReach(target string, extra []string, agentSock string) error {
 	cmd := "ssh " + strings.Join(append(BaseOpts(), extra...), " ") +
 		" -o ConnectTimeout=5 " + quote(target) + " true"
+	if agentSock != "" {
+		cmd = "SSH_AUTH_SOCK=" + quote(agentSock) + " " + cmd
+	}
 	args := append(h.Opts(), h.Alias, cmd)
 	out, err := exec.Command("ssh", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s", Explain(target, string(out)))
 	}
 	return nil
+}
+
+// ForwardAgent makes this machine's ssh agent reachable on that machine at a unix
+// socket path, over the multiplexed connection. The agent signs; no key is copied.
+// The socket exists only while the connection does.
+//
+// Removing any old socket first matters: sshd refuses to bind over a path that
+// exists unless its own StreamLocalBindUnlink is on, and that is off by default.
+func (h *Host) ForwardAgent(remoteSock, localSock string) error {
+	rm := append(h.Opts(), h.Alias, "rm -f "+quote(remoteSock)+"; mkdir -p "+
+		quote(dirOf(remoteSock)))
+	_ = exec.Command("ssh", rm...).Run()
+	args := append(h.Opts(), "-O", "forward", "-R", remoteSock+":"+localSock, h.Alias)
+	if out, err := exec.Command("ssh", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("forward the ssh agent to %s: %s", h.Alias,
+			strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func dirOf(p string) string {
+	if i := strings.LastIndex(p, "/"); i > 0 {
+		return p[:i]
+	}
+	return "."
 }

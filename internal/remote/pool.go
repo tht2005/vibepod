@@ -10,6 +10,8 @@
 package remote
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,9 +53,27 @@ func (p *Pool) Host(alias string) *Host {
 	if h, ok := p.hosts[alias]; ok {
 		return h
 	}
-	h := &Host{Alias: alias, ctlPath: filepath.Join(p.ctlDir, alias+".ctl")}
+	h := &Host{Alias: alias, ctlPath: ctlPath(p.ctlDir, alias)}
 	p.hosts[alias] = h
 	return h
+}
+
+// ctlPath names a host's multiplexing socket.
+//
+// Unix socket paths are limited to about 108 bytes, and ssh appends a random suffix
+// while creating one. A deep run directory or a long alias — server_a100_user01_proxy
+// is a real one — overflows that, and the failure reads as ssh being unable to
+// connect at all. So a path that would be too long becomes a short hashed name in a
+// directory of this user's own under the system temp dir.
+func ctlPath(dir, alias string) string {
+	natural := filepath.Join(dir, alias+".ctl")
+	if len(natural)+20 < 100 {
+		return natural
+	}
+	sum := sha256.Sum256([]byte(natural))
+	short := filepath.Join(os.TempDir(), fmt.Sprintf("vp-%d", os.Getuid()))
+	_ = os.MkdirAll(short, 0o700)
+	return filepath.Join(short, hex.EncodeToString(sum[:8])+".ctl")
 }
 
 // Hosts lists the aliases this pool has touched.

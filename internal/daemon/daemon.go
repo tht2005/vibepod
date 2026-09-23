@@ -521,6 +521,10 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	s.configPath = m.Config
 	s.canMount = m.CanMount
 	s.machines = m.Machines
+	s.credentials = map[string]bool{}
+	for _, h := range m.Credentials {
+		s.credentials[h] = true
+	}
 	s.toolHosts = m.ToolHosts
 	// Consent to put one binary in ~/.vp/bin on these machines, given at `up`
 	// where a person is watching. Without it a machine that needs a pod says so

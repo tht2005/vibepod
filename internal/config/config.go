@@ -173,9 +173,11 @@ func (t *RemoteTools) UnmarshalYAML(n *yaml.Node) error {
 
 // Resolved is a config checked against the filesystem and flattened.
 type Resolved struct {
-	Name  string
-	Lease string
-	Ports []proto.PortSpec
+	// Credentials are the machines allowed to use this machine's ssh agent.
+	Credentials []string
+	Name        string
+	Lease       string
+	Ports       []proto.PortSpec
 	// Machines is every machine this config names, mount or no mount. A compute
 	// node with no data of its own is still a machine this pod runs commands on.
 	Machines   []string
@@ -378,6 +380,12 @@ func (c *Config) Resolve() (*Resolved, error) {
 		}
 		r.Mounts = append(r.Mounts, proto.MountSpec{At: src, Src: src, Identity: true})
 	}
+	for name, h := range c.Hosts {
+		if h.ForwardCredentials {
+			r.Credentials = append(r.Credentials, name)
+		}
+	}
+	sort.Strings(r.Credentials)
 	for _, s := range c.Ports {
 		p, err := ParsePort(s)
 		if err != nil {

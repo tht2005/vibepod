@@ -191,7 +191,10 @@ func (s *podState) via(host string, m *mountRec) string {
 		return decided
 	}
 	decided = "direct"
-	if err := s.d.pool.Host(np.host).CanReach(m.Owner, s.nodeSSHExtra()); err != nil {
+	s.mu.Lock()
+	agent := s.agents[np.host]
+	s.mu.Unlock()
+	if err := s.d.pool.Host(np.host).CanReach(m.Owner, s.nodeSSHExtra(), agent); err != nil {
 		decided = "relay"
 		msg := fmt.Sprintf("%s → %s  direct: %v; relaying through this machine",
 			np.host, m.Owner, err)

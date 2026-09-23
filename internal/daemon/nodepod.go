@@ -260,10 +260,17 @@ func (s *podState) startNodePod(host string, consented map[string]bool, pr *Prog
 		}
 	}
 
+	// Before the spec: deciding direct-or-relay asks the node whether it can reach
+	// the owner, and a trusted node reaches it with the forwarded agent.
+	agentSock, err := s.agentFor(host, need.HomeDir)
+	if err != nil {
+		return err
+	}
 	spec, err := s.nodeSpecFor(host, need.HomeDir)
 	if err != nil {
 		return err
 	}
+	spec.AgentSock = agentSock
 	blob, err := json.Marshal(spec)
 	if err != nil {
 		return err
@@ -376,6 +383,9 @@ func (s *podState) stopNodePod(host string) {
 	// one of those mounts can have it writable; and so do its tunnels.
 	s.releaseWriter(host)
 	s.dropRelays(host)
+	s.mu.Lock()
+	delete(s.agents, host) // the forward dies with the connection; forget it too
+	s.mu.Unlock()
 	h := s.d.pool.Host(host)
 	if _, err := h.Capture(fmt.Sprintf("%s/.vp/bin/vibepod nodedown --pod %s",
 		np.home, s.nodeName(host))); err != nil {
