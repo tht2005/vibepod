@@ -1,6 +1,6 @@
 # vibepod — design
 
-> Status: design in progress. Decisions marked **[open]** still need a call.
+> Status: architecture settled. v1 scope is M0-M2 (§13). Remaining unknowns in §12.
 
 ## 1. Problem
 
@@ -106,16 +106,46 @@ Overrides: `@prod cmd`, `@local cmd`, `@pod cmd`.
 Pod-internal paths are permanently exempt, so MCP servers and agent-internal helpers
 always run locally and never get shipped to a remote.
 
-### Path identity  **[open — see §12]**
+### Path identity
 
-Proposed: a remote dir mounts at **its own absolute path** by default.
-`prod:/srv/api` appears in the pod as `/srv/api`, not `/work/api`.
+A remote directory mounts at **its own absolute path**. `prod:/srv/api` appears in the
+pod as `/srv/api`, not `/work/api`.
 
-This eliminates path translation entirely. Without it, `cat /work/api/x` forwarded to
-prod fails, because prod has no `/work/api` — and rewriting path-like arguments is
-fragile guesswork. With it, every path is valid verbatim on both sides.
+This is not cosmetic. Two things depend on it:
 
-`at:` remains available for the rare case where two hosts collide on a path.
+1. **Arguments forward verbatim.** `cat /srv/api/config.yml` means the same thing on
+   both sides. The alternative requires detecting which argv entries are paths and
+   rewriting them — heuristic guesswork that fails in rare, confusing ways.
+2. **Remote tool output stays openable.** Compiler errors, stack traces, and log lines
+   are full of remote absolute paths:
+
+   ```
+   error[E0432]: unresolved import
+     --> /srv/api/src/db.rs:14:5
+   ```
+
+   The agent's next move is to open that file. Under path identity it just works.
+   Under a rewritten mountpoint, every path a remote tool prints is one the agent
+   cannot open — on every invocation.
+
+**Remote binaries are unaffected by any of this.** A routed command runs on the remote,
+in the remote's own real filesystem; the pod namespace exists only on your machine.
+Hardcoded paths in remote binaries are as correct as they ever were.
+
+**The hazard runs the other way**: a mount can shadow a *local* system path, so a pod-local
+process reading `/usr/lib/...` silently gets remote files over FUSE. `vpctl up` prevents
+this at startup rather than leaving it as a runtime mystery:
+
+- refuse to mount over `/usr`, `/bin`, `/lib`, `/lib64`, `/sbin`, `/etc`, `/proc`,
+  `/sys`, `/dev`, or pod runtime dirs
+- refuse any target that already exists and is non-empty in the pod
+- refuse two mounts claiming the same path
+
+Each refusal names the offending mount and points at `at:`, which overrides placement
+explicitly — and re-enables the translation problem for that mount alone.
+
+Real project directories (`/srv`, `/opt`, `/data`, `/var/www`, `/home/deploy`) do not
+collide with local system paths, so the guard rarely fires.
 
 ## 6. Filesystem modes
 
@@ -159,8 +189,22 @@ Removable with one `rm -rf`.
 **Audit log.** Every command and the machine it landed on, in one place. For a tool whose
 pitch is "your agent runs commands on prod", provable history is a requirement.
 
+**Host access is an explicit allowlist.** Only paths named in `host_access:` are bound
+into the pod. An agent working on a client's remote code cannot read `~/Documents`,
+`~/.aws`, or a sibling client's repository. Nothing is granted implicitly.
+
 **Honest limit.** bwrap is a namespace, not a security boundary against a determined
 attacker. It contains accidents, not adversaries.
+
+## 7a. Failure behaviour
+
+When an SSH link drops mid-command, the command **fails loudly** with a reserved exit
+code (`75`, `EX_TEMPFAIL`) and a clearly-vibepod error on stderr. The daemon reconnects
+in the background so the next command succeeds.
+
+It does not silently retry. A routed `make deploy` or migration that already partially
+executed must not be re-run behind the agent's back — a visible failure the agent can
+reason about is strictly better than a half-applied change it never learns about.
 
 ## 8. Config
 
@@ -186,6 +230,8 @@ mounts:
   - remote: prod:/var/log/api
     mode: fuse
     readonly: true
+  - remote: staging:/srv/api       # collides with prod:/srv/api
+    at: /staging-api               # explicit override required
 
 host_access:                       # bound from host into pod
   - ~/.claude
@@ -237,24 +283,33 @@ replays the buffer. Killing the pod kills everything inside it.
 | Credentials | per-command reverse proxy, per-host opt-in | nothing stored remotely; trust decided per machine |
 | Remote footprint | push on demand, prompt first, `toolbin:` pre-authorizes | no speculative installs, no mid-run interruptions once trusted |
 | Pod identity | named, resolved from cwd's `vibepod.yaml` | docker-like when explicit, zero-argument in a project |
+| Path identity | mount at the remote's own absolute path | args forward verbatim; remote tool output stays openable. Shadowing guarded by a deny-list at `up` |
+| Host access | explicit allowlist | nothing granted implicitly; the agent cannot read unrelated projects or credentials |
+| Link drops | fail loudly, exit `75` | never silently re-run a partially-applied non-idempotent command |
 | Hosts | ssh_config aliases | inherits ProxyJump/keys/ports for free |
 | Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; ~3ms vpsh startup is negligible against RTT |
 
 ## 12. Open questions
 
-1. **Path identity** (§5) — mount remote dirs at their own absolute path by default?
-2. **`host_access` model** — explicit allowlist, or bind `$HOME` minus a denylist?
-3. **v1 scope** — how much of this ships in the first working version?
-4. Link-drop behaviour: reconnect transparently, or fail in-flight commands loudly?
-5. Multiple remotes in one pod — supported by the model, but is it a v1 goal?
-6. `sync` mode implementation: rsync loop, or embed a mutagen-style watcher?
+1. **Multiple remotes in one pod** — the model supports it; is it a v1 goal or M4?
+2. **`sync` mode implementation** — rsync loop, or embed a mutagen-style watcher?
+3. **Interactive TTY through `vpsh`** — `vim`, `htop`, and anything needing a live PTY on
+   the remote. Allocate a PTY per routed command, or detect and special-case?
+4. **`@host` prefix parsing** — does `vpsh` recognise it (works everywhere, including from
+   inside the agent), or is it `vpctl exec` only (unambiguous, but invisible to agents)?
+5. **`host_access` defaults** — ship per-agent presets (`agents: [claude]` implies
+   `~/.claude`, `~/.claude.json`, MCP config) so the first run isn't empty?
+6. **MCP servers that touch mounts** — they run pod-local and read over FUSE. Acceptable,
+   or do they need their own routing story?
 
 ## 13. Milestones
+
+**v1 = M0-M2.**
 
 - **M0 — the trick works.** Pod with local binds only, `vpsh` routing everything back to
   the pod. Proves namespace + shim + fd plumbing end to end.
 - **M1 — one remote.** Daemon, sshfs mount, cwd routing to a single host, warm
   ControlMaster. This is the first genuinely useful version.
-- **M2 — lifecycle.** `vpinit`, detach/attach, PTY buffer, `ps`/`down`.
+- **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, `ps`/`down`.
 - **M3 — real work.** Credential proxy, toolbin prompts, port forwards.
 - **M4 — polish.** Multi-host, audit log, `doctor`, `sync` mode.
