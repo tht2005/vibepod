@@ -39,16 +39,46 @@ func (r *execRec) elapsedMS() int64 {
 // far less than not growing without limit.
 const maxExecs = 4000
 
+// recordExec notes a new program.
+//
+// A pid can run several programs in turn — a shell commonly execs its last
+// command in place rather than forking — so an exec on a pid that is already
+// tracked is the *end* of what it was running. Treating it as an overwrite
+// would leave the tree attributing a shell's children to whatever it became.
 func (s *podState) recordExec(r *execRec) {
+	var replaced *execRec
 	s.mu.Lock()
-	s.execs[r.PID] = r
-	if len(s.execs) > maxExecs {
-		s.evictLocked()
+	if old, ok := s.execs[r.PID]; ok && !old.done() {
+		old.End = time.Now()
+		replaced = old
+		s.retire(old)
 	}
+	s.execs[r.PID] = r
 	s.mu.Unlock()
+
+	if replaced != nil {
+		s.publishExit(replaced, "replaced")
+	}
 	s.d.bus.Publish(event.Event{
 		Kind: event.KindExec, Pod: s.name, PID: r.PID, PPID: r.PPID,
 		Argv: r.Argv, Cwd: r.Cwd, Target: r.Target, Session: r.Session,
+	})
+}
+
+// retire moves a finished program into history, which is what the tree
+// collapses into a count. Caller holds the lock.
+func (s *podState) retire(r *execRec) {
+	s.history = append(s.history, r)
+	if len(s.history) > maxExecs {
+		s.history = s.history[len(s.history)-maxExecs:]
+	}
+}
+
+func (s *podState) publishExit(r *execRec, detail string) {
+	s.d.bus.Publish(event.Event{
+		Kind: event.KindExit, Pod: s.name, PID: r.PID, Argv: r.Argv,
+		Target: r.Target, Code: r.Code, ElapsedMS: r.elapsedMS(),
+		Session: r.Session, Detail: detail,
 	})
 }
 
@@ -61,19 +91,6 @@ func (s *podState) retarget(pid int, target string) {
 		r.Target = target
 	}
 	s.mu.Unlock()
-}
-
-func (s *podState) evictLocked() {
-	done := make([]*execRec, 0, len(s.execs))
-	for _, r := range s.execs {
-		if r.done() {
-			done = append(done, r)
-		}
-	}
-	sort.Slice(done, func(i, j int) bool { return done[i].End.Before(done[j].End) })
-	for i := 0; i < len(done)/2; i++ {
-		delete(s.execs, done[i].PID)
-	}
 }
 
 // watchExits notices when tracked processes end.
@@ -93,10 +110,12 @@ func (s *podState) watchExits() {
 		}
 		var finished []*execRec
 		s.mu.Lock()
-		for _, r := range s.execs {
+		for pid, r := range s.execs {
 			if !r.done() && !sys.Alive(r.PID) {
 				r.End = time.Now()
 				finished = append(finished, r)
+				delete(s.execs, pid)
+				s.retire(r)
 			}
 		}
 		s.mu.Unlock()
@@ -106,11 +125,7 @@ func (s *podState) watchExits() {
 			return finished[i].Start.Before(finished[j].Start)
 		})
 		for _, r := range finished {
-			s.d.bus.Publish(event.Event{
-				Kind: event.KindExit, Pod: s.name, PID: r.PID, Argv: r.Argv,
-				Target: r.Target, Code: r.Code, ElapsedMS: r.elapsedMS(),
-				Session: r.Session,
-			})
+			s.publishExit(r, "")
 		}
 	}
 }
@@ -130,9 +145,13 @@ func (s *podState) setExitCode(pid, code int) {
 // explains the exec half.
 func (s *podState) tree(all bool) *proto.Tree {
 	s.mu.Lock()
-	recs := make([]*execRec, 0, len(s.execs))
+	recs := make([]*execRec, 0, len(s.execs)+len(s.history))
 	for _, r := range s.execs {
 		recs = append(recs, r)
+	}
+	completed := len(s.history)
+	if all {
+		recs = append(recs, s.history...)
 	}
 	sessions := make([]string, 0, len(s.sessions))
 	for id := range s.sessions {
@@ -179,6 +198,11 @@ func (s *podState) tree(all bool) *proto.Tree {
 		if r.done() && !all {
 			continue
 		}
+		// With --all, a pid may appear more than once; the live program wins
+		// the parenting, since that is what its children actually belong to.
+		if prev, ok := byPID[r.PID]; ok && prev.State == "running" {
+			continue
+		}
 		byPID[r.PID] = nodeOf(r)
 	}
 	// Attach each node to its parent when the parent is also tracked;
@@ -197,12 +221,6 @@ func (s *podState) tree(all bool) *proto.Tree {
 	}
 	// Completed work collapses to a count: an hour of agent work is hundreds
 	// of execs, and an uncollapsed tree is unreadable in either language.
-	completed := 0
-	for _, r := range recs {
-		if r.done() {
-			completed++
-		}
-	}
 	t.Completed = completed
 	sess := map[string]*proto.TreeSession{}
 	for _, n := range roots {

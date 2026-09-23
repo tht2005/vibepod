@@ -3,6 +3,7 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -93,6 +94,19 @@ func (pc *podConn) serve() {
 			}
 		case proto.OpLog:
 			pc.d.streamLog(pc.c, m)
+		case proto.OpUse:
+			// Own session only, and only from something holding a terminal.
+			if !hasTTY(pc.pid) {
+				pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: "use needs a terminal; " +
+					"run it from `vpctl shell`, or set exec_on: in the config"})
+				break
+			}
+			m.Session = sessionOf(uint32(pc.pid))
+			if err := pc.d.use(m); err != nil {
+				pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
+			} else {
+				pc.send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
+			}
 		default:
 			closeAll(fds)
 			pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID,
@@ -189,4 +203,13 @@ func (pc *podConn) forwardSignal(sig int) {
 	if err := host.Signal(id, sig); err != nil {
 		pc.d.logf("pod %s: forward signal %d to %s: %v", pc.s.name, sig, host.Alias, err)
 	}
+}
+
+// hasTTY reports whether a pod process has a terminal on stdin.
+func hasTTY(pid int) bool {
+	link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/0", pid))
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(link, "/dev/pts/")
 }

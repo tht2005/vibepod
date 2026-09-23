@@ -42,7 +42,9 @@ func (s *podState) startSession(m *proto.Msg, kind string) (*session, error) {
 		"VIBEPOD_POD="+s.name,
 		"VIBEPOD_SESSION="+id,
 		"VIBEPOD_SOCK="+pod.SockPath,
+		"PATH="+podPath(m.Env),
 	)
+	s.claimSession(id)
 	reply, err := s.callFD(&proto.Msg{
 		Op: proto.OpSpawn, Argv: m.Argv, Env: env, Cwd: m.Cwd,
 		AllocPTY: true, Rows: m.Rows, Cols: m.Cols, Session: id,

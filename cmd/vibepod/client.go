@@ -15,6 +15,11 @@ import (
 // daemon is a user process with no privileges, so starting it needs no
 // ceremony and asks nothing of the user.
 func connect() (*proto.Conn, error) {
+	// Inside a pod, the only socket that exists is the pod's own — which is
+	// deliberately the weaker of the two. There is no host socket to find.
+	if s := os.Getenv("VIBEPOD_SOCK"); s != "" {
+		return proto.Dial(s)
+	}
 	sock := daemon.HostSock()
 	if c, err := proto.Dial(sock); err == nil {
 		return c, nil

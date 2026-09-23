@@ -34,7 +34,11 @@ type podState struct {
 	sessions map[string]*session
 	pins     map[string]string // session id -> pinned target
 	used     map[string]bool   // hosts this pod has routed to
-	execs    map[int]*execRec  // every program launch the gate has seen
+	// pendingSession names the session whose first process has been asked for
+	// but has not yet reached execve.
+	pendingSession string
+	execs          map[int]*execRec // the program each live pid is running
+	history        []*execRec       // programs that have ended
 
 	stopped chan struct{}
 
@@ -188,6 +192,30 @@ func (s *podState) stashOf(path string) (string, bool) {
 	defer s.mu.Unlock()
 	stash, ok := s.shims[path]
 	return stash, ok
+}
+
+// claimSession labels a session's first process.
+//
+// The exec gate reads a process's environment before execve replaces it, so
+// the very first exec of a session still carries vpinit's environment and not
+// the session token. Everything descended from it inherits the token
+// normally; only the root needs this. It is identified by its parent, which
+// is vpinit itself.
+func (s *podState) claimSession(id string) {
+	s.mu.Lock()
+	s.pendingSession = id
+	s.mu.Unlock()
+}
+
+func (s *podState) sessionForRoot(ppid int) string {
+	if ppid != s.p.Pid {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.pendingSession
+	s.pendingSession = ""
+	return id
 }
 
 func (s *podState) pinOf(sessionID string) string {

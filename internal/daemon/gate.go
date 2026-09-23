@@ -77,7 +77,11 @@ func (d *Daemon) handleExec(s *podState, n *sys.Notif) {
 	if len(argv) == 0 {
 		argv = []string{path}
 	}
+	ppid := sys.PPID(n.PID)
 	session := sessionOf(n.PID)
+	if session == "" {
+		session = s.sessionForRoot(ppid)
+	}
 	shim := d.shouldShim(s, path, cwd, n.PID)
 
 	// Report where this command will actually run, which is not always where
@@ -89,7 +93,7 @@ func (d *Daemon) handleExec(s *podState, n *sys.Notif) {
 		target = route.Resolve(s.table, cwd, s.pinOf(session)).Target
 	}
 	s.recordExec(&execRec{
-		PID: int(n.PID), PPID: sys.PPID(n.PID), Argv: argv, Cwd: cwd,
+		PID: int(n.PID), PPID: ppid, Argv: argv, Cwd: cwd,
 		Target: target, Session: session, Start: time.Now(),
 	})
 

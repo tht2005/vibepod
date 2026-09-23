@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -302,5 +303,81 @@ func TestRemoteExitCodeIsProxied(t *testing.T) {
 		if got != want {
 			t.Errorf("remote exit %d came back as %d", want, got)
 		}
+	}
+}
+
+// --- M2: visibility and the in-pod control plane ---------------------------
+
+// An agent inside a pod may look at anything and steer nothing. Without this
+// the agent could re-route itself to a machine its directory would never have
+// chosen — a capability nobody granted it.
+func TestInPodControlPlaneIsReadOnlyForTheAgent(t *testing.T) {
+	out, errOut, _ := inPod(t, "vpctl tree --json >/dev/null && echo READ_OK; "+
+		"vpctl log >/dev/null && echo LOG_OK; "+
+		"vpctl down e2e 2>&1; vpctl use vptest 2>&1")
+	if !strings.Contains(out, "READ_OK") {
+		t.Errorf("the agent could not read the tree: %q / %q", out, errOut)
+	}
+	if !strings.Contains(out, "LOG_OK") {
+		t.Errorf("the agent could not read the log: %q / %q", out, errOut)
+	}
+	if !strings.Contains(out, `"down" is not permitted from inside a pod`) {
+		t.Errorf("down was not refused from inside the pod: %q", out)
+	}
+	// use is the sharp edge: an agent that can pin its own executor grants
+	// itself a machine. Without a terminal it must be refused.
+	if !strings.Contains(out, "needs a terminal") {
+		t.Errorf("use was not gated inside the pod: %q", out)
+	}
+}
+
+func TestTreeJSONIsParseable(t *testing.T) {
+	inPod(t, "true")
+	out, _, code := vpctl(t, "tree", "--json", "e2e")
+	if code != 0 {
+		t.Fatalf("tree --json exit %d", code)
+	}
+	var tree struct {
+		Pod    string `json:"pod"`
+		Mounts []struct {
+			At     string `json:"at"`
+			Kind   string `json:"kind"`
+			Target string `json:"target"`
+		} `json:"mounts"`
+	}
+	if err := json.Unmarshal([]byte(out), &tree); err != nil {
+		t.Fatalf("tree --json is not valid JSON: %v\n%s", err, out)
+	}
+	if tree.Pod != "e2e" {
+		t.Errorf("tree reported pod %q", tree.Pod)
+	}
+	if len(tree.Mounts) == 0 {
+		t.Errorf("tree reported no mounts")
+	}
+}
+
+// The log is the trust surface: for a tool whose pitch is "your agent runs
+// commands on prod", what ran and where has to be provable.
+func TestLogRecordsWhereEachCommandRan(t *testing.T) {
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	marker := "log-probe-7b3"
+	onRemote(t, "cd "+remoteSrv+" && /usr/bin/env sh -c 'exit 9'")
+	onRemote(t, "cd "+workDir+" && /usr/bin/mkdir -p "+filepath.Join(workDir, marker))
+	time.Sleep(600 * time.Millisecond) // let the exit poller notice
+
+	out, _, code := vpctlIn(t, remoteDir, "log", "e2e-remote")
+	if code != 0 {
+		t.Fatalf("log exit %d", code)
+	}
+	if !strings.Contains(out, "vptest") {
+		t.Errorf("log does not show the remote command:\n%s", out)
+	}
+	if !strings.Contains(out, "✗ 9") {
+		t.Errorf("log lost a non-zero remote exit status:\n%s", out)
+	}
+	if !strings.Contains(out, "mkdir") || !strings.Contains(out, "pod") {
+		t.Errorf("log does not show the pod-local command:\n%s", out)
 	}
 }

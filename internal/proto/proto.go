@@ -70,6 +70,7 @@ type Spec struct {
 	Root     string   `json:"root"`     // host dir that becomes the pod root
 	RunDir   string   `json:"run_dir"`  // host dir bound in at /vp/run
 	ShimBin  string   `json:"shim_bin"` // host path of vpsh
+	CtlBin   string   `json:"ctl_bin"`  // host path of the vibepod binary
 	Binds    []Bind   `json:"binds"`
 	Env      []string `json:"env,omitempty"`
 	Hostname string   `json:"hostname,omitempty"`

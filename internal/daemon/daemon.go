@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -138,6 +139,8 @@ func (k *ctlConn) serve() {
 			} else {
 				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Tree: t})
 			}
+		case proto.OpUse:
+			d.reply(k.c, m, d.use(m))
 		case proto.OpSession, proto.OpAttach:
 			go k.runSession(m, fds)
 		case proto.OpWinch:
@@ -264,6 +267,9 @@ func (d *Daemon) up(m *proto.Msg) error {
 			ln.Close()
 			return err
 		}
+	}
+	if m.Spec.CtlBin == "" {
+		m.Spec.CtlBin, _ = os.Executable()
 	}
 	rules := make([]route.Rule, 0, len(m.Routes))
 	for _, r := range m.Routes {
@@ -402,6 +408,31 @@ func (d *Daemon) lookup(name string) (*podState, error) {
 	return s, nil
 }
 
+// use pins a session's executor. This is the sharp edge of the in-pod
+// control plane: an agent that can pin its own executor can send itself to a
+// machine its directory would never have chosen, granting itself a capability
+// nobody gave it. The tty check is a proxy for intent, not proof of it — but
+// it is cheap, it fails closed, and a human at a terminal has one where an
+// agent's subprocess does not.
+func (d *Daemon) use(m *proto.Msg) error {
+	s, err := d.lookup(m.Pod)
+	if err != nil {
+		return err
+	}
+	if m.Session == "" {
+		return fmt.Errorf("use applies to a session; none was named")
+	}
+	s.mu.Lock()
+	if m.Target == "" || m.Target == "auto" {
+		delete(s.pins, m.Session)
+	} else {
+		s.pins[m.Session] = m.Target
+	}
+	s.mu.Unlock()
+	d.logf("pod %s: session %s now runs on %s", s.name, m.Session, m.Target)
+	return nil
+}
+
 // runDirect runs a process in the pod on the client's own file descriptors,
 // so the daemon never sits in the data path.
 func (d *Daemon) runDirect(s *podState, m *proto.Msg, fds []int) (int, error) {
@@ -424,7 +455,9 @@ func (d *Daemon) runDirect(s *podState, m *proto.Msg, fds []int) (int, error) {
 		"VIBEPOD_POD="+s.name,
 		"VIBEPOD_SESSION="+id,
 		"VIBEPOD_SOCK="+pod.SockPath,
+		"PATH="+podPath(m.Env),
 	)
+	s.claimSession(id)
 	reply, err := s.call(&proto.Msg{
 		Op: proto.OpSpawn, Argv: m.Argv, Env: env, Cwd: m.Cwd,
 		TTY: m.TTY, Session: id,
@@ -447,6 +480,17 @@ func shimBinary() (string, error) {
 		return "", fmt.Errorf("vpsh not found next to %s: %w", self, err)
 	}
 	return cand, nil
+}
+
+// podPath puts the pod's own tools first, so an agent can run `vpctl tree`
+// without being told where it lives.
+func podPath(env []string) string {
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, "PATH="); ok {
+			return pod.BinDir + ":" + v
+		}
+	}
+	return pod.BinDir + ":/usr/bin:/bin"
 }
 
 func closeAll(fds []int) {

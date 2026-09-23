@@ -17,6 +17,8 @@ const (
 	RunDir   = "/vp/run"
 	SockPath = "/vp/run/pod.sock"
 	ShimPath = "/vp/bin/vpsh"
+	CtlPath  = "/vp/bin/vpctl"
+	BinDir   = "/vp/bin"
 	StashDir = "/vp/real"
 )
 
@@ -144,6 +146,13 @@ func buildVp(vp string, spec *proto.Spec) error {
 	}
 	if err := sys.BindOver(spec.ShimBin, filepath.Join(vp, "bin", "vpsh"), true); err != nil {
 		return err
+	}
+	// The agent's own view of vibepod: read-only, and limited by which socket
+	// it can reach rather than by what the binary can do.
+	if spec.CtlBin != "" {
+		if err := sys.BindOver(spec.CtlBin, filepath.Join(vp, "bin", "vpctl"), true); err != nil {
+			return err
+		}
 	}
 	return os.Chmod(vp, 0o555)
 }

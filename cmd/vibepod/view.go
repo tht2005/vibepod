@@ -12,6 +12,15 @@ import (
 	"vibepod/internal/proto"
 )
 
+// podArg falls back to the pod this process is running in, so an agent
+// inside a pod never has to know its own name.
+func podArg(name string) string {
+	if name != "" {
+		return name
+	}
+	return os.Getenv("VIBEPOD_POD")
+}
+
 // cmdLog renders what has run and where. log and tree pair rather than
 // overlap: log is flat, chronological and finished; tree is hierarchical,
 // live and running.
@@ -27,7 +36,8 @@ func cmdLog(args []string) error {
 		return err
 	}
 	defer c.Close()
-	if err := c.Send(&proto.Msg{Op: proto.OpLog, Pod: fs.Arg(0), Follow: *follow}); err != nil {
+	if err := c.Send(&proto.Msg{Op: proto.OpLog, Pod: podArg(fs.Arg(0)),
+		Follow: *follow}); err != nil {
 		return err
 	}
 	for {
@@ -101,7 +111,7 @@ func cmdTree(args []string) error {
 		return err
 	}
 	defer c.Close()
-	reply, err := call(c, &proto.Msg{Op: proto.OpTree, Pod: fs.Arg(0), All: *all})
+	reply, err := call(c, &proto.Msg{Op: proto.OpTree, Pod: podArg(fs.Arg(0)), All: *all})
 	if err != nil {
 		return err
 	}

@@ -8,10 +8,10 @@ import (
 )
 
 const (
-	tiocGPTN    = 0x80045430
-	tiocSPTLCK  = 0x40045431
-	tiocGWINSZ  = 0x5413
-	tiocSWINSZ  = 0x5414
+	tiocGPTN   = 0x80045430
+	tiocSPTLCK = 0x40045431
+	tiocGWINSZ = 0x5413
+	tiocSWINSZ = 0x5414
 )
 
 // Winsize is the terminal size, as the kernel represents it.

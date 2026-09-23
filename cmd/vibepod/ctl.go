@@ -15,6 +15,7 @@ import (
 
 const usage = `vpctl - run your agent here, run its commands where the code lives
 
+  vpctl new [name]             create a pod and open the console
   vpctl up [name]              create a pod, detached
   vpctl run [name] -- cmd...   run a command in a pod, creating it if needed
   vpctl shell [name]           another terminal on a running pod
@@ -23,6 +24,7 @@ const usage = `vpctl - run your agent here, run its commands where the code live
   vpctl log [-f] [pod]         every command and the machine it ran on
   vpctl tree [pod]             mounts and live execs, in one view
   vpctl down [name]            stop a pod and release its mounts
+  vpctl use <host|auto>        send this session's commands to a machine
   vpctl doctor                 check this machine can host a pod
 
 A pod takes its name and mounts from ./vibepod.yaml unless you name one.
@@ -35,6 +37,8 @@ func runCtl(args []string) int {
 	}
 	var err error
 	switch args[0] {
+	case "new":
+		return cmdNew(args[1:])
 	case "up":
 		err = cmdUp(args[1:])
 	case "run":
@@ -51,6 +55,8 @@ func runCtl(args []string) int {
 		err = cmdTree(args[1:])
 	case "down":
 		err = cmdDown(args[1:])
+	case "use":
+		err = cmdUse(args[1:])
 	case "doctor":
 		err = cmdDoctor()
 	case "-h", "--help", "help":
@@ -221,6 +227,31 @@ func podCwd(binds []proto.Bind) string {
 		return binds[0].Dst
 	}
 	return "/"
+}
+
+// cmdUse pins the current session's executor. Prefer exec_on: in the config
+// for anything durable: a pin is invisible in the config and outlives your
+// memory of setting it.
+func cmdUse(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: vpctl use <host|auto>")
+	}
+	session := os.Getenv("VIBEPOD_SESSION")
+	if session == "" {
+		return fmt.Errorf("no session here; run this inside a pod terminal")
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_, err = call(c, &proto.Msg{Op: proto.OpUse, Pod: os.Getenv("VIBEPOD_POD"),
+		Session: session, Target: args[0]})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("commands from this session now run on %s\n", args[0])
+	return nil
 }
 
 func cmdPs() error {
