@@ -1057,8 +1057,10 @@ backend, `⏎` attaches, `/` filters the log, `q` quits.
 on the real terminal, and redraws when it returns** — what `lazygit` does with `$EDITOR`.
 `vp attach` decides how the session is shown (blocks for a `vp shell` session, raw for
 anything else), so every door into a session shows it the same way. Both the cockpit and
-`vp shell` are drawn with Bubble Tea and Lip Gloss, in the terminal's own sixteen colours
-so they follow the user's theme.
+`vp shell` live in `internal/ui` and share one theme, drawn with Bubble Tea and Lip Gloss
+in the terminal's own sixteen colours so they follow the user's theme. A machine has one
+colour everywhere: its dot in the cockpit, its bar on each activity line, the bar of each
+block `vp shell` prints for it.
 
 This is deliberate, and it is the reason the TUI is a cockpit rather than a multiplexer.
 Running Claude Code inside a homemade multiplexer means nested alt-screens, mouse reporting

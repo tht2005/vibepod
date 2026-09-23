@@ -40,6 +40,23 @@ func (r *ptyRun) screen() string {
 	return b.String()
 }
 
+// altScreen is whether a terminal fed this output would be on its alternate
+// screen now.
+func (r *ptyRun) altScreen() bool {
+	e := vt.NewEmulator(100, 24)
+	go func() {
+		b := make([]byte, 1024)
+		for {
+			if _, err := e.Read(b); err != nil {
+				return
+			}
+		}
+	}()
+	defer e.Close()
+	_, _ = e.Write([]byte(r.out.String()))
+	return e.IsAltScreen()
+}
+
 func (r *ptyRun) seeScreen(t *testing.T, want string, d time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(d)

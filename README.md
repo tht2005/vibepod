@@ -233,21 +233,25 @@ this. So is a shell whose hooks do not take (fish, for now), and it says so.
 `vibepod` with no arguments:
 
 ```
-vibepod · work
-MACHINES                                │ACTIVITY
-● pod*        ~/Git/notes                │14:02:11 gpu03  python train.py      ●
-● gpu03       /remote/vast0/…/proj       │14:01:40 pod    rg TODO           ✓ .3s
-○ gpu05       vp mount gpu05:/path       │13:58:02 gpu03  rocm-smi          ✓
-                                         │
-SESSIONS                                 │
-1   claude     ▸ pod                     │
-2   shell      ▸ gpu03                   │
-                                         │
-MOUNTS                                   │
-  /remote/vast0/…/proj    gpu03:/remote… │
-─────────────────────────────────────────┴──────────────────────────────────
- backend gpu03 │ m mount  u unmount  b backend  ⏎ attach  ⇥ pane  / filter  q quit
+╭─ vibepod · work ───────────────────────────────────────────────────────────╮
+│ MACHINES                        │ ACTIVITY                                 │
+│ ❯ ● pod*     ~/Git/notes        │ ▌ 14:02 gpu03  python train.py         ⠋ │
+│   ● gpu03    /remote/vast0/…    │ ▌ 14:01 pod    rg TODO           ✓ 0.3s  │
+│   ○ gpu05    vp mount gpu05:/…  │ ▌ 13:58 gpu03  rocm-smi          ✓ 1.2s  │
+│                                 │                                          │
+│ SESSIONS                        │                                          │
+│ › 1  claude  ▸ pod              │                                          │
+│   2  shell   ▸ gpu03            │                                          │
+│                                 │                                          │
+│ MOUNTS                          │                                          │
+│   /remote/vast0/…/proj    gpu03 │                                          │
+╰─ mount gpu05:/data — done ─────────────────────────────────────────────────╯
+ pod  session 1       m mount · u unmount · b backend · ⏎ attach · q quit
 ```
+
+It is drawn in the same language as `vp shell`: a machine has one colour in
+both (the dot, its activity bar, its blocks), `❯` marks where the keys act,
+and the last thing the cockpit had to say sits in the bottom edge.
 
 `⏎` does not draw a terminal inside a pane. It **leaves the alt-screen, runs
 `vp attach` on the real terminal, and redraws when you come back** — what

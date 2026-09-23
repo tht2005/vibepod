@@ -142,7 +142,7 @@ func TestCockpitHandsTheTerminalToASessionAndTakesItBack(t *testing.T) {
 	if !r.seeScreen(t, "left running", 15*time.Second) {
 		t.Fatalf("the cockpit did not take the terminal back; got:\n%s", r.screen())
 	}
-	if !strings.Contains(r.out.String()[mark:], "\x1b[?1049h") {
+	if !r.altScreen() {
 		t.Errorf("the cockpit did not re-enter the alt-screen after the handoff")
 	}
 	r.send("q")
