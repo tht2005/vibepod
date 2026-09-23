@@ -28,29 +28,96 @@ Planes 1 and 2 are plumbing. Plane 3 is the product.
 
 ## 3. The mechanism
 
-**Inside the pod, `/bin/sh` and `/bin/bash` are `vpsh`, a dispatcher.**
+Two parts: an **exec gate** that sees every program launch, and **lazy bind-shims** that
+do the redirecting.
 
-The pod is a mount namespace, so a fake shell can be bind-mounted over the real one
-*inside the pod only*, without touching the host.
+### Why not intercept the shell
+
+The obvious design — bind `vpsh` over `/bin/sh` and forward the `-c` string verbatim —
+does not survive contact with a real agent. Measured, in this repo:
 
 ```
-agent runs:  bash -c "cargo test"        (cwd = /srv/api)
-vpsh:        → vibepod: {pod, cwd, argv, env, tty?}
-vibepod:     /srv/api is mounted from prod → warm ControlMaster
-             ssh prod 'cd /srv/api && exec bash -c "cargo test"'
-             stream stdout/stderr/exit back
+$SHELL = /usr/bin/zsh                      # not /bin/sh, not /bin/bash
+
+/usr/bin/zsh -c 'source ~/.claude/shell-snapshots/snapshot-zsh-*.sh 2>/dev/null || true
+                 && setopt NO_EXTENDED_GLOB ... 2>/dev/null || true
+                 && eval '"'"'<the actual command>'"'"'
+                 && pwd -P >| /tmp/claude-XXXX-cwd'
 ```
 
-Why this interception point:
+Each call is a fresh `zsh -c`, not a persistent shell. Environment continuity comes from
+replaying a snapshot file; cwd continuity comes from writing `pwd -P` to a **local** temp
+file that the next call reads. Ship that string to a remote and:
 
-- **Universal by construction.** Claude, Codex, OpenCode, or a shell script — anything
-  that shells out gets routed. No per-agent plugin. The agent never knows.
-- **No parsing.** The `-c` string is forwarded verbatim. Pipelines, heredocs,
-  redirections, `&&` stay bash's problem.
-- **One policy file.** Routing lives in the daemon, not scattered through shims.
+- the snapshot path does not exist there, so the environment silently evaporates
+- `setopt` is a zsh builtin, so the remote needs zsh
+- `pwd -P >| /tmp/claude-XXXX-cwd` **writes on the wrong machine**, so `cd` stops
+  persisting between calls — silently
+- the whole string is zsh syntax handed to whatever shell the remote has
 
-Known limitation: a pipeline picks **one** side. `cat local.txt | remote-tool` runs
-entirely on one machine. Documented, not fixed.
+This is the default path for the primary agent, not a corner case. The shell must stay
+local, where its wrapper, builtins, redirections, and cwd tracking all work untouched.
+Interception belongs one level down, at the program.
+
+### The exec gate
+
+`vpinit` installs a seccomp filter with `SECCOMP_RET_USER_NOTIF` on `execve`/`execveat`,
+passes the listener fd to `vibepod` over `SCM_RIGHTS`, then drops its capabilities. The
+filter is inherited by every descendant, so the daemon observes **every exec in the pod** —
+including statically-linked and agent-bundled binaries that no `$PATH` shim could catch.
+
+This requires `CAP_SYS_ADMIN` in the pod's user namespace, which
+`bwrap --unshare-user --cap-add ALL` grants (verified: `CapEff` goes from `0` to
+`0x1ffffffffff`, including `cap_sys_admin`). The capability is scoped to the pod's userns,
+never the host, and `vpinit` drops it immediately after installing the filter.
+
+### Lazy bind-shims
+
+seccomp-notify is a **gate, not a rewriter** — the supervisor may allow, deny, or
+`CONTINUE`, but cannot alter `execve`'s arguments. The redirect uses the one thing notify
+does provide: it freezes the syscall while the daemon decides.
+
+```
+agent execs /usr/bin/cargo
+  → notify fires; the process is frozen mid-syscall
+  → daemon: cargo, cwd /srv/api → prod. No shim at that path yet.
+  → daemon nsenters the pod mount ns, bind-mounts vpsh over /usr/bin/cargo
+  → reply CONTINUE
+  → the kernel resolves the path now, and finds the shim
+```
+
+Path resolution happens after the syscall resumes, so the bind lands in time. First exec
+of a binary pays one mount (~1ms); every exec after is free. No `$PATH` enumeration, no
+shim-set staleness, and no ptrace — which matters, because ptrace is exclusive and would
+break `strace` and `gdb` *inside* the pod.
+
+Where seccomp-notify is unavailable (older kernels, nested containers), this degrades to a
+statically generated shim directory built from the remote's own `$PATH`. Same daemon-side
+policy, weaker coverage.
+
+### What this buys
+
+- **Agent wrappers work untouched.** The wrapper, `source`, `setopt`, and the `pwd -P`
+  capture all run locally, so cwd tracking keeps working.
+- **`cd /srv/api` is a local operation** against the mount, and needs no special handling.
+- **Pipelines split naturally.** `rg foo | head -20` runs `rg` on the remote and `head`
+  in the pod, streaming between them — better than routing the whole pipeline one way.
+- **Direct execs are caught.** The agent's built-in Grep spawns ripgrep without a shell;
+  under shell-level interception that read would have gone over FUSE.
+
+Known cost: a redirection like `cmd > out.txt`, where `out.txt` sits in a FUSE mount, has
+the remote program's stdout streamed back and written locally over FUSE. Correct, slower
+than native, optimisable later.
+
+### Terminal and signals
+
+SSH does not forward `SIGINT` without a PTY, so Ctrl-C on a routed `make` would otherwise
+leave an orphan on the remote. But `-tt` merges stderr into stdout and mangles binary
+output, and agents parse those streams separately.
+
+So: **piped by default**, with signals forwarded by killing the remote *process group* over
+a second multiplexed channel (~5ms, pure POSIX, nothing installed remotely). **PTY only
+when vpsh's own stdio is a tty** — which is exactly `vpctl shell` and interactive programs.
 
 ## 4. Architecture
 
@@ -66,8 +133,9 @@ entirely on one machine. Documented, not fixed.
 │                            └─ audit log                        │
 │                            ▲                                   │
 │  ┌─ pod "work" (bwrap namespace) │                             │
-│  │   vpinit (PID 1) ─────────────┤  holds ns, reaps, signals   │
-│  │   /bin/sh → vpsh ─────────────┘  every command routes here  │
+│  │   vpinit (PID 1) ─────────────┤  holds ns; owns exec gate   │
+│  │     └ seccomp notify fd ──────┤  every execve, to the daemon│
+│  │   vpsh (bind-mounted lazily) ─┘  over intercepted binaries  │
 │  │   /srv/api    ← sshfs  prod:/srv/api                        │
 │  │   ~/Git/notes ← bind   (local)                              │
 │  │   ~/.claude   ← bind   (local, rw)                          │
@@ -85,8 +153,8 @@ entirely on one machine. Documented, not fixed.
 |---|---|
 | `vpctl` | thin client. `up`, `ps`, `shell`, `run`, `attach`, `exec`, `down` |
 | `vibepod` | rootless user daemon, auto-spawned on first use. Owns everything long-lived |
-| `vpinit` | PID 1 inside each pod. Holds the mount namespace open, reaps zombies, forwards signals |
-| `vpsh` | the `/bin/sh` shim. Forwards `(cwd, argv, fds, tty)` to the daemon, proxies exit code |
+| `vpinit` | PID 1 inside each pod. Holds the mount namespace open, installs the seccomp exec gate then drops caps, reaps zombies, forwards signals |
+| `vpsh` | the shim, bind-mounted over intercepted binaries on demand. Forwards `(cwd, argv, env, fds, tty)` to the daemon, proxies exit code |
 
 `vpinit` exists because **a mount namespace only survives while a process is inside it.**
 Without it, detaching would destroy the pod.
@@ -147,19 +215,74 @@ explicitly — and re-enables the translation problem for that mount alone.
 Real project directories (`/srv`, `/opt`, `/data`, `/var/www`, `/home/deploy`) do not
 collide with local system paths, so the guard rarely fires.
 
-## 6. Filesystem modes
+## 6. Filesystem
+
+### FUSE cannot be mounted inside the pod
+
+bwrap forces `NoNewPrivs=1` (verified), which disables setuid. `fusermount3` is setuid
+root. Therefore **all mounts are made on the host by the daemon and bound into the pod.**
+
+Forced, but it yields a security property for free: the agent cannot unmount, remount, or
+tamper with any mount. There is no `fusermount -u` available to it.
+
+Getting a mount into an already-running pod: `/` has `shared` propagation here and bwrap
+makes the pod root `rslave`, so host mounts should propagate inward. The fallback that
+always works is `nsenter` into the pod's mount+user namespace — same uid, so permitted —
+and binding there. Verify propagation in M1; design for the fallback.
+
+### Who actually reads through FUSE
+
+Less than it first appears. Under routing, `rg`, `make`, and `cargo` execute **on the
+remote against its local disk** and never touch FUSE. The FUSE load is only:
+
+- the agent's built-in file tools (Read / Glob / Grep)
+- MCP servers
+- pod-local commands
+
+The worst of these is the agent's own Grep running ripgrep over the mount — which is
+precisely the direct exec the exec gate catches. **The FUSE performance risk is mostly the
+interception-gap problem wearing a different hat**; closing one closes the other.
+
+### Backend: rclone sftp with a VFS cache
+
+| | sshfs 3.7.6 | **rclone sftp + `--vfs-cache-mode full`** | custom Go FUSE |
+|---|---|---|---|
+| status | mature, maintenance-mode | actively developed | ours |
+| second read | round trip | local disk | whatever we build |
+| invalidation hook | none clean | `vfs/forget` via rc API | exact |
+| effort | none | small | large |
+
+The deciding factor is the invalidation hook — see below. `rclone` is **not** installed on
+this machine, so it is a real dependency to vendor or require.
+
+### Execution-aware cache invalidation
+
+A general-purpose network filesystem must guess: it caches for a second because it has no
+idea what is happening on the other end.
+
+**We are not guessing.** vibepod mediates every command, so it knows exactly when the
+remote tree could have changed — nothing else touches it. That permits effectively
+infinite attribute and entry timeouts, with invalidation driven by **command completion**
+rather than a timer. It is a correctness-preserving cache far more aggressive than any
+network FS can justify, and it exists only because of the routing layer.
+
+This is why the backend needs a `vfs/forget`-style hook. sshfs has none.
+
+### Mount modes
 
 `mode:` is per-mount, so the strategy can change without changing the config shape.
 
 | mode | behaviour | good for |
 |---|---|---|
-| `fuse` (default) | sshfs with aggressive caching. Remote is the single source of truth, zero drift | most repos, low-RTT links |
-| `sync` | bidirectional sync to a local scratch dir. Local-disk read speed | large repos, high-RTT links |
+| `fuse` (default) | rclone sftp + VFS cache, invalidated on command completion | most repos |
+| `sync` | bidirectional sync to a local scratch dir | huge repos, very high RTT |
 | `bind` | local directory, no network | local dirs |
 
-**The known risk:** agents are read-storms — glob, grep, read 40 files. At 30ms RTT,
-sshfs turns a 2-second `rg` into 40 seconds. This is the biggest UX risk in the design
-and the reason `sync` exists as an escape hatch.
+### Failure modes
+
+Link drop with open fds yields stale handles and `EIO`; the daemon remounts and reports it
+(§7a). Buffered writes lost to a drop can leave a partial file. Log directories and other
+read-only sources should be mounted `readonly: true`.
 
 ## 7. Security model
 
@@ -277,7 +400,12 @@ replays the buffer. Killing the pod kills everything inside it.
 | Topology | central `vibepod` daemon + per-pod `vpinit` | one socket, one audit log, shared ssh muxes; `vpinit` covers the namespace-lifetime requirement |
 | Privilege | rootless, auto-spawned | credentials are user-owned; root buys nothing and costs the security story |
 | Exec routing | cwd-inferred + `@host` override | no invisible mode state; agents get it right with zero prompting |
-| Interception | `/bin/sh` → `vpsh` | agent-agnostic, no command parsing |
+| Interception | seccomp exec gate + lazy bind-shims | agents wrap commands in generated shell scripts; the shell must stay local. Catches bundled and static binaries that `$PATH` shims cannot |
+| Redirect | bind-mount `vpsh` while notify holds the syscall | notify is a gate, not a rewriter; ptrace would break `strace`/`gdb` inside the pod |
+| Sandbox | bwrap, behind an interface | `--cap-add ALL` in the userns supplies the `CAP_SYS_ADMIN` the exec gate needs |
+| FUSE placement | mounted on the host, bound in | `NoNewPrivs=1` kills setuid `fusermount3`; the agent also cannot tamper with mounts |
+| FS backend | rclone sftp + VFS cache | local-disk re-reads, and a `vfs/forget` hook for execution-aware invalidation |
+| TTY & signals | piped by default, PTY when stdio is a tty | agents parse stdout/stderr separately; signals forwarded by remote process-group kill |
 | Remote FS | `fuse` default, `mode:` per mount | ship fast, escape hatch for latency without a config break |
 | Detach | dtach-style, built into the daemon | no tmux dependency, no prefix-key collisions |
 | Credentials | per-command reverse proxy, per-host opt-in | nothing stored remotely; trust decided per machine |
@@ -291,23 +419,26 @@ replays the buffer. Killing the pod kills everything inside it.
 
 ## 12. Open questions
 
-1. **Multiple remotes in one pod** — the model supports it; is it a v1 goal or M4?
-2. **`sync` mode implementation** — rsync loop, or embed a mutagen-style watcher?
-3. **Interactive TTY through `vpsh`** — `vim`, `htop`, and anything needing a live PTY on
-   the remote. Allocate a PTY per routed command, or detect and special-case?
-4. **`@host` prefix parsing** — does `vpsh` recognise it (works everywhere, including from
-   inside the agent), or is it `vpctl exec` only (unambiguous, but invisible to agents)?
-5. **`host_access` defaults** — ship per-agent presets (`agents: [claude]` implies
-   `~/.claude`, `~/.claude.json`, MCP config) so the first run isn't empty?
-6. **MCP servers that touch mounts** — they run pod-local and read over FUSE. Acceptable,
-   or do they need their own routing story?
+1. **`--cap-add ALL` portability** — verified on this kernel, but it is documented as
+   requiring a privileged user. Check across distros and kernel versions.
+2. **Mount propagation into a live pod** — does the `shared`/`rslave` path actually work,
+   or is `nsenter` the only reliable route?
+3. **rclone as a dependency** — vendor the binary, require it, or reconsider a custom
+   Go FUSE once access patterns are known?
+4. **Multiple remotes in one pod** — the model supports it; v1 goal or M4?
+5. **`sync` mode implementation** — rsync loop, or a mutagen-style watcher?
+6. **`@host` prefix parsing** — with the shell now local, where does the override live?
+7. **`host_access` defaults** — ship per-agent presets so the first run is not empty?
+8. **Bind-shim accumulation** — one mount per distinct binary. Is there a ceiling worth
+   caring about, and do shims need eviction?
 
 ## 13. Milestones
 
 **v1 = M0-M2.**
 
-- **M0 — the trick works.** Pod with local binds only, `vpsh` routing everything back to
-  the pod. Proves namespace + shim + fd plumbing end to end.
+- **M0 — the trick works.** bwrap pod, seccomp exec gate, lazy bind-shim redirect, local
+  binds only. Success is running Claude Code inside it and seeing every exec intercepted
+  with cwd tracking intact. This is the riskiest assumption in the design.
 - **M1 — one remote.** Daemon, sshfs mount, cwd routing to a single host, warm
   ControlMaster. This is the first genuinely useful version.
 - **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, `ps`/`down`.
