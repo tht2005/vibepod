@@ -644,11 +644,28 @@ func (co *cockpit) statusLine(w int) string {
 		machine = "—"
 	}
 	left := " " + paint(machine).Bold(true).Render(machine) + "  " + who
-	keys := stDim.Render("m mount · u unmount · b backend · ⏎ attach · tab switch list · / filter · q quit ")
-	if lipgloss.Width(left)+lipgloss.Width(keys)+2 > w {
-		keys = stDim.Render("⏎ attach · q quit ")
+	// As many hints as fit, the least needed dropped first.
+	hints := []string{"⏎ attach", "q quit", "m mount", "b backend", "tab switch",
+		"u unmount", "/ filter"}
+	order := []string{"m mount", "u unmount", "b backend", "⏎ attach",
+		"tab switch", "/ filter", "q quit"}
+	for n := len(hints); n > 0; n-- {
+		keep := map[string]bool{}
+		for _, h := range hints[:n] {
+			keep[h] = true
+		}
+		var shown []string
+		for _, h := range order {
+			if keep[h] {
+				shown = append(shown, h)
+			}
+		}
+		keys := stDim.Render(strings.Join(shown, " · ") + " ")
+		if lipgloss.Width(left)+lipgloss.Width(keys)+2 <= w {
+			return spread(left, keys, w)
+		}
 	}
-	return spread(left, keys, w)
+	return fit(left, w)
 }
 
 func shortHome(p string) string {
