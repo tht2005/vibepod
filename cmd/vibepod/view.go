@@ -124,6 +124,9 @@ func logLine(e event.Event, follow, all bool) string {
 			trim(strings.Join(e.Argv, " "), 40))
 	case event.KindPod:
 		return fmt.Sprintf("%s  %-8s pod %s %s", ts, "-", e.Pod, e.Detail)
+	case event.KindNotice:
+		return fmt.Sprintf("%s  %-8s %-40s %s", ts, e.Target,
+			trim(strings.Join(e.Argv, " "), 40), e.Detail)
 	}
 	return ""
 }

@@ -214,6 +214,14 @@ would never have chosen.
 parent of — routed ones. For a pod-local exec it knows the command ended but
 not what it returned, so the field is absent rather than zero.
 
+**Environment.** A routed command carries what you set for it — `VAR=v cmd`,
+or an `export` earlier in the same shell — and nothing else. Not your
+credentials, which is the promise above, and not your `PATH` or `HOME`, which
+describe this machine and would break the remote's toolchain. A variable
+declined for that reason is reported in `vpctl log` rather than dropped
+silently. `exec.forward_env` takes `none` or an explicit list if you want to
+say exactly what travels.
+
 **Guardrails.** There are none, by choice. vibepod routes and records; it does
 not judge. Your agent already gates commands, and pattern-matching shell
 strings for `rm -rf` is leaky in both directions. The log is the answer.

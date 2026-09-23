@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"vibepod/internal/event"
 	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/remote"
@@ -194,7 +195,20 @@ func (pc *podConn) runRemote(dec route.Decision, m *proto.Msg, files []*os.File)
 	pc.host, pc.execID = host, id
 	pc.mu.Unlock()
 
-	req := remote.Req{Dir: dec.Dir, Argv: m.Argv, TTY: m.TTY, ID: id}
+	// Carry what the caller set for this command, and nothing else. See
+	// env.go: the shell stays local, the delta crosses, identity never does.
+	env, refused := forwardEnv(pc.s.envMode, pc.s.baselineEnv(m.Session), m.Env)
+	if len(refused) > 0 {
+		// A refusal nobody mentions is how the bug this guards against got
+		// here. It does not go to the command's stderr — agents parse that —
+		// so it goes where the routing decisions go.
+		pc.d.logf("pod %s: %v on %s: not forwarding %s (they describe this machine)",
+			pc.s.name, m.Argv, dec.Target, strings.Join(refused, ", "))
+		pc.d.bus.Publish(event.Event{Kind: event.KindNotice, Pod: pc.s.name,
+			Target: dec.Target, Argv: m.Argv, Session: m.Session,
+			Detail: "not forwarded: " + strings.Join(refused, ", ")})
+	}
+	req := remote.Req{Dir: dec.Dir, Argv: m.Argv, Env: env, TTY: m.TTY, ID: id}
 	copy(req.Files[:], files[:3])
 	code, err := host.Run(req)
 

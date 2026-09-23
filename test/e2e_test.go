@@ -141,7 +141,10 @@ func vpctlIn(t *testing.T, dir string, args ...string) (string, string, int) {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(binDir, "vpctl"), args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+runDir)
+	cmd.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+runDir,
+		// Stands in for the credentials a real pod holds: it is in the session
+		// baseline, so it must never appear on a remote.
+		"VP_FAKE_TOKEN=shh")
 	if ssh != nil {
 		cmd.Env = append(cmd.Env, "VIBEPOD_SSH_CONFIG="+ssh.configFile)
 	}
@@ -479,5 +482,64 @@ func TestHostsAndWhereNameMachinesAndTheirDirectories(t *testing.T) {
 	out, _, code = vpctlIn(t, remoteDir, "where", "-q", "@vptest")
 	if code != 0 || strings.TrimSpace(out) != remoteSrv {
 		t.Errorf("where -q must print a bare path for `cd $(...)`: %q", out)
+	}
+}
+
+// A routed command must carry what the caller set for it, and nothing else.
+//
+// Dropping it entirely was the bug, and it failed silently: a discarded
+// PYTHONPATH arrives as ModuleNotFoundError, which reads as a broken install
+// rather than a discarded environment. Forwarding everything is not the fix —
+// a pod's environment holds the credentials this design exists to keep on one
+// machine, and describes this machine rather than the remote.
+func TestARoutedCommandCarriesOnlyWhatTheCallerSet(t *testing.T) {
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	// What the caller set for this command crosses.
+	out, errOut, code := onRemote(t, "cd "+remoteSrv+
+		" && VP_PROBE=hello /usr/bin/env | /usr/bin/grep '^VP_PROBE='")
+	if code != 0 {
+		t.Fatalf("exit %d: %s %s", code, out, errOut)
+	}
+	if !strings.Contains(out, "VP_PROBE=hello") {
+		t.Errorf("the caller's variable did not reach the remote: %q", out)
+	}
+
+	// An exported variable is the same thing one step earlier.
+	out, _, _ = onRemote(t, "cd "+remoteSrv+
+		" && export VP_EXPORTED=yes && /usr/bin/env | /usr/bin/grep '^VP_EXPORTED='")
+	if !strings.Contains(out, "VP_EXPORTED=yes") {
+		t.Errorf("an exported variable did not reach the remote: %q", out)
+	}
+
+	// The remote's own identity is not overwritten with ours. The fixture host
+	// is this machine, so compare against the session's value rather than a
+	// name: what matters is that we did not impose it.
+	out, _, _ = onRemote(t, "cd "+remoteSrv+" && /usr/bin/env | /usr/bin/grep '^PATH='")
+	if strings.Contains(out, "/vp/bin") {
+		t.Errorf("the pod's PATH was imposed on the remote: %q", out)
+	}
+
+	// And a variable that was already in the session baseline stays here. This
+	// is the project's headline promise, so it gets a credential-shaped name.
+	out, _, _ = onRemote(t, "cd "+remoteSrv+
+		" && /usr/bin/env | /usr/bin/grep -c VP_FAKE_TOKEN || true")
+	if strings.TrimSpace(out) != "0" {
+		t.Errorf("a variable from the session baseline crossed to the remote: %q", out)
+	}
+}
+
+// Refusing silently is how the original bug survived, so a variable we decline
+// to forward has to be visible somewhere.
+func TestARefusedVariableIsReported(t *testing.T) {
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	onRemote(t, "cd "+remoteSrv+" && PATH=/nonsense /usr/bin/true")
+	time.Sleep(600 * time.Millisecond)
+	out, _, _ := vpctlIn(t, remoteDir, "log", "e2e-remote")
+	if !strings.Contains(out, "not forwarded: PATH") {
+		t.Errorf("a refused variable was dropped silently:\n%s", out)
 	}
 }

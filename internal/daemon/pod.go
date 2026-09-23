@@ -31,11 +31,13 @@ type podState struct {
 
 	shimOnce sync.Mutex
 
-	mu         sync.Mutex
-	shims      map[string]string // shadowed path -> stashed original
-	sessions   map[string]*session
-	pins       map[string]string // session id -> pinned target
-	used       map[string]bool   // hosts this pod has routed to
+	mu       sync.Mutex
+	shims    map[string]string // shadowed path -> stashed original
+	sessions map[string]*session
+	pins     map[string]string // session id -> pinned target
+	// envMode is how much of a caller's environment crosses to a remote.
+	envMode    EnvPolicy
+	used       map[string]bool // hosts this pod has routed to
 	sessionSeq int
 	// pendingSession names the session whose first process has been asked for
 	// but has not yet reached execve.
@@ -55,6 +57,10 @@ type session struct {
 	kind string // "console", "shell", "agent"
 	pid  int
 	argv []string
+	// env is the baseline this session started with. A routed command carries
+	// the difference between its own environment and this, which is exactly
+	// what the caller set and nothing else.
+	env  []string
 	done chan int
 
 	master *os.File
@@ -224,6 +230,17 @@ func (s *podState) sessionForRoot(ppid int) string {
 	id := s.pendingSession
 	s.pendingSession = ""
 	return id
+}
+
+// baselineEnv is the environment a session started with, against which a
+// command's own environment is a delta.
+func (s *podState) baselineEnv(sessionID string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if sess := s.sessions[sessionID]; sess != nil {
+		return sess.env
+	}
+	return nil
 }
 
 func (s *podState) pinOf(sessionID string) string {

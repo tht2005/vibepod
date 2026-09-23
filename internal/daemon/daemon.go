@@ -347,6 +347,13 @@ func (d *Daemon) up(m *proto.Msg) error {
 	if m.Spec.CtlBin == "" {
 		m.Spec.CtlBin, _ = os.Executable()
 	}
+	policy := EnvPolicy{Mode: EnvDelta}
+	if m.EnvPolicy != nil {
+		policy = EnvPolicy{Mode: EnvMode(m.EnvPolicy.Mode), Names: m.EnvPolicy.Names}
+		if policy.Mode == "" {
+			policy.Mode = EnvDelta
+		}
+	}
 	rules := make([]route.Rule, 0, len(m.Routes))
 	for _, r := range m.Routes {
 		rules = append(rules, route.Rule{Prefix: r.Prefix, Target: r.Target,
@@ -370,6 +377,7 @@ func (d *Daemon) up(m *proto.Msg) error {
 		return err
 	}
 	s := newPodState(d, name, p, route.New(m.ExecDefault, rules), m.ShimAll)
+	s.envMode = policy
 	s.podLn = ln
 	s.fs = fsm
 
@@ -601,13 +609,8 @@ func (d *Daemon) runDirect(s *podState, m *proto.Msg, fds []int) (int, error) {
 		s.mu.Unlock()
 	}()
 
-	env := append([]string{}, m.Env...)
-	env = append(env,
-		"VIBEPOD_POD="+s.name,
-		"VIBEPOD_SESSION="+id,
-		"VIBEPOD_SOCK="+pod.SockPath,
-		"PATH="+podPath(m.Env),
-	)
+	env := sessionEnv(s.name, id, m.Env)
+	sess.env = env
 	s.claimSession(id)
 	reply, err := s.call(&proto.Msg{
 		Op: proto.OpSpawn, Argv: m.Argv, Env: env, Cwd: m.Cwd,
@@ -631,6 +634,18 @@ func shimBinary() (string, error) {
 		return "", fmt.Errorf("vpsh not found next to %s: %w", self, err)
 	}
 	return cand, nil
+}
+
+// sessionEnv is what a session's first process is launched with, and therefore
+// the baseline a routed command's environment is measured against.
+func sessionEnv(podName, session string, callerEnv []string) []string {
+	env := append([]string{}, callerEnv...)
+	return append(env,
+		"VIBEPOD_POD="+podName,
+		"VIBEPOD_SESSION="+session,
+		"VIBEPOD_SOCK="+pod.SockPath,
+		"PATH="+podPath(callerEnv),
+	)
 }
 
 // podPath puts the pod's own tools first, so an agent can run `vpctl tree`

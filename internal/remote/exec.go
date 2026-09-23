@@ -12,6 +12,7 @@ import (
 type Req struct {
 	Dir  string   // working directory, as it exists on that machine
 	Argv []string // argv[0] is resolved by the remote's own PATH
+	Env  []string // VAR=value assignments the caller set for this command
 	TTY  bool
 	ID   string // names the pid file, so the command can be signalled
 	// Files are the caller's own stdin, stdout and stderr. The daemon wires
@@ -30,8 +31,12 @@ const runDirExpr = `"${TMPDIR:-/tmp}/vibepod-$(id -u)"`
 // is what makes Ctrl-C work without a PTY, which agents need because they read
 // stdout and stderr separately.
 func (h *Host) Run(r Req) (int, error) {
-	script := fmt.Sprintf(`d=%s; mkdir -p "$d"; echo $$ > "$d/%s"; cd %s || exit 1; exec %s`,
-		runDirExpr, r.ID, quote(r.Dir), joinArgs(r.Argv))
+	// Assignments go before `exec`, not after: `exec VAR=v cmd` would have the
+	// shell look for a program called "VAR=v". Before it, they are exported to
+	// the exec'd process, and the pid is still the shell's — so the pid file
+	// above still names the command, and signals still reach it.
+	script := fmt.Sprintf(`d=%s; mkdir -p "$d"; echo $$ > "$d/%s"; cd %s || exit 1; %sexec %s`,
+		runDirExpr, r.ID, quote(r.Dir), assignments(r.Env), joinArgs(r.Argv))
 
 	args := h.Opts()
 	if r.TTY {
@@ -82,6 +87,41 @@ func (h *Host) Cleanup() error {
 // quote makes a string safe for a POSIX shell.
 func quote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// assignments renders VAR=value pairs for the front of a command, quoting the
+// values and leaving the names alone — a name that needed quoting would not be
+// a name.
+func assignments(env []string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, value, ok := strings.Cut(kv, "=")
+		if !ok || name == "" || !validName(name) {
+			continue
+		}
+		out = append(out, name+"="+quote(value))
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, " ") + " "
+}
+
+// validName guards the one place a value's syntax reaches the remote shell
+// unquoted.
+func validName(name string) bool {
+	for i, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func joinArgs(argv []string) string {

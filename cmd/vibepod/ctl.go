@@ -129,6 +129,8 @@ func loadSpec(name string, shimAll bool) (*proto.Msg, error) {
 			Hostname:    res.Name,
 			RemoteTools: res.RemoteTools,
 		},
+		EnvPolicy: &proto.EnvPolicy{Mode: res.ForwardEnv.Mode,
+			Names: res.ForwardEnv.Names},
 		Routes:      res.Routes,
 		Remotes:     remotes,
 		ExecDefault: res.ExecDefault,

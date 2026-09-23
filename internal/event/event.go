@@ -18,6 +18,10 @@ const (
 	KindMount   = "mount"
 	KindPod     = "pod"
 	KindSession = "session"
+	// KindNotice is something vibepod did that the caller did not ask for and
+	// would otherwise not learn about — a refused environment variable, say.
+	// It exists so that such things are never merely silent.
+	KindNotice = "notice"
 )
 
 // Version is the `v` field. It changes only when the shape does.

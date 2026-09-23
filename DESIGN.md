@@ -100,6 +100,45 @@ Where seccomp-notify is unavailable (older kernels, nested containers), this deg
 statically generated shim directory built from the remote's own `$PATH`. Same daemon-side
 policy, weaker coverage.
 
+### What crosses with a routed command
+
+Interception keeps the shell local, but a command still has an environment, and
+the question of which parts of it follow the command to another machine is a
+separate one with a different answer.
+
+**Blanket forwarding is refused**, for two reasons that are both disqualifying
+on their own:
+
+- A pod's environment holds `ANTHROPIC_API_KEY`, `HF_TOKEN` and their
+  relatives. §7 promises those never leave this machine. Sending the
+  environment sends them.
+- `PATH`, `HOME`, `LD_LIBRARY_PATH`, `PYTHONHOME`, `SSH_AUTH_SOCK` and the
+  `XDG_*` family describe *this* machine. Imposing them on a remote breaks its
+  toolchain in ways that are harder to diagnose than the thing they were meant
+  to fix — a wrong `PATH` is worse than a missing variable.
+
+**Sending nothing is also wrong**, and fails silently, which is worse. A
+dropped `PYTHONPATH` surfaces as `ModuleNotFoundError`, which reads as a broken
+install rather than a discarded environment; the user is sent to debug the
+wrong machine.
+
+So what crosses is the **delta**: the difference between the command's
+environment and the environment its session started with. That is exactly
+`VAR=value cmd`, and `export VAR=...` earlier in the same shell, and nothing
+else — because anything a user did not touch is, by construction, identical to
+the baseline. Identity variables are excluded from the delta even when set
+deliberately, and **a refusal is reported rather than swallowed**: it goes to
+the event stream as a notice, where `vpctl log` shows it. Silence is how the
+original bug survived.
+
+Assignments are emitted before `exec` in the remote script, not after — `exec
+VAR=v cmd` would have the shell look for a program named `VAR=v` — which also
+leaves the pid the shell's own, so the pid file and the signal path are
+untouched.
+
+`exec.forward_env` can set this to `none`, or to an explicit list of names for
+anyone who would rather say precisely what travels.
+
 ### What this buys
 
 - **Agent wrappers work untouched.** The wrapper, `source`, `setopt`, and the `pwd -P`
@@ -426,6 +465,8 @@ ports:
 
 exec:
   default: pod                     # when cwd matches no mount
+  forward_env: delta               # what the caller set, only (§3); or none,
+                                   # or an explicit list of names
 ```
 
 Split `vibepod.yaml` (committed, shareable) from `vibepod.local.yaml` (your paths,
@@ -669,6 +710,7 @@ replays the buffer. Killing the pod kills everything inside it.
 | `vpctl tree` | mounts and exec structure in one view | the mount half explains the exec half; replaces a separate `mounts` command |
 | Remote depth | leaf by default, `-x` polls `ps` | we gate execs in the pod, not on the remote; do not fake fidelity we lack |
 | In-pod scope | read-only, plus own-session `use` behind a tty check | stops the agent re-routing itself while keeping `vpctl shell` usable |
+| Routed env | forward the caller's delta; never identity, never credentials | blanket forwarding breaks §7's promise and the remote's toolchain; sending nothing fails silently as a broken install |
 | Guardrails | none — the log is the answer | pattern-matching shell strings is leaky both ways; the agent already gates commands |
 | Hosts | ssh_config aliases | inherits ProxyJump/keys/ports for free |
 | Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; ~3ms vpsh startup is negligible against RTT |

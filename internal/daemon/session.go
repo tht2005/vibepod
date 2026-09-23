@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"vibepod/internal/event"
-	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/sys"
 	"vibepod/internal/term"
@@ -35,13 +34,7 @@ func (s *podState) startSession(m *proto.Msg, kind string) (*session, error) {
 	if id == "" {
 		id = s.nextSessionID()
 	}
-	env := append([]string{}, m.Env...)
-	env = append(env,
-		"VIBEPOD_POD="+s.name,
-		"VIBEPOD_SESSION="+id,
-		"VIBEPOD_SOCK="+pod.SockPath,
-		"PATH="+podPath(m.Env),
-	)
+	env := sessionEnv(s.name, id, m.Env)
 	s.claimSession(id)
 	reply, err := s.callFD(&proto.Msg{
 		Op: proto.OpSpawn, Argv: m.Argv, Env: env, Cwd: m.Cwd,
@@ -55,7 +48,7 @@ func (s *podState) startSession(m *proto.Msg, kind string) (*session, error) {
 		return nil, fmt.Errorf("vpinit did not return a terminal")
 	}
 	sess := &session{
-		id: id, kind: kind, argv: m.Argv, pid: reply.msg.Pid,
+		id: id, kind: kind, argv: m.Argv, env: env, pid: reply.msg.Pid,
 		master:  os.NewFile(uintptr(reply.fds[0]), "pty"),
 		ring:    term.NewRing(scrollback),
 		done:    make(chan int, 1),

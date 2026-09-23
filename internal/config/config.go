@@ -47,12 +47,54 @@ type Mount struct {
 
 type Exec struct {
 	Default string `yaml:"default"`
+	// ForwardEnv says how much of a caller's environment a routed command
+	// carries. Blanket forwarding is not an option: a pod's environment holds
+	// the credentials that are the whole point of keeping the agent on one
+	// machine, and describes this machine rather than the remote.
+	//
+	//	forward_env: delta          # default: what the caller set, only
+	//	forward_env: none
+	//	forward_env: [PYTHONPATH, CUDA_VISIBLE_DEVICES]
+	ForwardEnv ForwardEnv `yaml:"forward_env"`
+}
+
+// ForwardEnv is a mode or an explicit list of names.
+type ForwardEnv struct {
+	Mode  string
+	Names []string
+}
+
+// UnmarshalYAML accepts `delta`, `none`, or a list of variable names, because
+// all three are things a person would reasonably write.
+func (f *ForwardEnv) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		var mode string
+		if err := n.Decode(&mode); err != nil {
+			return err
+		}
+		switch mode {
+		case "delta", "none":
+			f.Mode = mode
+			return nil
+		}
+		return fmt.Errorf("forward_env: %q is not delta, none, or a list of "+
+			"variable names", mode)
+	case yaml.SequenceNode:
+		if err := n.Decode(&f.Names); err != nil {
+			return err
+		}
+		f.Mode = "explicit"
+		return nil
+	}
+	return fmt.Errorf("forward_env: expected delta, none, or a list")
 }
 
 // Resolved is a config checked against the filesystem and flattened.
 type Resolved struct {
 	Name        string
 	RemoteTools []string
+	ForwardEnv  ForwardEnv
 	Binds       []proto.Bind
 	Remotes     []RemoteMount
 	Routes      []proto.Route
@@ -108,7 +150,11 @@ func Find(dir string) (string, bool) {
 // Resolve expands paths and applies the placement guard. Every refusal happens
 // here, at up time, while a human is watching — never mid-run.
 func (c *Config) Resolve() (*Resolved, error) {
-	r := &Resolved{Name: c.Pod, ExecDefault: c.Exec.Default, RemoteTools: c.RemoteTools}
+	r := &Resolved{Name: c.Pod, ExecDefault: c.Exec.Default,
+		RemoteTools: c.RemoteTools, ForwardEnv: c.Exec.ForwardEnv}
+	if r.ForwardEnv.Mode == "" {
+		r.ForwardEnv.Mode = "delta"
+	}
 	if r.Name == "" {
 		r.Name = "default"
 	}

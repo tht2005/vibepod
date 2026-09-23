@@ -83,6 +83,15 @@ type Spec struct {
 	Hostname    string   `json:"hostname,omitempty"`
 }
 
+// EnvPolicy says how much of a caller's environment a routed command carries.
+// Blanket forwarding is refused: a pod's environment holds the credentials this
+// whole design exists to keep on one machine, and describes this machine rather
+// than the one the command is going to.
+type EnvPolicy struct {
+	Mode  string   `json:"mode"`            // delta | none | explicit
+	Names []string `json:"names,omitempty"` // for explicit
+}
+
 // Route is one cwd-to-machine rule, as resolved by vpctl from the config.
 type Route struct {
 	Prefix       string `json:"prefix"`
@@ -140,6 +149,7 @@ type Msg struct {
 	Routes      []Route       `json:"routes,omitempty"`
 	Remotes     []RemoteMount `json:"remotes,omitempty"`
 	ExecDefault string        `json:"exec_default,omitempty"`
+	EnvPolicy   *EnvPolicy    `json:"env_policy,omitempty"`
 	ShimAll     bool          `json:"shim_all,omitempty"`
 
 	Follow bool            `json:"follow,omitempty"`
