@@ -381,3 +381,23 @@ func TestLogRecordsWhereEachCommandRan(t *testing.T) {
 		t.Errorf("log does not show the pod-local command:\n%s", out)
 	}
 }
+
+// The session's first program is the one that deadlocked: vpinit forks it and
+// waits for its execve, while that execve waits for vpinit to bind a shim.
+// A shell is never shimmed, so this has to start with something that is.
+func TestSessionWhoseFirstProgramNeedsAShim(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		out, errOut, code := vpctl(t, "run", "--shim-all", "--",
+			"/usr/bin/env", "true")
+		if code != 0 {
+			t.Errorf("exit %d: %s %s", code, out, errOut)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("starting a session whose first program needs a shim deadlocked")
+	}
+}

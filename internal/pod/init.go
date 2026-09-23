@@ -87,6 +87,7 @@ type initServer struct {
 
 	binds  chan *bindReq
 	spawns chan *spawnReq
+	sendMu sync.Mutex
 
 	mu       sync.Mutex
 	sessions map[int]string // pid -> session id
@@ -137,6 +138,13 @@ func (s *initServer) spawnWorker(ready chan<- error) {
 	}
 }
 
+// serve dispatches, and never waits.
+//
+// This matters more than it looks. Starting a process means forking and
+// waiting for its execve to complete — and that execve traps to the daemon,
+// which may need to ask vpinit to bind a shim before it will let it through.
+// A serve loop that waited for the spawn it was performing would be waiting
+// on a message it is itself responsible for reading.
 func (s *initServer) serve() error {
 	for {
 		m, fds, err := s.conn.Recv()
@@ -146,39 +154,54 @@ func (s *initServer) serve() error {
 		}
 		switch m.Op {
 		case proto.OpBind:
-			reply := make(chan error, 1)
-			s.binds <- &bindReq{src: m.Src, dst: m.Dst, readonly: m.ReadOnly, reply: reply}
-			err := <-reply
-			if err != nil {
-				_ = s.conn.Errorf(m.ID, "%v", err)
-			} else {
-				_ = s.conn.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
-			}
+			go s.handleBind(m)
 		case proto.OpSpawn:
-			reply := make(chan spawnRes, 1)
-			s.spawns <- &spawnReq{m: m, fds: fds, reply: reply}
-			res := <-reply
-			closeAll(fds)
-			switch {
-			case res.err != nil:
-				_ = s.conn.Errorf(m.ID, "%v", res.err)
-			case res.master != nil:
-				// The daemon keeps the master, which is what lets the session
-				// outlive the terminal that started it.
-				_ = s.conn.Send(&proto.Msg{Op: proto.OpSpawned, ID: m.ID,
-					Pid: res.pid, Session: m.Session}, int(res.master.Fd()))
-				res.master.Close()
-			default:
-				_ = s.conn.Send(&proto.Msg{Op: proto.OpSpawned, ID: m.ID,
-					Pid: res.pid, Session: m.Session})
-			}
+			go s.handleSpawn(m, fds)
 		case proto.OpSignal:
 			_ = syscall.Kill(m.Pid, syscall.Signal(m.Sig))
-			_ = s.conn.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
+			s.send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
 		default:
-			_ = s.conn.Errorf(m.ID, "unknown op %q", m.Op)
+			s.send(&proto.Msg{Op: proto.OpErr, ID: m.ID,
+				Err: fmt.Sprintf("unknown op %q", m.Op)})
 		}
 	}
+}
+
+func (s *initServer) handleBind(m *proto.Msg) {
+	reply := make(chan error, 1)
+	s.binds <- &bindReq{src: m.Src, dst: m.Dst, readonly: m.ReadOnly, reply: reply}
+	if err := <-reply; err != nil {
+		s.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
+		return
+	}
+	s.send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
+}
+
+func (s *initServer) handleSpawn(m *proto.Msg, fds []int) {
+	defer closeAll(fds)
+	reply := make(chan spawnRes, 1)
+	s.spawns <- &spawnReq{m: m, fds: fds, reply: reply}
+	res := <-reply
+	switch {
+	case res.err != nil:
+		s.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: res.err.Error()})
+	case res.master != nil:
+		// The daemon keeps the master, which is what lets the session outlive
+		// the terminal that started it.
+		s.send(&proto.Msg{Op: proto.OpSpawned, ID: m.ID, Pid: res.pid,
+			Session: m.Session}, int(res.master.Fd()))
+		res.master.Close()
+	default:
+		s.send(&proto.Msg{Op: proto.OpSpawned, ID: m.ID, Pid: res.pid,
+			Session: m.Session})
+	}
+}
+
+// send serialises replies from the workers onto the single socket.
+func (s *initServer) send(m *proto.Msg, fds ...int) {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	_ = s.conn.Send(m, fds...)
 }
 
 // doSpawn starts a process on the caller's own file descriptors. Passing fds

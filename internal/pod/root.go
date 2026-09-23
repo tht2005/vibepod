@@ -80,6 +80,9 @@ func buildRoot(spec *proto.Spec) error {
 		"mode=1777"); err != nil {
 		return err
 	}
+	if err := bindResolvConf(root); err != nil {
+		return err
+	}
 	if err := buildVp(in(VpDir), spec); err != nil {
 		return err
 	}
@@ -93,6 +96,24 @@ func buildRoot(spec *proto.Spec) error {
 		}
 	}
 	return sys.PivotRoot(root)
+}
+
+// bindResolvConf makes name resolution work inside the pod.
+//
+// A pod shares the host's network namespace, so it can already reach
+// everything the host can — but on a systemd-resolved machine
+// /etc/resolv.conf is a symlink into /run, which is not bound, and the
+// symlink dangles. The symptom is an agent that starts perfectly and then
+// times out on its first API call.
+func bindResolvConf(root string) error {
+	target, err := filepath.EvalSymlinks("/etc/resolv.conf")
+	if err != nil || target == "/etc/resolv.conf" {
+		return nil // a real file inside /etc, already bound
+	}
+	if _, err := os.Stat(target); err != nil {
+		return nil
+	}
+	return sys.BindOver(target, filepath.Join(root, target), true)
 }
 
 func buildDev(dev string) error {

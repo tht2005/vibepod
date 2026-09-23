@@ -29,6 +29,8 @@ type podState struct {
 	podLn   *net.UnixListener
 	fs      *fs.Manager
 
+	shimOnce sync.Mutex
+
 	mu       sync.Mutex
 	shims    map[string]string // shadowed path -> stashed original
 	sessions map[string]*session
@@ -160,6 +162,11 @@ func (s *podState) callFD(m *proto.Msg, fds ...int) (rpcReply, error) {
 // shim can still run it. Called while the calling process is frozen in execve,
 // so it must finish before the reply or the redirect misses.
 func (s *podState) ensureShim(path string) (string, error) {
+	// One binding per binary, even when several processes reach it at once:
+	// a second bind would stack a shim on top of a shim.
+	s.shimOnce.Lock()
+	defer s.shimOnce.Unlock()
+
 	s.mu.Lock()
 	if stash, ok := s.shims[path]; ok {
 		s.mu.Unlock()
