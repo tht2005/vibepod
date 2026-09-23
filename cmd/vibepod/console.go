@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type console struct {
 	pod     string
 	session string
 	cwd     string
+	prev    string // for `cd -`, which is how you leave a remote directory
 	target  string
 
 	mu      sync.Mutex
@@ -155,8 +157,8 @@ func (con *console) submit(line string) (quit bool) {
 	case line == "tree", strings.HasPrefix(line, "tree "):
 		con.runLocalView(line)
 		return false
-	case strings.HasPrefix(line, "cd "):
-		con.changeDir(strings.TrimSpace(strings.TrimPrefix(line, "cd ")))
+	case line == "cd", strings.HasPrefix(line, "cd "):
+		con.changeDir(strings.TrimSpace(strings.TrimPrefix(line, "cd")))
 		return false
 	case strings.HasPrefix(line, "use "):
 		con.use(strings.TrimSpace(strings.TrimPrefix(line, "use ")))
@@ -224,10 +226,29 @@ func (con *console) commandConn() *proto.Conn {
 	return con.cmdConn
 }
 
-func (con *console) changeDir(dir string) {
-	if !strings.HasPrefix(dir, "/") {
-		dir = con.cwd + "/" + dir
+// changeDir is the console's most load-bearing builtin, because the working
+// directory is what decides which machine a command runs on. It therefore has
+// to behave the way cd behaves everywhere else — bare, `~`, and `-` included,
+// which are how anyone actually gets back out of a remote directory.
+func (con *console) changeDir(arg string) {
+	home := os.Getenv("HOME")
+	dir := arg
+	switch {
+	case dir == "", dir == "~":
+		dir = home
+	case dir == "-":
+		if con.prev == "" {
+			con.out("cd: no previous directory\r\n")
+			return
+		}
+		dir = con.prev
+	case strings.HasPrefix(dir, "~/"):
+		dir = filepath.Join(home, strings.TrimPrefix(dir, "~/"))
+	case !strings.HasPrefix(dir, "/"):
+		dir = filepath.Join(con.cwd, dir)
 	}
+	dir = filepath.Clean(dir)
+
 	c, err := connect()
 	if err != nil {
 		con.out("vibepod: " + err.Error() + "\r\n")
@@ -241,7 +262,11 @@ func (con *console) changeDir(dir string) {
 		con.out("cd: " + dir + ": no such directory in the pod\r\n")
 		return
 	}
-	con.cwd = dir
+	con.prev, con.cwd = con.cwd, dir
+	if arg == "-" {
+		// Shells print where they landed, because "-" does not say.
+		con.out(short(dir) + "\r\n")
+	}
 }
 
 func (con *console) use(target string) {

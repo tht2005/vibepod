@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -71,4 +73,52 @@ func TestConsoleRefusesADirectoryThePodCannotSee(t *testing.T) {
 	if strings.Contains(con.out.String(), "definitely-not-here ❯") {
 		t.Errorf("the prompt moved to a directory that does not exist")
 	}
+}
+
+// The working directory decides which machine a command runs on, so cd is the
+// console's most load-bearing builtin and has to behave like cd everywhere
+// else. In particular `cd -` is how anyone gets back out of a remote directory.
+func TestConsoleCdFormsThatPeopleActuallyType(t *testing.T) {
+	con := onPTY(t, "new", "e2e")
+	defer con.stop()
+	if !con.waitFor(t, "❯", 10*time.Second) {
+		t.Fatalf("no prompt; got:\n%s", con.out.String())
+	}
+	work := filepath.Base(workDir)
+
+	con.send("cd " + workDir + "\r")
+	if !con.waitFor(t, work+" [", 10*time.Second) {
+		t.Fatalf("absolute cd did not take; got:\n%s", tail(con.out.String()))
+	}
+	con.send("cd /tmp\r")
+	if !con.waitFor(t, "/tmp [", 10*time.Second) {
+		t.Fatalf("cd /tmp failed; got:\n%s", tail(con.out.String()))
+	}
+	// "-" returns, and says where it landed, because "-" does not say.
+	con.send("cd -\r")
+	if !con.waitFor(t, work+" [", 10*time.Second) {
+		t.Errorf("cd - did not return; got:\n%s", tail(con.out.String()))
+	}
+	// Relative paths resolve and are cleaned rather than accumulating "..".
+	con.send("cd ../work\r")
+	if !con.waitFor(t, work+" [", 10*time.Second) {
+		t.Errorf("relative cd failed; got:\n%s", tail(con.out.String()))
+	}
+	if strings.Contains(con.out.String(), "/.. [") {
+		t.Errorf("the prompt shows an uncleaned path:\n%s", tail(con.out.String()))
+	}
+	// This pod has no home bound into it, so ~ cannot resolve — but the error
+	// must name $HOME, proving the tilde expanded instead of being appended to
+	// the current directory, which is what it used to do.
+	con.send("cd ~\r")
+	if !con.waitFor(t, "cd: "+os.Getenv("HOME")+":", 10*time.Second) {
+		t.Errorf("~ was not expanded; got:\n%s", tail(con.out.String()))
+	}
+}
+
+func tail(s string) string {
+	if len(s) > 400 {
+		return s[len(s)-400:]
+	}
+	return s
 }
