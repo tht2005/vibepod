@@ -45,6 +45,13 @@ func runDaemon(args []string) error {
 	}
 	defer os.Remove(sock)
 
+	// Leave the running build next to the socket. A daemon outlives the binary
+	// that started it, so after an upgrade the old one is still serving —
+	// including spawning vpinit from its own, older image. Clients read this
+	// file instead of asking, so noticing costs nothing.
+	_ = os.WriteFile(filepath.Join(runDir, "version"), []byte(daemon.Version), 0o600)
+	defer os.Remove(filepath.Join(runDir, "version"))
+
 	d, err := daemon.New(runDir, logger)
 	if err != nil {
 		return err

@@ -13,13 +13,21 @@ import (
 	"vibepod/internal/proto"
 )
 
-// podArg falls back to the pod this process is running in, so an agent
-// inside a pod never has to know its own name.
+// podArg resolves which pod a command means, in the order that surprises
+// least: what you named, then the pod you are inside, then the one this
+// project declares. An agent in a pod never has to know its own name, and a
+// person in a project directory never has to type one.
 func podArg(name string) string {
 	if name != "" {
 		return name
 	}
-	return os.Getenv("VIBEPOD_POD")
+	if p := os.Getenv("VIBEPOD_POD"); p != "" {
+		return p
+	}
+	if m, err := loadSpec("", false); err == nil {
+		return m.Spec.Name
+	}
+	return ""
 }
 
 // cmdLog renders what has run and where. log and tree pair rather than
@@ -118,6 +126,155 @@ func logLine(e event.Event, follow, all bool) string {
 		return fmt.Sprintf("%s  %-8s pod %s %s", ts, "-", e.Pod, e.Detail)
 	}
 	return ""
+}
+
+// cmdHosts answers "where can I go", which in a pod is a question about
+// machines and not about paths.
+func cmdHosts(args []string) error {
+	fs := flag.NewFlagSet("hosts", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "machine-readable output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	reply, err := call(c, &proto.Msg{Op: proto.OpHosts, Pod: podArg(fs.Arg(0))})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(reply.Hosts)
+	}
+	fmt.Print(renderHosts(reply.Hosts))
+	return nil
+}
+
+// renderHosts is shared with the console, which prints the same list for a
+// bare `cd`: the question "where can I go" has one answer wherever it is asked.
+func renderHosts(hosts []proto.HostInfo) string {
+	var b strings.Builder
+	for _, h := range hosts {
+		status := "connected"
+		switch {
+		case h.Local:
+			status = "here"
+		case !h.Connected:
+			status = "not connected"
+		}
+		if h.Default {
+			status += " · default"
+		}
+		dir := "(no directory of its own)"
+		if len(h.Dirs) > 0 {
+			dir = short(h.Dirs[0])
+		}
+		fmt.Fprintf(&b, "  @%-10s %-20s %s\n", h.Name, status, dir)
+		for _, extra := range h.Dirs[1:] {
+			fmt.Fprintf(&b, "  %-10s %-20s %s\n", "", "", short(extra))
+		}
+	}
+	return b.String()
+}
+
+// cmdWhere answers both readings of the word, because both are asked.
+//
+//	vpctl where           which machine does this directory run on
+//	vpctl where @gpu03    which directory does that machine own
+//
+// It prints a bare path with -q, so a real shell can compose with it:
+//
+//	cd "$(vpctl where -q @gpu03)"
+//
+// That composition is the reason this is a separate command from `cd`. A
+// process cannot change its caller's working directory, so anything that
+// claims to is either lying or is the caller itself.
+func cmdWhere(args []string) error {
+	fs := flag.NewFlagSet("where", flag.ContinueOnError)
+	quiet := fs.Bool("q", false, "print only the path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	pod := podArg("")
+
+	if arg := fs.Arg(0); arg != "" {
+		dir, target, err := machineDir(c, pod, arg)
+		if err != nil {
+			return err
+		}
+		if *quiet {
+			fmt.Println(dir)
+			return nil
+		}
+		fmt.Printf("%s is @%s\n", short(dir), target)
+		return nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	reply, err := call(c, &proto.Msg{Op: proto.OpStat, Pod: pod, Path: cwd,
+		Session: os.Getenv("VIBEPOD_SESSION")})
+	if err != nil {
+		return err
+	}
+	if *quiet {
+		fmt.Println(reply.Target)
+		return nil
+	}
+	if reply.Target == "pod" {
+		fmt.Printf("%s runs here, in the pod\n", short(cwd))
+		return nil
+	}
+	fmt.Printf("%s runs on @%s, as %s\n", short(cwd), reply.Target, reply.Path)
+	return nil
+}
+
+// machineDir resolves "@gpu03" to the directory that machine owns.
+func machineDir(c *proto.Conn, pod, arg string) (dir, target string, err error) {
+	name, sub, _ := strings.Cut(strings.TrimPrefix(arg, "@"), "/")
+	if name == "local" {
+		name = "pod"
+	}
+	reply, err := call(c, &proto.Msg{Op: proto.OpHosts, Pod: pod})
+	if err != nil {
+		return "", "", err
+	}
+	for _, h := range reply.Hosts {
+		if h.Name != name {
+			continue
+		}
+		switch len(h.Dirs) {
+		case 0:
+			return "", "", fmt.Errorf("@%s has no directory of its own in this pod", name)
+		case 1:
+			return filepath.Join(h.Dirs[0], sub), h.Name, nil
+		default:
+			// Naming a machine cannot pick between its directories, and
+			// guessing would be worse than asking.
+			var b strings.Builder
+			fmt.Fprintf(&b, "@%s owns more than one directory; name one:\n", name)
+			for _, d := range h.Dirs {
+				fmt.Fprintf(&b, "  %s\n", short(d))
+			}
+			return "", "", fmt.Errorf("%s", strings.TrimRight(b.String(), "\n"))
+		}
+	}
+	var known []string
+	for _, h := range reply.Hosts {
+		known = append(known, "@"+h.Name)
+	}
+	return "", "", fmt.Errorf("no machine @%s in this pod; there is %s",
+		name, strings.Join(known, ", "))
 }
 
 // cmdTree is the one view nothing else can produce: pstree stops at the

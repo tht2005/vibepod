@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,12 +57,21 @@ func TestManualConsole(t *testing.T) {
 	}()
 	time.Sleep(2 * time.Second)
 	lines := []string{"/usr/bin/ls /\r"}
-	if dir := os.Getenv("VP_DIR"); dir != "" {
+	if script := os.Getenv("VP_SCRIPT"); script != "" {
+		b, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = nil
+		for _, l := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
+			lines = append(lines, l+"\r")
+		}
+	} else if dir := os.Getenv("VP_DIR"); dir != "" {
 		lines = append(lines, "cd "+dir+"\r", "/usr/bin/ls\r", "/usr/bin/uname -n\r")
 	}
 	for _, line := range lines {
 		master.WriteString(line)
-		time.Sleep(3500 * time.Millisecond)
+		time.Sleep(2500 * time.Millisecond)
 	}
 	t.Logf("\n%s", out)
 }

@@ -126,6 +126,9 @@ vpctl attach [name] [sess]    return to a session you detached from
 vpctl ps                      running pods
 vpctl tree [name]             mounts and live execs, in one view
 vpctl log [-f] [name]         every command and the machine it ran on
+vpctl hosts [name]            the machines a pod runs on, and what they own
+vpctl where [@machine]        which machine runs this directory, or vice versa
+vpctl cd @machine             switch directory (inside the console)
 vpctl use <host|auto>         send this session's commands to one machine
 vpctl down [name]             stop it and release its mounts
 vpctl doctor                  check this machine can host a pod
@@ -133,6 +136,42 @@ vpctl doctor                  check this machine can host a pod
 
 `Ctrl-\` detaches and leaves the session running. Pods are named and outlive
 the terminal that made them, like containers.
+
+### Getting around
+
+A remote directory mounts at its own absolute path, which is right for every
+purpose except typing it. So navigation is by machine, not by path — your
+config declares two or three places, and picking between them should not cost
+seventy characters:
+
+```console
+~/Git/vibepod (@pod) ❯ hosts
+  @pod     here · default   ~/Git/vibepod
+  @gpu03   connected        /remote/vast0/…/amd_matrix_instruction_calculator
+  vpctl cd @<machine> to switch
+
+~/Git/vibepod (@pod) ❯ vpctl cd @gpu03
+/remote/vast0/…/amd_matrix_instruction_calculator (@gpu03) ❯ uname -n
+mv-mi250-03
+… (@gpu03) ❯ cd -
+~/Git/vibepod
+~/Git/vibepod (@pod) ❯
+```
+
+Switching machines is `vpctl cd @machine`, deliberately *not* plain `cd`. A
+directory can be named `@gpu03`, and a `cd` that guessed between the two would
+silently move you to another machine. Plain `cd` stays exactly a filesystem
+operation — absolute, relative, `~`, `-` — and a bare `cd` lists where you can
+go.
+
+In a real shell, no command can change its caller's directory, so the
+composable form is a path:
+
+```console
+$ cd "$(vpctl where -q @gpu03)"
+$ vpctl where
+/remote/vast0/… runs on @gpu03, as /remote/vast0/…
+```
 
 ### Seeing where things went
 

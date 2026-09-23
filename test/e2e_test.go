@@ -454,3 +454,30 @@ func TestARemoteMountHasExactlyOnePathInThePod(t *testing.T) {
 		t.Errorf("/vp/run is missing the socket: %q", rest)
 	}
 }
+
+// "Where can I go" is a question about machines, not paths, so it has a command
+// of its own.
+func TestHostsAndWhereNameMachinesAndTheirDirectories(t *testing.T) {
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	out, _, code := vpctlIn(t, remoteDir, "hosts", "e2e-remote")
+	if code != 0 {
+		t.Fatalf("hosts exit %d: %s", code, out)
+	}
+	for _, want := range []string{"@pod", "@vptest", remoteSrv} {
+		if !strings.Contains(out, want) {
+			t.Errorf("hosts does not mention %q:\n%s", want, out)
+		}
+	}
+	// Both readings of "where": a directory's machine, and a machine's
+	// directory.
+	out, _, code = vpctlIn(t, remoteDir, "where", "@vptest")
+	if code != 0 || !strings.Contains(out, remoteSrv) {
+		t.Errorf("where @vptest did not name its directory (exit %d): %s", code, out)
+	}
+	out, _, code = vpctlIn(t, remoteDir, "where", "-q", "@vptest")
+	if code != 0 || strings.TrimSpace(out) != remoteSrv {
+		t.Errorf("where -q must print a bare path for `cd $(...)`: %q", out)
+	}
+}

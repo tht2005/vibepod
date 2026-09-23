@@ -11,6 +11,7 @@ import (
 
 	"vibepod/internal/event"
 	"vibepod/internal/proto"
+	"vibepod/internal/route"
 	"vibepod/internal/term"
 )
 
@@ -26,8 +27,9 @@ type console struct {
 	pod     string
 	session string
 	cwd     string
-	prev    string // for `cd -`, which is how you leave a remote directory
-	target  string
+	prev    string // for `cd -`
+	pin     string // set by `use`; overrides what the directory would decide
+	table   *route.Table
 
 	mu      sync.Mutex
 	line    []rune
@@ -61,9 +63,14 @@ func cmdNew(args []string) int {
 			"use `vpctl up` for scripts")
 		return 1
 	}
+	rules := make([]route.Rule, 0, len(m.Routes))
+	for _, r := range m.Routes {
+		rules = append(rules, route.Rule{Prefix: r.Prefix, Target: r.Target,
+			RemotePrefix: r.RemotePrefix})
+	}
 	con := &console{
 		spec: m, pod: m.Spec.Name, cwd: podCwd(m.Spec.Binds),
-		session: "console", target: "auto",
+		session: "console", table: route.New(m.ExecDefault, rules),
 	}
 	return con.run()
 }
@@ -157,6 +164,15 @@ func (con *console) submit(line string) (quit bool) {
 	case line == "tree", strings.HasPrefix(line, "tree "):
 		con.runLocalView(line)
 		return false
+	case line == "hosts", line == "machines":
+		con.listPlaces()
+		return false
+	case line == "vpctl cd", strings.HasPrefix(line, "vpctl cd "):
+		// Switching machines is its own command precisely so that plain `cd`
+		// never has to guess whether "@gpu03" is a machine or a directory
+		// somebody named that.
+		con.switchMachine(strings.TrimSpace(strings.TrimPrefix(line, "vpctl cd")))
+		return false
 	case line == "cd", strings.HasPrefix(line, "cd "):
 		con.changeDir(strings.TrimSpace(strings.TrimPrefix(line, "cd")))
 		return false
@@ -226,15 +242,20 @@ func (con *console) commandConn() *proto.Conn {
 	return con.cmdConn
 }
 
-// changeDir is the console's most load-bearing builtin, because the working
-// directory is what decides which machine a command runs on. It therefore has
-// to behave the way cd behaves everywhere else — bare, `~`, and `-` included,
-// which are how anyone actually gets back out of a remote directory.
+// changeDir is plain cd, and only that: a filesystem operation on paths.
+//
+// It deliberately knows nothing about machines. A directory can legitimately be
+// named "@gpu03", and a cd that guessed between the two would be wrong in a way
+// that silently moved you to another machine.
 func (con *console) changeDir(arg string) {
 	home := os.Getenv("HOME")
 	dir := arg
 	switch {
-	case dir == "", dir == "~":
+	case dir == "":
+		// In a cockpit the useful answer to a bare cd is where you could go.
+		con.listPlaces()
+		return
+	case dir == "~":
 		dir = home
 	case dir == "-":
 		if con.prev == "" {
@@ -248,7 +269,55 @@ func (con *console) changeDir(arg string) {
 		dir = filepath.Join(con.cwd, dir)
 	}
 	dir = filepath.Clean(dir)
+	before := con.cwd
+	con.moveTo(dir)
+	if arg == "-" && con.cwd != before {
+		// Shells print where they landed, because "-" does not say.
+		con.out(short(dir) + "\r\n")
+	}
+}
 
+// switchMachine moves to the directory a machine owns. The console is the one
+// caller that can do this, because the directory it changes is its own.
+func (con *console) switchMachine(arg string) {
+	if arg == "" {
+		con.listPlaces()
+		return
+	}
+	c, err := connect()
+	if err != nil {
+		con.out("vibepod: " + err.Error() + "\r\n")
+		return
+	}
+	defer c.Close()
+	dir, _, err := machineDir(c, con.pod, arg)
+	if err != nil {
+		con.out(strings.ReplaceAll(err.Error(), "\n", "\r\n") + "\r\n")
+		return
+	}
+	con.moveTo(dir)
+}
+
+// listPlaces answers "where can I go", which in a pod is a question about
+// machines rather than paths.
+func (con *console) listPlaces() {
+	c, err := connect()
+	if err != nil {
+		con.out("vibepod: " + err.Error() + "\r\n")
+		return
+	}
+	defer c.Close()
+	reply, err := call(c, &proto.Msg{Op: proto.OpHosts, Pod: con.pod})
+	if err != nil {
+		con.out("vibepod: " + err.Error() + "\r\n")
+		return
+	}
+	con.out(strings.ReplaceAll(renderHosts(reply.Hosts), "\n", "\r\n"))
+	con.out("  vpctl cd @<machine> to switch\r\n")
+}
+
+// moveTo changes directory once the path is known to be the one wanted.
+func (con *console) moveTo(dir string) {
 	c, err := connect()
 	if err != nil {
 		con.out("vibepod: " + err.Error() + "\r\n")
@@ -263,10 +332,6 @@ func (con *console) changeDir(arg string) {
 		return
 	}
 	con.prev, con.cwd = con.cwd, dir
-	if arg == "-" {
-		// Shells print where they landed, because "-" does not say.
-		con.out(short(dir) + "\r\n")
-	}
 }
 
 func (con *console) use(target string) {
@@ -281,7 +346,7 @@ func (con *console) use(target string) {
 		con.out("vibepod: " + err.Error() + "\r\n")
 		return
 	}
-	con.target = target
+	con.pin = target
 	con.out("[commands from this console now run on " + target + "]\r\n")
 }
 
@@ -328,12 +393,8 @@ func (con *console) followEvents() {
 func (con *console) header() {
 	con.out("\x1b[2J\x1b[H")
 	con.out(fmt.Sprintf("vibepod · %s\r\n", con.pod))
-	for _, r := range con.spec.Routes {
-		if r.Target != "pod" {
-			con.out(fmt.Sprintf("  %s → %s\r\n", short(r.Prefix), r.Target))
-		}
-	}
-	con.out("  Ctrl-\\ detaches a running command · `use <host>` · `tree` · `exit`\r\n\r\n")
+	con.listPlaces()
+	con.out("  Ctrl-\\ detaches · `hosts` · `tree` · `use <machine>` · `exit`\r\n\r\n")
 }
 
 // above prints a line without disturbing what is being typed.
@@ -375,12 +436,19 @@ func (con *console) redraw() {
 	fmt.Fprintf(os.Stdout, "\r\x1b[K%s", con.promptText())
 }
 
+// promptText shows the full path and the machine that path runs on. The path
+// is long, and that is the honest cost of mounting a remote directory at its
+// own absolute path; the machine is the thing you most need to know before
+// pressing return.
 func (con *console) promptText() string {
-	exec := con.target
-	if exec == "" {
-		exec = "auto"
+	dec := route.Resolve(con.table, con.cwd, con.pin)
+	label := "@" + dec.Target
+	if con.pin != "" && con.pin != "auto" {
+		// A pin overrides the directory, so it must be visible: it is the one
+		// route the directory cannot explain.
+		label += " pinned"
 	}
-	return fmt.Sprintf("%s [%s] ❯ %s", promptPath(con.cwd), exec, string(con.line))
+	return fmt.Sprintf("%s (%s) ❯ %s", short(con.cwd), label, string(con.line))
 }
 
 // promptPath keeps the prompt short enough to type in front of. Remote

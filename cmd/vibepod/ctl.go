@@ -25,6 +25,9 @@ const usage = `vpctl - run your agent here, run its commands where the code live
   vpctl shell [name]           another terminal on a running pod
   vpctl attach [name] [sess]   return to a session you detached from
   vpctl ps                     running pods
+  vpctl hosts [pod]            the machines a pod runs on, and what they own
+  vpctl where [@machine]       which machine runs this directory, or vice versa
+  vpctl cd @machine            switch directory (inside the vpctl console)
   vpctl log [-f] [pod]         every command and the machine it ran on
   vpctl tree [pod]             mounts and live execs, in one view
   vpctl down [name]            stop a pod and release its mounts
@@ -53,6 +56,12 @@ func runCtl(args []string) int {
 		return cmdAttach(args[1:])
 	case "ps":
 		err = cmdPs()
+	case "hosts", "machines":
+		err = cmdHosts(args[1:])
+	case "where":
+		err = cmdWhere(args[1:])
+	case "cd":
+		err = cmdCd(args[1:])
 	case "log":
 		err = cmdLog(args[1:])
 	case "tree":
@@ -274,6 +283,29 @@ func daemonVersion() (string, error) {
 		return "(before versions were reported)", nil
 	}
 	return reply.Version, nil
+}
+
+// cmdCd exists for the console, which is the only caller that *can* change a
+// working directory — its own. Anywhere else a process changing its caller's
+// directory is impossible, so this says so and points at the composable form
+// rather than failing silently.
+func cmdCd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: vpctl cd @machine[/subdir]")
+	}
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	dir, target, err := machineDir(c, podArg(""), args[0])
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("cannot change the working directory of the shell that "+
+		"called me.\n  In the vpctl console, `vpctl cd %s` works.\n"+
+		"  In a shell:  cd \"$(vpctl where -q %s)\"\n"+
+		"  That is %s, on @%s", args[0], args[0], short(dir), target)
 }
 
 func cmdPs() error {

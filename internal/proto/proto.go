@@ -42,7 +42,8 @@ const (
 	OpEvent   = "event"
 	OpEnd     = "end"
 	OpUse     = "use"
-	OpStat    = "stat" // does this path exist in the pod, and is it a directory?
+	OpHosts   = "hosts" // the machines this pod can reach, and their directories
+	OpStat    = "stat"  // does this path exist in the pod, and is it a directory?
 	OpUp      = "up"
 	OpPs      = "ps"
 	OpDown    = "down"
@@ -151,7 +152,8 @@ type Msg struct {
 	// old one.
 	Version string `json:"version,omitempty"`
 
-	Pods []PodInfo `json:"pods,omitempty"`
+	Pods  []PodInfo  `json:"pods,omitempty"`
+	Hosts []HostInfo `json:"hosts,omitempty"`
 }
 
 // Tree is the pod's structure: mounts and live execs, in one view.
@@ -187,6 +189,17 @@ type TreeNode struct {
 	Code      *int       `json:"code,omitempty"`
 	Session   string     `json:"session,omitempty"`
 	Children  []TreeNode `json:"children,omitempty"`
+}
+
+// HostInfo is one machine a pod can run commands on. The pod itself counts as
+// one: "here" is an answer to "where does this run", and leaving it out of the
+// list would make the local case look like an absence rather than a choice.
+type HostInfo struct {
+	Name      string   `json:"name"`
+	Local     bool     `json:"local,omitempty"`
+	Connected bool     `json:"connected,omitempty"`
+	Dirs      []string `json:"dirs,omitempty"`
+	Default   bool     `json:"default,omitempty"`
 }
 
 // PodInfo is one row of vpctl ps.

@@ -145,16 +145,20 @@ func (k *ctlConn) serve() {
 			d.reply(k.c, m, d.down(m.Pod))
 		case proto.OpLog:
 			d.streamLog(k.c, m)
-		case proto.OpStat:
-			ok, err := d.statInPod(m)
+		case proto.OpHosts:
+			hosts, err := d.hostList(m)
 			if err != nil {
 				_ = k.c.Errorf(m.ID, "%v", err)
 			} else {
-				code := 1
-				if ok {
-					code = 0
-				}
-				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Code: code})
+				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Hosts: hosts})
+			}
+		case proto.OpStat:
+			reply, err := d.statInPod(m)
+			if err != nil {
+				_ = k.c.Errorf(m.ID, "%v", err)
+			} else {
+				reply.ID = m.ID
+				_ = k.c.Send(reply)
 			}
 		case proto.OpTree:
 			t, err := d.treeOf(m)
@@ -259,7 +263,7 @@ func sessionKind(m *proto.Msg) string {
 
 func readOnlyOp(op string) bool {
 	switch op {
-	case proto.OpPs, proto.OpLog, proto.OpTree:
+	case proto.OpPs, proto.OpLog, proto.OpTree, proto.OpHosts, proto.OpStat:
 		return true
 	}
 	return false
@@ -486,6 +490,43 @@ func errAlreadyRunning(name string) error {
 	return fmt.Errorf("pod %q is already running", name)
 }
 
+// hostList reports the machines this pod runs commands on and the directories
+// that belong to each. It is the answer to "where can I go", which in a pod is
+// a question about machines rather than about paths.
+func (d *Daemon) hostList(m *proto.Msg) ([]proto.HostInfo, error) {
+	s, err := d.lookup(m.Pod)
+	if err != nil {
+		return nil, err
+	}
+	dirs := map[string][]string{}
+	for _, r := range s.table.Rules() {
+		dirs[r.Target] = append(dirs[r.Target], r.Prefix)
+	}
+	names := []string{route.Pod}
+	for target := range dirs {
+		if target != route.Pod {
+			names = append(names, target)
+		}
+	}
+	sort.Strings(names[1:])
+
+	out := make([]proto.HostInfo, 0, len(names))
+	for _, name := range names {
+		h := proto.HostInfo{
+			Name:    name,
+			Local:   name == route.Pod,
+			Dirs:    dirs[name],
+			Default: name == s.table.Default,
+		}
+		// An established multiplexed connection answers this instantly; a
+		// host with no master yet fails fast rather than dialling out.
+		h.Connected = h.Local || d.pool.Host(name).Reachable()
+		sort.Strings(h.Dirs)
+		out = append(out, h)
+	}
+	return out, nil
+}
+
 // statInPod answers "is this a directory in the pod" without running anything
 // in it. /proc/<pid>/root resolves inside that process's mount namespace, so
 // the daemon can look through vpinit's eyes.
@@ -493,20 +534,29 @@ func errAlreadyRunning(name string) error {
 // Running `test -d` in the pod would also work and did, but it put a command
 // nobody typed into a log whose whole value is that everything in it was
 // asked for.
-func (d *Daemon) statInPod(m *proto.Msg) (bool, error) {
+func (d *Daemon) statInPod(m *proto.Msg) (*proto.Msg, error) {
 	s, err := d.lookup(m.Pod)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if !strings.HasPrefix(m.Path, "/") {
-		return false, fmt.Errorf("stat needs an absolute path")
+		return nil, fmt.Errorf("stat needs an absolute path")
 	}
 	// A symlink inside the pod pointing at an absolute path would resolve
 	// against our root, not the pod's, so this can say yes to a directory the
 	// pod cannot reach. The next command there fails plainly, which is the
 	// same answer one step later.
 	fi, err := os.Stat(filepath.Join("/proc", strconv.Itoa(s.p.Pid), "root", m.Path))
-	return err == nil && fi.IsDir(), nil
+	code := 1
+	if err == nil && fi.IsDir() {
+		code = 0
+	}
+	// Answer the more interesting question at the same time: which machine
+	// owns this directory, and what is it called there. The daemon's own route
+	// table decides, so there is only ever one resolver.
+	dec := route.Resolve(s.table, m.Path, s.pinOf(m.Session))
+	return &proto.Msg{Op: proto.OpOK, Code: code, Target: dec.Target,
+		Path: dec.Dir}, nil
 }
 
 // use pins a session's executor. This is the sharp edge of the in-pod

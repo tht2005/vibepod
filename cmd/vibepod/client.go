@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +24,7 @@ func connect() (*proto.Conn, error) {
 	}
 	sock := daemon.HostSock()
 	if c, err := proto.Dial(sock); err == nil {
+		warnStaleDaemon()
 		return c, nil
 	}
 	if err := spawnDaemon(); err != nil {
@@ -35,6 +38,23 @@ func connect() (*proto.Conn, error) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("daemon did not come up; see %s/daemon.log", daemon.RunDir())
+}
+
+// warnStaleDaemon says so when the daemon is from a different build than this
+// binary. It is not an error — the old daemon works fine, for the old
+// behaviour — but the symptom otherwise is a change you just made having no
+// effect at all, which is a bad hour.
+func warnStaleDaemon() {
+	b, err := os.ReadFile(filepath.Join(daemon.RunDir(), "version"))
+	if err != nil {
+		return
+	}
+	if running := strings.TrimSpace(string(b)); running != daemon.Version {
+		fmt.Fprintf(os.Stderr,
+			"vibepod: the running daemon is build %s, this is %s. "+
+				"`vpctl down` your pods to pick up the new one.\n",
+			running, daemon.Version)
+	}
 }
 
 func spawnDaemon() error {

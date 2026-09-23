@@ -441,6 +441,9 @@ vpctl up [name]             create pod, detached, no console     (scripts, CI)
 vpctl run claude [target]   create/attach and launch an agent
 vpctl shell [pod]           another independent terminal into a running pod
 vpctl attach [pod]          reattach to a detached console or agent session
+vpctl hosts [pod]           the machines this pod runs on, and what they own
+vpctl where [@host]         which machine runs this directory, or vice versa
+vpctl cd @host              switch to a machine's directory (console only)
 vpctl use <host|auto>       set this session's executor
 vpctl exec @prod -- cmd     one-off, explicit target
 vpctl ps                    list pods, routes, health
@@ -657,6 +660,8 @@ replays the buffer. Killing the pod kills everything inside it.
 | Host access | explicit allowlist | nothing granted implicitly; the agent cannot read unrelated projects or credentials |
 | Link drops | fail loudly, exit `75` | never silently re-run a partially-applied non-idempotent command |
 | Console | cockpit: status + log + input | a command surface that shows routing, without rebuilding a shell |
+| Navigation | by machine (`vpctl cd @host`), never plain `cd` | path identity makes paths long; a directory can be named `@host`, and a `cd` that guessed would silently change machines |
+| Prompt | full path plus the machine it runs on | the path is the honest cost of path identity; the machine is what you need before pressing return |
 | Sessions | many per pod | `vpctl shell` attaches independent terminals, `docker exec -it` style |
 | Exec target | `exec_on:` on a mount, session pin overrides | keeps "cwd decides" as the one rule; agents inherit routing with nothing to learn |
 | Reverse mounts | `expose_to:` on local mounts | "edit locally, run on the big machine" is impossible without them |

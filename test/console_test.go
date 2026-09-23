@@ -87,21 +87,21 @@ func TestConsoleCdFormsThatPeopleActuallyType(t *testing.T) {
 	work := filepath.Base(workDir)
 
 	con.send("cd " + workDir + "\r")
-	if !con.waitFor(t, work+" [", 10*time.Second) {
+	if !con.waitFor(t, work+" (", 10*time.Second) {
 		t.Fatalf("absolute cd did not take; got:\n%s", tail(con.out.String()))
 	}
 	con.send("cd /tmp\r")
-	if !con.waitFor(t, "/tmp [", 10*time.Second) {
+	if !con.waitFor(t, "/tmp (", 10*time.Second) {
 		t.Fatalf("cd /tmp failed; got:\n%s", tail(con.out.String()))
 	}
 	// "-" returns, and says where it landed, because "-" does not say.
 	con.send("cd -\r")
-	if !con.waitFor(t, work+" [", 10*time.Second) {
+	if !con.waitFor(t, work+" (", 10*time.Second) {
 		t.Errorf("cd - did not return; got:\n%s", tail(con.out.String()))
 	}
 	// Relative paths resolve and are cleaned rather than accumulating "..".
 	con.send("cd ../work\r")
-	if !con.waitFor(t, work+" [", 10*time.Second) {
+	if !con.waitFor(t, work+" (", 10*time.Second) {
 		t.Errorf("relative cd failed; got:\n%s", tail(con.out.String()))
 	}
 	if strings.Contains(con.out.String(), "/.. [") {
@@ -121,4 +121,52 @@ func tail(s string) string {
 		return s[len(s)-400:]
 	}
 	return s
+}
+
+// Switching machines is a separate command from cd for exactly one reason: a
+// directory can be named "@gpu03", and a cd that guessed between the two would
+// silently move you to another machine.
+func TestPlainCdNeverGuessesAtMachines(t *testing.T) {
+	trap := filepath.Join(workDir, "@pod")
+	if err := os.MkdirAll(trap, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(trap)
+
+	con := onPTY(t, "new", "e2e")
+	defer con.stop()
+	if !con.waitFor(t, "❯", 10*time.Second) {
+		t.Fatalf("no prompt; got:\n%s", con.out.String())
+	}
+	con.send("cd " + workDir + "\r")
+	if !con.waitFor(t, filepath.Base(workDir)+" (", 10*time.Second) {
+		t.Fatalf("cd failed; got:\n%s", tail(con.out.String()))
+	}
+	// A directory named @pod is a directory.
+	con.send("cd @pod\r")
+	if !con.waitFor(t, "@pod (", 10*time.Second) {
+		t.Errorf("plain cd did not enter the directory named @pod; got:\n%s",
+			tail(con.out.String()))
+	}
+	// And the machine form is spelled differently, so it cannot be confused.
+	con.send("vpctl cd @pod\r")
+	if !con.waitFor(t, filepath.Base(workDir)+" (", 10*time.Second) {
+		t.Errorf("vpctl cd @pod did not go to the machine's directory; got:\n%s",
+			tail(con.out.String()))
+	}
+}
+
+// The prompt names the machine, because that is the thing you most need to know
+// before pressing return.
+func TestPromptNamesTheMachine(t *testing.T) {
+	con := onPTY(t, "new", "e2e")
+	defer con.stop()
+	if !con.waitFor(t, "(@pod) ❯", 10*time.Second) {
+		t.Errorf("the prompt does not name the machine; got:\n%s",
+			tail(con.out.String()))
+	}
+	// And the header says where you can go.
+	if !strings.Contains(con.out.String(), "@pod") {
+		t.Errorf("the header does not list the machines:\n%s", con.out.String())
+	}
 }
