@@ -6,9 +6,13 @@ import (
 	"sort"
 	"strings"
 
+	"os"
+	"path"
+
 	"vibepod/internal/config"
 	"vibepod/internal/event"
 	"vibepod/internal/fs"
+	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/route"
 )
@@ -73,7 +77,7 @@ func (s *podState) addMount(rm proto.MountSpec, pr *Progress, runtime bool) (*mo
 	if at == "" {
 		at = rm.Path
 	}
-	if err := s.checkNewMount(at, rm.Host, rm.Path); err != nil {
+	if err := s.checkNewMount(at, rm.Host, rm.Path, runtime); err != nil {
 		return nil, err
 	}
 	if s.fs == nil {
@@ -122,16 +126,76 @@ func (s *podState) dropMount(rec *mountRec) {
 	}
 }
 
-// bindMount puts a mount into the pod's namespace. Separate from addMount
-// because at `up` the binds travel in the spec, before the pod exists.
+// bindMount puts a mount into a pod that is already running.
+//
+// It names the mount by its path in the pod's staging area, not by its path out
+// here: the daemon's mount arrived in there by propagation, and a bind whose
+// source belongs to another mount namespace is refused by the kernel however it
+// is named — an O_PATH descriptor does not help, because the check is on the
+// mount rather than the path. See pod.StageDir.
+//
+// At `up` none of this is needed: the binds travel in the spec and are made
+// before pivot_root, while the host's filesystem is still in view.
 func (s *podState) bindMount(rec *mountRec) error {
-	_, err := s.call(&proto.Msg{Op: proto.OpBind, Src: rec.Src, Dst: rec.At,
+	staged := path.Join(pod.StageDir, filepath.Base(rec.Src))
+	reply, err := s.call(&proto.Msg{Op: proto.OpBind, Src: staged, Dst: rec.At,
 		ReadOnly: rec.ReadOnly})
-	return err
+	if err != nil {
+		if !s.propagates() {
+			return fmt.Errorf("%w\n  the filesystem holding %s is not a shared "+
+				"mount, so a mount made now cannot reach the pod; this machine can "+
+				"still be added with `vibepod down` and `up`", err, s.d.runDir)
+		}
+		return err
+	}
+	if reply.Detail != "" {
+		s.d.logf("pod %s: %s", s.name, reply.Detail)
+	}
+	return nil
 }
 
-// checkNewMount refuses the two mounts that cannot be made safe afterwards.
-func (s *podState) checkNewMount(at, host, path string) error {
+// propagates reports whether a mount made in the daemon's run directory will
+// reach a pod. It is the one host property `vp mount` depends on, so it is
+// checked and named rather than assumed: systemd mounts everything shared, but a
+// machine that does not is entitled to a sentence rather than an EINVAL.
+func (s *podState) propagates() bool {
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return true // cannot tell; let the real error speak for itself
+	}
+	best, shared := 0, false
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 7 {
+			continue
+		}
+		point := f[4]
+		if !under(s.d.runDir, point) || len(point) < best {
+			continue
+		}
+		best = len(point)
+		shared = false
+		for _, opt := range f[6:] {
+			if opt == "-" {
+				break
+			}
+			if strings.HasPrefix(opt, "shared:") {
+				shared = true
+			}
+		}
+	}
+	return shared
+}
+
+// checkNewMount refuses the mounts that cannot be made safe afterwards.
+//
+// runtime distinguishes a mount being inserted into a live pod from one the
+// config asked for. Nesting is legitimate when a file says so — the order is
+// written down, and a later mount sitting on top of an earlier one is something
+// the author chose. Inserting one into a running pod is not: it changes what the
+// mounts above it mean while work is going on inside them, and order is part of
+// the state precisely because it decides that. §6a.
+func (s *podState) checkNewMount(at, host, path string, runtime bool) error {
 	at = filepath.Clean(at)
 	if err := config.GuardPath(at); err != nil {
 		return err
@@ -140,10 +204,7 @@ func (s *podState) checkNewMount(at, host, path string) error {
 		if m.At == at {
 			return fmt.Errorf("%s is already mounted here, from %s", at, m.source())
 		}
-		// Runtime mounts are append-only, and shadowing is why: inserting one
-		// under an existing mount would change what the mounts above it mean,
-		// while work is running in them. §6a.
-		if under(at, m.At) || under(m.At, at) {
+		if runtime && (under(at, m.At) || under(m.At, at)) {
 			return fmt.Errorf("%s would shadow %s, which is already mounted; "+
 				"mount it somewhere else with `at:`, or `vp unmount %s` first",
 				at, m.At, m.At)

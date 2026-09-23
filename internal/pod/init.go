@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -150,26 +151,46 @@ func (s *initServer) serve() error {
 		}
 		switch m.Op {
 		case proto.OpBind, proto.OpUnbind:
-			go s.handleBind(m)
+			go s.handleBind(m, fds)
+			fds = nil
 		case proto.OpSpawn:
 			go s.handleSpawn(m, fds)
 		case proto.OpSignal:
+			closeAll(fds)
 			_ = syscall.Kill(m.Pid, syscall.Signal(m.Sig))
 			s.send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
 		default:
+			closeAll(fds)
 			s.send(&proto.Msg{Op: proto.OpErr, ID: m.ID,
 				Err: fmt.Sprintf("unknown op %q", m.Op)})
 		}
 	}
 }
 
-func (s *initServer) handleBind(m *proto.Msg) {
+// handleBind performs a mount asked for after the pod exists, which is all
+// `vp mount` needs from vpinit. The source is a path in the staging area, where
+// the daemon's mount arrived by propagation — see StageDir for why it cannot
+// simply be the host path.
+func (s *initServer) handleBind(m *proto.Msg, fds []int) {
+	defer closeAll(fds)
 	reply := make(chan error, 1)
 	s.binds <- &bindReq{src: m.Src, dst: m.Dst, readonly: m.ReadOnly,
 		remove: m.Op == proto.OpUnbind, reply: reply}
 	if err := <-reply; err != nil {
 		s.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
 		return
+	}
+	// The staged copy has served its purpose. Leaving it would give those files a
+	// second path in the pod, and a path under /vp means nothing on the machine
+	// that owns them.
+	if m.Op == proto.OpBind && strings.HasPrefix(m.Src, StageDir+"/") {
+		s.binds <- &bindReq{dst: m.Src, remove: true, reply: reply}
+		if err := <-reply; err != nil {
+			s.send(&proto.Msg{Op: proto.OpOK, ID: m.ID,
+				Detail: "the staged copy at " + m.Src + " could not be released: " +
+					err.Error()})
+			return
+		}
 	}
 	s.send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
 }

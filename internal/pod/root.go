@@ -20,6 +20,17 @@ const (
 	ShellPath = "/vp/bin/vpsh"
 	VpPath    = "/vp/bin/vp"
 	BinDir    = "/vp/bin"
+	// StageDir is where a mount made after `up` arrives.
+	//
+	// vpinit pivoted into the pod's root long ago, so the host directory a FUSE
+	// mount lives at cannot be named from in here — and the kernel refuses a
+	// bind whose source mount belongs to another mount namespace, however that
+	// source is named. What does cross is propagation: this is a bind of the
+	// daemon's mount directory, kept as a slave of it, so a mount the daemon
+	// makes appears here and can then be bound where it belongs. vpinit unmounts
+	// the staged copy immediately afterwards, so a remote directory still has
+	// exactly one path in the pod.
+	StageDir = "/vp/mnt"
 	// BriefPath is the generated agent instruction file. It lives under
 	// /vp/run, which is a bind of the pod's own runtime directory on the host,
 	// so the daemon can rewrite it when a mount is added without asking vpinit
@@ -47,8 +58,15 @@ var devNodes = []string{"null", "zero", "full", "random", "urandom", "tty"}
 // buildRoot assembles the pod filesystem and pivots into it. It runs as PID 1
 // of a fresh mount namespace, so nothing here is visible to the host.
 func buildRoot(spec *proto.Spec) error {
-	// Detach from host propagation first: everything below is ours alone.
-	if err := sys.Mount("", "/", "", sys.MsRec|sys.MsPrivate, ""); err != nil {
+	// Receive mounts from the namespace we were cloned from, and send none back.
+	//
+	// v1 detached entirely (MS_PRIVATE), which was simpler and made `vp mount`
+	// impossible: a pod could only ever have the mounts it was born with. Slave
+	// is one-way — the pod learns about a mount the daemon makes, and can never
+	// place one outside itself. What it can reach that way is exactly the staging
+	// directory below; everything else the host mounts lives under the old root,
+	// which pivot_root detaches.
+	if err := sys.Mount("", "/", "", sys.MsRec|sys.MsSlave, ""); err != nil {
 		return err
 	}
 	root := spec.Root
@@ -171,13 +189,25 @@ func buildVp(vp string, spec *proto.Spec) error {
 	if err := sys.Mount("tmpfs", vp, "tmpfs", sys.MsNosuid, "mode=755"); err != nil {
 		return err
 	}
-	for _, d := range []string{"run", "bin"} {
+	for _, d := range []string{"run", "bin", "mnt"} {
 		if err := os.MkdirAll(filepath.Join(vp, d), 0o755); err != nil {
 			return err
 		}
 	}
 	if err := sys.BindOver(spec.RunDir, filepath.Join(vp, "run"), false); err != nil {
 		return err
+	}
+	// The staging area. Non-recursive, so the mounts already made for this pod
+	// are not copied in — they are bound at their own paths below, and a second
+	// path to the same files is the one thing the pod's layout must not have.
+	if spec.StageDir != "" {
+		stage := filepath.Join(vp, "mnt")
+		if err := sys.BindOne(spec.StageDir, stage, false); err != nil {
+			return fmt.Errorf("stage %s: %w", spec.StageDir, err)
+		}
+		if err := sys.MakeSlave(stage); err != nil {
+			return err
+		}
 	}
 	// The pod's $SHELL, which records a command line and then runs it.
 	if err := sys.BindOver(spec.ShellBin, filepath.Join(vp, "bin", "vpsh"), true); err != nil {

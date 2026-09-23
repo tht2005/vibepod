@@ -239,8 +239,12 @@ func renderHosts(hosts []proto.HostInfo) string {
 			dir = "vp mount " + h.Name + ":/path"
 		}
 		fmt.Fprintf(&b, "  @%-10s %-20s %s\n", h.Name, status, dir)
-		for _, extra := range h.Dirs[1:] {
-			fmt.Fprintf(&b, "  %-10s %-20s %s\n", "", "", short(extra))
+		// A machine this pod has not mounted owns no directories at all, which
+		// the old code could not represent: it always had at least one.
+		if len(h.Dirs) > 1 {
+			for _, extra := range h.Dirs[1:] {
+				fmt.Fprintf(&b, "  %-10s %-20s %s\n", "", "", short(extra))
+			}
 		}
 	}
 	return b.String()

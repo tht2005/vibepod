@@ -462,6 +462,14 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 
 	m.Spec.RunDir = ctlDir
 	m.Spec.Root = filepath.Join(podRun, "root")
+	// Where remote mounts are made, and the staging area the pod sees them
+	// through. It has to exist before the pod does, because the bind that
+	// carries it in happens while the root is being built.
+	m.Spec.StageDir = filepath.Join(podRun, "mnt")
+	if err := os.MkdirAll(m.Spec.StageDir, 0o700); err != nil {
+		ln.Close()
+		return err
+	}
 	if m.Spec.ShellBin == "" {
 		if m.Spec.ShellBin, err = shellBinary(); err != nil {
 			ln.Close()
@@ -489,13 +497,9 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	}
 	s.podLn = ln
 
-	// Every mount, in the order the config named them. Local directories are
-	// binds the pod builds for itself; a remote directory is mounted here first
-	// and then bound in like any other.
-	if err := s.openMounts(m, pr); err != nil {
-		s.closeFailed(ln)
-		return err
-	}
+	// Local directories are binds the pod builds for itself, so they travel in
+	// the spec and exist the moment the pod does.
+	s.planLocal(m)
 	m.Spec.Brief = s.brief()
 
 	p, err := pod.Start(m.Spec)
@@ -504,12 +508,22 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 		return err
 	}
 	s.p = p
+	go s.readLoop()
+
+	// Remote directories are attached afterwards, through the same staging area
+	// `vp mount` uses an hour later. One code path deliberately: a mount added at
+	// runtime that behaved differently from one in the config would be a second
+	// implementation of the only thing this program does.
+	if err := s.attachRemotes(m, pr); err != nil {
+		p.Kill()
+		s.closeFailed(ln)
+		return err
+	}
 
 	d.mu.Lock()
 	d.pods[name] = s
 	d.mu.Unlock()
 
-	go s.readLoop()
 	go d.servePodSocket(s)
 	go s.watchExits()
 	d.bus.Publish(event.Event{Kind: event.KindPod, Pod: name, Detail: "up",
@@ -519,29 +533,40 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	return nil
 }
 
-// openMounts brings up every mount this pod needs and refuses the pod if one
-// cannot be reached — at up time, where a person is watching, rather than
-// mid-run where an agent would meet it.
-func (s *podState) openMounts(m *proto.Msg, pr *Progress) error {
+// planLocal records the pod's own directories and puts them in the spec, so they
+// are there before anything runs.
+func (s *podState) planLocal(m *proto.Msg) {
+	for _, ms := range m.Mounts {
+		if ms.Host != "" {
+			continue
+		}
+		rec := &mountRec{At: ms.At, Src: ms.Src, Owner: route.Pod,
+			ExecOn: ms.ExecOn, Kind: "bind", ReadOnly: ms.ReadOnly,
+			Identity: ms.Identity}
+		s.mu.Lock()
+		s.mounts = append(s.mounts, rec)
+		s.mu.Unlock()
+		m.Spec.Binds = append(m.Spec.Binds,
+			proto.Bind{Src: rec.Src, Dst: rec.At, ReadOnly: rec.ReadOnly})
+	}
+	s.rebuildRoutes()
+}
+
+// attachRemotes brings up every remote mount the config asked for and refuses
+// the pod if one cannot be reached — at up time, where a person is watching,
+// rather than mid-run where an agent would meet it.
+func (s *podState) attachRemotes(m *proto.Msg, pr *Progress) error {
 	for _, ms := range m.Mounts {
 		if ms.Host == "" {
-			rec := &mountRec{At: ms.At, Src: ms.Src, Owner: route.Pod,
-				ExecOn: ms.ExecOn, Kind: "bind", ReadOnly: ms.ReadOnly,
-				Identity: ms.Identity}
-			s.mu.Lock()
-			s.mounts = append(s.mounts, rec)
-			s.mu.Unlock()
-			m.Spec.Binds = append(m.Spec.Binds,
-				proto.Bind{Src: rec.Src, Dst: rec.At, ReadOnly: rec.ReadOnly})
 			continue
 		}
 		rec, err := s.addMount(ms, pr, false)
 		if err != nil {
 			return err
 		}
-		rec.ExecOn = ms.ExecOn
-		m.Spec.Binds = append(m.Spec.Binds,
-			proto.Bind{Src: rec.Src, Dst: rec.At, ReadOnly: rec.ReadOnly})
+		if err := s.bindMount(rec); err != nil {
+			return fmt.Errorf("bind %s into the pod: %w", rec.At, err)
+		}
 		s.d.logf("pod %s: mounted %s at %s via %s", s.name, rec.source(),
 			rec.At, rec.Kind)
 	}

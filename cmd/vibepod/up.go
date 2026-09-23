@@ -167,6 +167,8 @@ func podCwd(mounts []proto.MountSpec) string {
 			return m.At
 		}
 	}
+	// No config to consult: the pod is already running and was opened from
+	// somewhere else. Its own root is the one directory certain to exist.
 	return "/"
 }
 

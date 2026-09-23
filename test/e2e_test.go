@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -116,9 +117,19 @@ func setup(m *testing.M) (int, error) {
 	if err := daemonP.Start(); err != nil {
 		return 0, err
 	}
+	// Ask it to shut down rather than killing it: the daemon releases every FUSE
+	// mount on its way out, and a killed one leaves them behind for whoever next
+	// looks at /proc/mounts.
 	defer func() {
-		_ = daemonP.Process.Kill()
-		_, _ = daemonP.Process.Wait()
+		_ = daemonP.Process.Signal(syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() { _, _ = daemonP.Process.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = daemonP.Process.Kill()
+			_, _ = daemonP.Process.Wait()
+		}
 	}()
 	if err := waitSock(filepath.Join(runDir, "host.sock")); err != nil {
 		return 0, err

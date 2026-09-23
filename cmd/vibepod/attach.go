@@ -125,24 +125,37 @@ func attachOwningStdin(c *proto.Conn, m *proto.Msg) (int, error) {
 func cmdShell(args []string) int {
 	fs := flag.NewFlagSet("shell", flag.ContinueOnError)
 	on := fs.String("on", "", "open it on this machine instead of the pod's default")
+	dir := fs.String("C", "", "start in this directory")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	name := fs.Arg(0)
+	// A pod that is already running can be opened from anywhere. Only creating
+	// one needs a config, so a missing vibepod.yaml is a reason to skip `up`,
+	// not a reason to refuse — you are as likely to want another terminal on a
+	// pod from outside its project directory as from inside it.
 	m, err := loadSpec(name)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "vibepod:", err)
-		return 1
-	}
-	c, err := connect()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "vibepod:", err)
+	c, cerr := connect()
+	if cerr != nil {
+		fmt.Fprintln(os.Stderr, "vibepod:", cerr)
 		return 1
 	}
 	defer c.Close()
-	if err := ensureUp(c, m); err != nil {
+	switch {
+	case err == nil:
+		if err := ensureUp(c, m); err != nil {
+			fmt.Fprintln(os.Stderr, "vibepod:", err)
+			return 1
+		}
+	case name == "":
 		fmt.Fprintln(os.Stderr, "vibepod:", err)
 		return 1
+	default:
+		m = &proto.Msg{Spec: &proto.Spec{Name: name}}
+	}
+	start := podCwd(m.Mounts)
+	if *dir != "" {
+		start = *dir
 	}
 	// The pod's own $SHELL, so that an interactive session's commands are
 	// recorded like any other. vpsh execs the user's real shell immediately; a
@@ -150,7 +163,7 @@ func cmdShell(args []string) int {
 	// that session *is* a shell over there.
 	code, err := attachOwningStdin(c, &proto.Msg{
 		Op: proto.OpSession, Pod: m.Spec.Name, Argv: []string{pod.ShellPath},
-		Env: os.Environ(), Cwd: podCwd(m.Mounts), Backend: *on,
+		Env: os.Environ(), Cwd: start, Backend: *on,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vibepod:", err)

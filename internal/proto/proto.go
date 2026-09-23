@@ -82,6 +82,10 @@ type Spec struct {
 	RunDir   string `json:"run_dir"`   // host dir bound in at /vp/run
 	ShellBin string `json:"shell_bin"` // host path of vpsh, the pod's $SHELL
 	CtlBin   string `json:"ctl_bin"`   // host path of the vibepod binary
+	// StageDir is the host directory the daemon makes remote mounts in. It is
+	// bound into the pod as a staging area so that a mount made an hour after
+	// `up` can be reached from inside — see pod.StageDir.
+	StageDir string `json:"stage_dir,omitempty"`
 	// Tools get a three-line wrapper in /vp/bin, which leads PATH. Two kinds
 	// are named there: commands that exist only on a remote, and commands the
 	// agent should not run locally even though it could.
