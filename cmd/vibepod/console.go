@@ -27,9 +27,10 @@ type console struct {
 	cwd     string
 	target  string
 
-	mu    sync.Mutex
-	line  []rune
-	state *term.State
+	mu      sync.Mutex
+	line    []rune
+	state   *term.State
+	cmdConn *proto.Conn // non-nil while a command owns the terminal
 }
 
 func cmdNew(args []string) int {
@@ -77,11 +78,21 @@ func (con *console) run() int {
 	go con.followEvents()
 	con.prompt()
 
+	// One read loop for the console's whole life. While a command is running
+	// the same loop forwards keystrokes to it, which is what "hands the
+	// terminal over" means in practice — and why the daemon never needs to
+	// read this terminal itself.
 	buf := make([]byte, 256)
 	for {
 		n, err := os.Stdin.Read(buf)
 		if err != nil {
 			return 0
+		}
+		if c := con.commandConn(); c != nil {
+			if !sendInput(c, buf[:n]) {
+				con.out("\r\n[detached — the command is still running]\r\n")
+			}
+			continue
 		}
 		for _, b := range buf[:n] {
 			switch b {
@@ -94,7 +105,9 @@ func (con *console) run() int {
 				if quit := con.submit(line); quit {
 					return 0
 				}
-				con.prompt()
+				if con.commandConn() == nil {
+					con.prompt()
+				}
 			case 0x7f, 0x08: // backspace
 				con.mu.Lock()
 				if len(con.line) > 0 {
@@ -154,24 +167,56 @@ func (con *console) submit(line string) (quit bool) {
 
 // runInPod hands the whole terminal over. Anything that wants a real tty —
 // an editor, an agent — gets one, and gets it back on exit.
+//
+// It waits here rather than returning to the prompt, because a cockpit with
+// two things competing for the keyboard is not a cockpit. The read loop keeps
+// running throughout; it just forwards instead of editing.
 func (con *console) runInPod(argv []string) {
 	c, err := connect()
 	if err != nil {
 		con.out("vibepod: " + err.Error() + "\r\n")
 		return
 	}
-	defer c.Close()
-	code, err := attachClient(c, &proto.Msg{
+	state, err := attachSend(c, &proto.Msg{
 		Op: proto.OpSession, Pod: con.pod, Session: con.session,
 		Argv: argv, Env: os.Environ(), Cwd: con.cwd,
 	})
 	if err != nil {
+		c.Close()
 		con.out("vibepod: " + err.Error() + "\r\n")
 		return
 	}
-	if code != 0 {
-		con.out(fmt.Sprintf("[exit %d]\r\n", code))
-	}
+	con.mu.Lock()
+	con.cmdConn = c
+	con.mu.Unlock()
+
+	// Do not wait here: the read loop that called this is the same loop that
+	// has to forward keystrokes to the command. Hand the terminal over and
+	// let the loop carry on.
+	keep := c
+	go func() {
+		defer keep.Close()
+		code, detached, err := attachWait(keep)
+		con.mu.Lock()
+		con.cmdConn = nil
+		con.mu.Unlock()
+		state.Restore()
+		switch {
+		case err != nil:
+			con.out("vibepod: " + err.Error() + "\r\n")
+		case detached:
+			con.out("\r\n[left running — vpctl attach " + con.pod + "]\r\n")
+		case code != 0:
+			con.out(fmt.Sprintf("[exit %d]\r\n", code))
+		}
+		con.prompt()
+	}()
+}
+
+func (con *console) commandConn() *proto.Conn {
+	con.mu.Lock()
+	defer con.mu.Unlock()
+	return con.cmdConn
 }
 
 func (con *console) changeDir(dir string) {

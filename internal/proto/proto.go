@@ -49,6 +49,7 @@ const (
 	OpAttach  = "attach"  // reconnect to a session the daemon is holding
 	OpWinch   = "winch"   // the client's terminal was resized
 	OpDetach  = "detach"  // left running, deliberately
+	OpInput   = "input"   // keystrokes for an attached session
 
 	// generic replies
 	OpOK   = "ok"
@@ -121,6 +122,10 @@ type Msg struct {
 	AllocPTY bool `json:"alloc_pty,omitempty"`
 	Rows     int  `json:"rows,omitempty"`
 	Cols     int  `json:"cols,omitempty"`
+	// Data carries terminal input, which is keystrokes: small enough that the
+	// socket is the right place for it, while output stays on a passed
+	// descriptor where the bulk belongs.
+	Data []byte `json:"data,omitempty"`
 
 	Pid  int `json:"pid,omitempty"`
 	Sig  int `json:"sig,omitempty"`

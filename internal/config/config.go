@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"vibepod/internal/proto"
@@ -201,6 +202,34 @@ func (c *Config) Resolve() (*Resolved, error) {
 		r.Binds = append(r.Binds, proto.Bind{Src: src, Dst: src})
 	}
 	return r, nil
+}
+
+// HostList is every machine this config refers to, however it refers to it.
+func (c *Config) HostList() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(h string) {
+		if h == "" || h == route.Pod || seen[h] {
+			return
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	for h := range c.Hosts {
+		add(h)
+	}
+	for _, m := range c.Mounts {
+		if host, _, ok := strings.Cut(m.Remote, ":"); ok {
+			add(host)
+		}
+		add(m.ExecOn)
+		for _, h := range m.ExposeTo {
+			add(h)
+		}
+	}
+	add(c.Exec.Default)
+	sort.Strings(out)
+	return out
 }
 
 func expand(p string) (string, error) {

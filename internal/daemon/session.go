@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"sync"
 	"time"
@@ -103,7 +102,13 @@ func (sess *session) pump() {
 
 // attach wires a client's terminal to a session until the session ends or the
 // client detaches. Returns the exit code, and whether it merely detached.
-func (sess *session) attach(in, out *os.File) (code int, detached bool) {
+//
+// Only the *output* half uses the client's descriptor. Input arrives as
+// messages, because the daemon must never be the thing reading a client's
+// terminal: a read blocked on a tty does not reliably come back when the
+// descriptor is closed, and a daemon still holding that read goes on eating
+// keystrokes that belong to whoever comes next.
+func (sess *session) attach(out *os.File, detachCh <-chan struct{}) (code int, detached bool) {
 	a := &attachment{out: out, stop: make(chan struct{})}
 	if snap := sess.ring.Snapshot(); len(snap) > 0 {
 		_, _ = out.Write(snap)
@@ -115,30 +120,6 @@ func (sess *session) attach(in, out *os.File) (code int, detached bool) {
 		sess.mu.Lock()
 		delete(sess.clients, a)
 		sess.mu.Unlock()
-	}()
-
-	detachCh := make(chan struct{})
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := in.Read(buf)
-			if n > 0 {
-				// Ctrl-\ leaves the session running rather than killing it.
-				if i := indexByte(buf[:n], term.DetachKey); i >= 0 {
-					if i > 0 {
-						_, _ = sess.master.Write(buf[:i])
-					}
-					close(detachCh)
-					return
-				}
-				if _, err := sess.master.Write(buf[:n]); err != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
 	}()
 
 	select {
@@ -157,6 +138,13 @@ func (sess *session) attach(in, out *os.File) (code int, detached bool) {
 	}
 }
 
+// write feeds keystrokes to the session's terminal.
+func (sess *session) write(data []byte) {
+	if sess.master != nil && len(data) > 0 {
+		_, _ = sess.master.Write(data)
+	}
+}
+
 func (sess *session) resize(rows, cols int) {
 	if sess.master != nil && rows > 0 && cols > 0 {
 		_ = sys.SetWinsize(sess.master.Fd(), rows, cols)
@@ -168,17 +156,6 @@ func (sess *session) close() {
 		_ = sess.master.Close()
 	}
 }
-
-func indexByte(b []byte, c byte) int {
-	for i, x := range b {
-		if x == c {
-			return i
-		}
-	}
-	return -1
-}
-
-var _ = io.EOF
 
 // findSession locates a running session by id, or the only one if unnamed.
 func (s *podState) findSession(id string) (*session, error) {

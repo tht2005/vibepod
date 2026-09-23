@@ -98,8 +98,9 @@ type ctlConn struct {
 	c    *proto.Conn
 	host bool // false for connections that arrived on a pod socket
 
-	mu   sync.Mutex
-	sess *session
+	mu     sync.Mutex
+	sess   *session
+	detach chan struct{}
 }
 
 // handle serves one client. host is false for connections arriving on a pod
@@ -144,12 +145,20 @@ func (k *ctlConn) serve() {
 		case proto.OpSession, proto.OpAttach:
 			go k.runSession(m, fds)
 		case proto.OpWinch:
-			k.mu.Lock()
-			sess := k.sess
-			k.mu.Unlock()
-			if sess != nil {
+			if sess := k.attached(); sess != nil {
 				sess.resize(m.Rows, m.Cols)
 			}
+		case proto.OpInput:
+			if sess := k.attached(); sess != nil {
+				sess.write(m.Data)
+			}
+		case proto.OpDetach:
+			k.mu.Lock()
+			if k.detach != nil {
+				close(k.detach)
+				k.detach = nil
+			}
+			k.mu.Unlock()
 		default:
 			closeAll(fds)
 			_ = k.c.Errorf(m.ID, "unknown op %q", m.Op)
@@ -194,13 +203,14 @@ func (k *ctlConn) runSession(m *proto.Msg, fds []int) {
 		_ = k.c.Errorf(m.ID, "%v", err)
 		return
 	}
+	detach := make(chan struct{})
 	k.mu.Lock()
-	k.sess = sess
+	k.sess, k.detach = sess, detach
 	k.mu.Unlock()
 
-	code, detached := sess.attach(files[0], files[1])
+	code, detached := sess.attach(files[1], detach)
 	k.mu.Lock()
-	k.sess = nil
+	k.sess, k.detach = nil, nil
 	k.mu.Unlock()
 	if detached {
 		_ = k.c.Send(&proto.Msg{Op: proto.OpDetach, ID: m.ID, Session: sess.id})
@@ -209,6 +219,12 @@ func (k *ctlConn) runSession(m *proto.Msg, fds []int) {
 	s.endSession(sess)
 	_ = k.c.Send(&proto.Msg{Op: proto.OpExit, ID: m.ID, Code: code,
 		Session: sess.id})
+}
+
+func (k *ctlConn) attached() *session {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.sess
 }
 
 func sessionKind(m *proto.Msg) string {

@@ -8,7 +8,10 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"os/exec"
+
 	"vibepod/internal/config"
+	"vibepod/internal/fs"
 	"vibepod/internal/proto"
 	"vibepod/internal/term"
 )
@@ -197,7 +200,7 @@ func cmdRun(args []string) int {
 	// descriptors: there is nothing to detach from, and a pty would merge
 	// stdout with stderr, which agents read separately.
 	if term.IsTTY(os.Stdin) {
-		code, err := attachClient(c, sess)
+		code, err := attachOwningStdin(c, sess)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "vpctl:", err)
 			return 1
@@ -307,29 +310,112 @@ func indexOf(list []string, s string) int {
 	return -1
 }
 
+// cmdDoctor reports whether this machine can host a pod, and which of the
+// optional pieces are present. It separates what vibepod cannot work without
+// from what merely changes how well it works, because the second kind is not
+// a failure and should not read like one.
 func cmdDoctor() error {
 	self, _ := os.Executable()
-	checks := []struct {
-		name string
-		err  error
-	}{
+	required := []check{
 		{"vpsh binary", statErr(filepath.Join(filepath.Dir(self), "vpsh"))},
 		{"unprivileged user namespaces", checkUserns()},
 		{"seccomp user notification", checkSeccomp()},
+		{"ssh", inPath("ssh")},
 	}
+	fmt.Println("required")
 	bad := 0
-	for _, c := range checks {
+	for _, c := range required {
 		if c.err != nil {
 			bad++
-			fmt.Printf("  ✗ %-32s %v\n", c.name, c.err)
-		} else {
-			fmt.Printf("  ✓ %-32s\n", c.name)
+		}
+		c.print()
+	}
+
+	fmt.Println("\nremote filesystems")
+	backend, err := fs.Pick()
+	if err != nil {
+		bad++
+		(check{"a mount backend", err}).print()
+	} else {
+		(check{"backend in use: " + backend.Name(), nil}).print()
+		if backend.Name() != "rclone" {
+			fmt.Printf("    %-30s %s\n", "",
+				"rclone would cache re-reads on local disk and can be told to")
+			fmt.Printf("    %-30s %s\n", "",
+				"forget them when a command finishes; sshfs cannot, so its")
+			fmt.Printf("    %-30s %s\n", "",
+				"timeouts stay short and it pays round trips instead.")
+		}
+	}
+
+	// Reachability is worth knowing before a pod is created rather than in the
+	// middle of an agent run.
+	if cfgPath, found := config.Find(cwdOr(".")); found {
+		if cfg, err := config.Load(cfgPath); err == nil {
+			if hosts := cfg.HostList(); len(hosts) > 0 {
+				fmt.Println("\nhosts in " + short(cfgPath))
+				for _, h := range hosts {
+					(check{h, reachable(h)}).print()
+				}
+			}
 		}
 	}
 	if bad > 0 {
-		return fmt.Errorf("%d check(s) failed", bad)
+		return fmt.Errorf("%d required check(s) failed", bad)
 	}
 	return nil
+}
+
+type check struct {
+	name string
+	err  error
+}
+
+func (c check) print() {
+	if c.err != nil {
+		fmt.Printf("  ✗ %-30s %v\n", c.name, c.err)
+		return
+	}
+	fmt.Printf("  ✓ %-30s\n", c.name)
+}
+
+func inPath(bin string) error {
+	if _, err := exec.LookPath(bin); err != nil {
+		return fmt.Errorf("not installed")
+	}
+	return nil
+}
+
+func cwdOr(fallback string) string {
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return fallback
+}
+
+// reachable asks ssh, with the user's own config, so ProxyJump and keys are
+// exercised exactly as a real command would exercise them.
+func reachable(host string) error {
+	args := []string{}
+	if f := os.Getenv("VIBEPOD_SSH_CONFIG"); f != "" {
+		args = append(args, "-F", f)
+	}
+	args = append(args, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "true")
+	if out, err := exec.Command("ssh", args...).CombinedOutput(); err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("%s", firstLine(msg))
+	}
+	return nil
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 func statErr(p string) error {
