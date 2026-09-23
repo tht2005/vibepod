@@ -35,10 +35,47 @@ type nodePod struct {
 	host string
 	sock string // the socket on that machine
 	home string
-	// mounts is what that node holds, so a dispatch into a mount it does not
-	// have can be refused by name rather than run against the wrong bytes.
-	mounts []string
-	native map[string]bool // mounts it owns, and therefore binds natively
+
+	mu sync.Mutex
+	// held is what that node reports it has, so a dispatch into a mount it does
+	// not have is refused by name rather than run against the wrong bytes.
+	held []proto.Held
+	// gen is the generation it has converged to. Behind the pod's own means there
+	// is a difference waiting to be applied.
+	gen int64
+	// reachable is the last thing the lease loop learned. A node that is not
+	// reachable is not wrong, only behind.
+	reachable bool
+}
+
+func (np *nodePod) setHeld(held []proto.Held, gen int64) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	np.held, np.gen, np.reachable = held, gen, true
+}
+
+func (np *nodePod) heldList() []proto.Held {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	return append([]proto.Held(nil), np.held...)
+}
+
+func (np *nodePod) generation() int64 {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	return np.gen
+}
+
+func (np *nodePod) setReachable(ok bool) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	np.reachable = ok
+}
+
+func (np *nodePod) isReachable() bool {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	return np.reachable
 }
 
 // nodePods is the set, keyed by machine.
@@ -86,40 +123,44 @@ func (n *nodePods) drop(host string) {
 // rest it mounts from whoever owns them.
 func (s *podState) nodeSpecFor(host, home string) (*proto.NodeSpec, error) {
 	spec := &proto.NodeSpec{
-		Pod:      s.name,
+		Pod:      s.nodeName(host),
 		Node:     host,
-		RunDir:   node.RunDir(home, s.name),
+		RunDir:   node.RunDir(home, s.nodeName(host)),
 		Hostname: host,
 		SSHExtra: s.nodeSSHExtra(),
 		Version:  Version,
+		Lease:    s.lease,
 	}
 	for _, m := range s.mountList() {
-		if m.Identity {
+		if m.Identity || m.Owner != route.Pod {
 			continue
 		}
-		if m.Owner == route.Pod {
-			// A directory on *this* machine. Reaching it from a node means
-			// serving it back out — which is the reverse mount, and is not built.
-			// Refuse at `up`, where a person is watching, and say what a node pod
-			// on this config would and would not see.
-			return nil, fmt.Errorf("%s is a directory on this machine, and a pod on "+
-				"%s cannot reach it yet; mount it from a machine %s can see, or run "+
-				"that session on `pod`", m.At, host, host)
-		}
-		spec.Mounts = append(spec.Mounts, proto.MountSpec{
-			At: m.At, Host: m.Owner, Path: m.RemotePath, ReadOnly: m.ReadOnly,
-			Cache: m.Cache, Prefetch: m.Prefetch,
-		})
-		if m.Cache != "" {
-			spec.Cache = m.Cache
-		}
+		// A directory on *this* machine. Reaching it from a node means serving it
+		// back out — the reverse mount, which is not built. Refuse here, where a
+		// person is watching, rather than build a pod missing part of the tree.
+		return nil, fmt.Errorf("%s is a directory on this machine, and a pod on "+
+			"%s cannot reach it yet; mount it from a machine %s can see, or run "+
+			"that session on `pod`", m.At, host, host)
 	}
+	// The same list the reconciler converges to, writer election included, so a
+	// freshly built pod and a reconciled one cannot disagree.
+	spec.Mounts = s.desired(host)
 	if len(spec.Mounts) == 0 {
 		return nil, fmt.Errorf("a pod on %s would hold nothing: every mount in this "+
 			"pod is local to this machine", host)
 	}
 	return spec, nil
 }
+
+// nodeName is what a node pod is called on the machine that runs it: this pod's
+// name *and* the alias it was reached by.
+//
+// The pod name alone is not enough. Two ssh aliases for one machine — gpu03 and
+// gpu03-direct — are common, and keyed by pod name they would share one node pod:
+// the second `node add` would "adopt" the first's pod and reconcile it to its own
+// idea of who may write. Keyed by alias, each is its own pod, and adoption still
+// finds the right one after this daemon restarts.
+func (s *podState) nodeName(host string) string { return s.name + "@" + host }
 
 // nodeSSHExtra are the options a node's own outbound ssh needs. In the ordinary
 // case none: the node uses its own ssh config and the agent socket forwarded for
@@ -197,6 +238,29 @@ func (s *podState) startNodePod(host string, consented map[string]bool, pr *Prog
 		}
 	}
 
+	// A pod may already be running there: this daemon restarted, or the laptop
+	// lost its connection and came back inside the lease. Adopt it rather than
+	// kill it — the whole reason a node pod outlives a disconnect is so a job on it
+	// does not die with the ssh — and let the reconciler apply whatever changed.
+	if !need.Binary {
+		candidate := &nodePod{host: host, home: need.HomeDir}
+		if _, err := s.nodeRequest(candidate, &proto.Msg{Op: proto.OpHeld}); err == nil {
+			pr.step("adopting the pod already running on %s… ", host)
+			s.nodePods.put(host, candidate)
+			if err := s.reconcile(candidate); err != nil {
+				pr.failed()
+				s.nodePods.drop(host)
+				return fmt.Errorf("%s has a pod that could not be reconciled: %w",
+					host, err)
+			}
+			pr.ok("generation %d", candidate.generation())
+			s.markUsed(host)
+			s.d.bus.Publish(event.Event{Kind: event.KindPod, Pod: s.name,
+				Target: host, Detail: "node pod adopted"})
+			return nil
+		}
+	}
+
 	spec, err := s.nodeSpecFor(host, need.HomeDir)
 	if err != nil {
 		return err
@@ -229,20 +293,27 @@ func (s *podState) startNodePod(host string, consented map[string]bool, pr *Prog
 	}
 	pr.ok("ready")
 
-	np := &nodePod{host: host, sock: sock, home: need.HomeDir,
-		native: map[string]bool{}}
-	for _, m := range spec.Mounts {
-		np.mounts = append(np.mounts, m.At)
-		if m.Host == host {
-			np.native[m.At] = true
-		}
-	}
+	np := &nodePod{host: host, sock: sock, home: need.HomeDir, reachable: true}
 	s.nodePods.put(host, np)
+	defer s.warnBudget(pr)
+	// Ask it what it ended up with rather than assuming the spec was applied
+	// whole: adoption of a pod that was already running goes through the same
+	// path, and there the answer is genuinely unknown.
+	if err := s.reconcile(np); err != nil {
+		s.nodePods.drop(host)
+		return fmt.Errorf("%s built a pod but could not be reconciled: %w", host, err)
+	}
 	s.markUsed(host)
 	s.d.bus.Publish(event.Event{Kind: event.KindPod, Pod: s.name, Target: host,
 		Detail: "node pod up"})
-	s.d.logf("pod %s: node pod on %s (%d mounts, %d native)", s.name, host,
-		len(np.mounts), len(np.native))
+	native := 0
+	for _, h := range np.heldList() {
+		if h.Native {
+			native++
+		}
+	}
+	s.d.logf("pod %s: node pod on %s at generation %d (%d mounts, %d native)",
+		s.name, host, np.generation(), len(np.heldList()), native)
 	return nil
 }
 
@@ -302,9 +373,12 @@ func (s *podState) stopNodePod(host string) {
 		return
 	}
 	s.nodePods.drop(host)
+	// Its claim on writing to anything goes with it, so the next machine to take
+	// one of those mounts can have it writable.
+	s.releaseWriter(host)
 	h := s.d.pool.Host(host)
 	if _, err := h.Capture(fmt.Sprintf("%s/.vp/bin/vibepod nodedown --pod %s",
-		np.home, s.name)); err != nil {
+		np.home, s.nodeName(host))); err != nil {
 		s.d.logf("pod %s: stopping the node pod on %s: %v", s.name, host, err)
 	}
 }
@@ -329,11 +403,11 @@ func (s *podState) needNodePod(host, cwd string) error {
 	}
 }
 
-// nodeHolds reports whether a machine's pod has this directory, which is what
-// makes a dispatch to a stale node a visible refusal rather than a wrong path.
+// holds reports whether a machine's pod has this directory, which is what makes a
+// dispatch to a node that is behind a visible refusal rather than a wrong path.
 func (np *nodePod) holds(dir string) bool {
-	for _, at := range np.mounts {
-		if under(dir, at) {
+	for _, h := range np.heldList() {
+		if under(dir, h.At) {
 			return true
 		}
 	}
@@ -395,14 +469,12 @@ func (d *Daemon) nodeDrop(m *proto.Msg) error {
 }
 
 func (s *podState) nodeList() []proto.NodeInfo {
+	behind := s.staleness()
 	out := []proto.NodeInfo{}
 	for _, np := range s.nodePods.list() {
-		info := proto.NodeInfo{Host: np.host, Mounts: np.mounts}
-		for at := range np.native {
-			info.Native = append(info.Native, at)
-		}
-		sort.Strings(info.Native)
-		out = append(out, info)
+		out = append(out, proto.NodeInfo{Host: np.host, Mounts: np.heldList(),
+			Generation: np.generation(), Behind: behind[np.host],
+			Reachable: np.isReachable()})
 	}
 	return out
 }

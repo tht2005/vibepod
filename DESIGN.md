@@ -1,6 +1,6 @@
 # vibepod — design
 
-> Status: **v2 built and verified through M6** (M0-M2 were v1; M3-M6 replaced it).
+> Status: **v2 built and verified through M6a** (M0-M2 were v1; M3-M6a replaced it).
 > v1 routed commands by working directory through a seccomp exec gate; using it
 > showed the mechanism cannot be made trustworthy, so v2 replaced it with an
 > explicit per-session **backend** and a live shell on it (§3), made the config a
@@ -9,11 +9,10 @@
 > the composed tree is uniform everywhere (§6a) rather than translating paths.
 >
 > What is not built: `via: relay`, the forwarded-agent credential proxy, `toolbin:`
-> pushes, port forwards, reverse mounts, `sync` mode, and the control plane (M6a)
-> that would let `vp mount` converge a pod that already has node pods — today that
-> combination is a refusal naming the mount. §13 has the milestone list and what
-> each one cost; §12 the remaining unknowns. PLAN.md records what was measured
-> before v1.
+> pushes, port forwards, reverse mounts and `sync` mode. Per-file write tokens were
+> replaced by per-mount writer election, for a reason §11 records. §13 has the
+> milestone list and what each one cost; §12 the remaining unknowns. PLAN.md
+> records what was measured before v1.
 
 ## 1. Problem
 
@@ -1247,7 +1246,7 @@ replays the buffer. Killing the pod kills everything inside it.
 | Tree consistency | per-mount generations, reconcile on reconnect | 2PC lets one dead node block every mount change; best-effort push produces silent divergence. Dispatch refuses a stale mount, so staleness costs a visible refusal, never a wrong path |
 | Staleness grain | per mount, not per node | one missed mount should cost a path, not a machine; unrelated sessions on that node stay correct |
 | Mount locality | native bind on its owner, cached rclone mount elsewhere | running work where the data lives is then always full speed, with nothing to configure |
-| Write coherence | one writer per **file**, tracked by the control plane | N write-back caches over one mount means two nodes can hold dirty copies and the last flush wins silently. Per-file because that is rclone's unit and because two nodes writing *different* files in one mount is normal |
+| Write coherence | one writer per **mount**, elected at mount time; `writers: many` opts out | N write-back caches over one mount means two nodes can hold dirty copies and the last flush wins silently. The design asked for per-file tokens; building it found there is no enforcement point — writes go through rclone on the node and vibepod is deliberately not in the data path, so it cannot see an open. A mount flag is enforced by the kernel. The cost is that two machines cannot write *different* files in one mount unless `writers: many` accepts last-flush-wins |
 | Invalidation grain | per mount, broadcast to every holder | one cache became N; forgetting a whole host's mounts was harmless with one copy and wasteful with many |
 | Overlapping origins | refused at `up` and `vp mount` | two caches over the same bytes cannot be made coherent afterwards. The existing shadow guard checks pod paths for visibility; origins need the same check for coherence |
 | Connection budget | one `rclone rcd` per node, budget computed at `up` | M mounts × N nodes against one origin runs into sshd's `MaxSessions`/`MaxStartups`, which presents as unrelated failures for everyone on a shared node |
@@ -1378,14 +1377,22 @@ order so that each one was usable on its own.
   Still missing: `via: relay` for a node with no path to the data, the forwarded-agent
   credential proxy, `toolbin:` pushes and port forwards. A node uses its own ssh config, so
   nothing is stored anywhere it was not already.
-- **M6a — the control plane. Not started**, and the first genuinely distributed piece.
-  Per-mount generations, reconcile-on-reconnect, per-mount staleness surfaced in `vp ps` and
-  the cockpit, dispatch refusal on a stale mount (the *refusal* exists; the convergence does
-  not), append-only runtime ordering with the shadow guard (built), two-phase unmount with
-  the dirty-flush refusal, the lease, and adoption on reconnect. Plus what replication does
-  to the cache: per-file write tokens, invalidation fanned out per mount to every holder,
-  the origin-overlap refusal (built) and the connection budget. Until it lands, adding a
-  mount to a pod that has node pods means `down` and `up`.
+- **M6a — the control plane. [done]** Per-mount generations; a reconciler that converges
+  every node pod after `vp mount` and `vp unmount`, leaves an unreachable one behind rather
+  than blocking, and catches it up when the lease loop hears from it again; per-mount
+  staleness in `vp ps`, `vp node` and the cockpit; dispatch that tries to catch a stale node
+  up before refusing; unmount that flushes a write-back cache and refuses rather than
+  discard; the lease, which keeps a node pod through a disconnect and has it flush,
+  unmount, exit and clear its state when the daemon is gone for good; adoption of a pod
+  already running on a node; invalidation fanned out per mount to every other holder; and
+  the connection budget, warned about before sshd starts refusing people.
+  Per-file write tokens became per-mount writer election (§11). The flush and the
+  per-mount invalidation are rclone calls, and this machine has no rclone, so those two are
+  written against its API and verified only in the sshfs case, where there is nothing to
+  flush or forget.
+  Building it found that node pods were keyed by pod name alone, so two ssh aliases for one
+  machine shared a pod and the second `node add` adopted the first's — they are keyed by
+  pod *and* alias now.
 - **M7 — polish. Not started.** Reverse mounts (`expose_to:`) for "edit here, run there",
   `sync` mode, and the rest of the tree's views from §9: `-x` to expand a remote subtree,
   `--running`, `--failed --since`, one subtree by pid, `--mounts`/`--exec`.

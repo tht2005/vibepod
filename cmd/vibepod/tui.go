@@ -44,7 +44,10 @@ type cockpit struct {
 	activity []string
 	// deflt is the backend a new session opens on, which is what the status line
 	// says when no session is focused.
-	deflt   string
+	deflt string
+	// behind is, per machine, the mounts its node pod does not hold yet. Shown on
+	// that machine's row, because a command there under one of them is refused.
+	behind  map[string][]string
 	filter  string
 	status  string
 	focus   int // 0: machines, 1: sessions
@@ -476,7 +479,16 @@ func (co *cockpit) refresh() {
 	defer c.Close()
 	hosts, _ := call(c, &proto.Msg{Op: proto.OpHosts, Pod: co.pod})
 	tree, _ := call(c, &proto.Msg{Op: proto.OpTree, Pod: co.pod})
+	ps, _ := call(c, &proto.Msg{Op: proto.OpPs})
 	co.mu.Lock()
+	co.behind = nil
+	if ps != nil {
+		for _, p := range ps.Pods {
+			if p.Name == co.pod {
+				co.behind = p.Behind
+			}
+		}
+	}
 	if hosts != nil {
 		co.hosts = hosts.Hosts
 	}

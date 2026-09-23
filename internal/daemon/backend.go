@@ -212,10 +212,13 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 		// carried as it is. If this particular mount is missing from that pod, say
 		// so — a stale node costs a visible refusal, never a wrong path.
 		if !np.holds(dir) && owner != backend {
-			return 0, fmt.Errorf("%s is not in the pod on %s, so a command there "+
-				"would be in a directory of the same name on a different "+
-				"filesystem; `vibepod down` and `up` replicates the current mounts",
-				dir, backend)
+			// Behind on this mount. Try once to catch up — it may simply have been
+			// unreachable when the mount was added — and refuse only if that fails.
+			if err := s.reconcile(np); err != nil || !np.holds(dir) {
+				return 0, fmt.Errorf("%s is not in the pod on %s yet, so a command "+
+					"there would be in a directory of the same name on a different "+
+					"filesystem; `vp node` shows what it is behind on", dir, backend)
+			}
 		}
 	case owner == backend:
 		// The directory is that machine's own: the path means there what it says,
@@ -240,7 +243,7 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 
 	host := s.d.pool.Host(backend)
 	if np != nil {
-		host = host.InPod(np.home, s.name)
+		host = host.InPod(np.home, s.nodeName(backend))
 	}
 	s.markUsed(backend)
 	id := fmt.Sprintf("%s-%d", s.name, execSeq.Add(1))
@@ -279,6 +282,11 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 	if s.fs != nil {
 		s.fs.InvalidateAfter(backend)
 	}
+	// And on every *other* machine holding a cache of the directory it ran in.
+	// With one cache, forgetting after a command was enough; with a pod on every
+	// backend there are N, and a node that is not told keeps serving the bytes from
+	// before the command ran.
+	s.fanOutInvalidate(backend, r.cwd)
 	return code, nil
 }
 

@@ -92,7 +92,7 @@ func startSSHD(dir string, port int) (*sshFixture, error) {
 			name, port, os.Getenv("USER"), id)
 	}
 	if err := os.WriteFile(sshCfg,
-		[]byte(alias("vptest")+alias("vptest2")), 0o600); err != nil {
+		[]byte(alias("vptest")+alias("vptest2")+alias("vptest3")), 0o600); err != nil {
 		return nil, err
 	}
 

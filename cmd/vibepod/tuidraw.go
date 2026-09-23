@@ -178,6 +178,12 @@ func (co *cockpit) hostRow(h proto.HostInfo, w int) string {
 		// list that is not visible from the list.
 		name += "*"
 	}
+	if missing := co.behind[h.Name]; len(missing) > 0 {
+		// Per mount: commands there under other mounts are still correct, so the
+		// row says how many it is missing rather than marking the machine broken.
+		where = fmt.Sprintf("behind on %d mount(s)", len(missing))
+		dot = "◐"
+	}
 	return fmt.Sprintf("%s %-11s %s", dot, trim(name, 11), where)
 }
 

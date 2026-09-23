@@ -172,10 +172,10 @@ func (s *podState) openShell(sess *session, backend string, argv []string,
 		// which is right when the directory is that machine's own and is what the
 		// prompt then shows.
 		if np := s.nodePods.get(backend); np != nil {
-			host = host.InPod(np.home, s.name)
+			host = host.InPod(np.home, s.nodeName(backend))
 		} else if err := s.ensureNodePod(backend); err == nil {
 			if np := s.nodePods.get(backend); np != nil {
-				host = host.InPod(np.home, s.name)
+				host = host.InPod(np.home, s.nodeName(backend))
 			}
 		}
 		cmd, err := host.Shell(dir, slave)

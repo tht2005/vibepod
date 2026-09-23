@@ -66,6 +66,79 @@ func (r *Rclone) Mount(m *Mount, sshCommand string) error {
 }
 
 // Invalidate is the hook the whole backend choice turns on.
+// Flush waits until this mount has written everything back.
+//
+// rclone's VFS uploads on file close rather than on a timer, so "has it finished"
+// is a question with an answer: the transfer queue. Asking it is the difference
+// between an unmount that is safe and one that is merely quick.
+func (r *Rclone) Flush(m *Mount, timeout time.Duration) error {
+	if m.rcAddr == "" {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		stats, err := r.rc(m, "vfs/stats", nil)
+		if err != nil {
+			// Cannot ask. Saying "flushed" would be a guess about somebody's
+			// checkpoint, so it is a refusal instead.
+			return fmt.Errorf("cannot ask %s whether it has finished writing: %w",
+				m.MountPoint, err)
+		}
+		queued := vfsQueued(stats)
+		if queued == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%d file(s) still waiting to be written to %s:%s",
+				queued, m.Host, m.RemotePath)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// vfsQueued digs the outstanding-write count out of rclone's reply. The shape of
+// that reply has changed between versions, so this reads every plausible field
+// rather than one: over-reporting delays an unmount, under-reporting loses a file.
+func vfsQueued(stats map[string]any) int {
+	total := 0
+	for _, key := range []string{"uploadsInProgress", "uploadsQueued"} {
+		if v, ok := stats[key].(float64); ok {
+			total += int(v)
+		}
+	}
+	if disk, ok := stats["diskCache"].(map[string]any); ok {
+		for _, key := range []string{"uploadsInProgress", "uploadsQueued"} {
+			if v, ok := disk[key].(float64); ok {
+				total += int(v)
+			}
+		}
+	}
+	return total
+}
+
+// rc calls one of rclone's control endpoints on the process serving this mount.
+func (r *Rclone) rc(m *Mount, path string, body map[string]string) (map[string]any, error) {
+	if body == nil {
+		body = map[string]string{}
+	}
+	blob, _ := json.Marshal(body)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post("http://"+m.rcAddr+"/"+path, "application/json",
+		bytes.NewReader(blob))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: %s", path, resp.Status)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Prefetch copies a tree onto local disk up front.
 //
 // For exactly one shape: many small files, where a lazy cache is latency-bound on

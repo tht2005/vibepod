@@ -50,15 +50,20 @@ const (
 	OpNodeAdd  = "node-add"  // build a pod on a machine
 	OpNodeDrop = "node-drop" // stop one and remove its state
 	OpNodeList = "node-list" // the machines with pods, and what they hold
-	OpBrief    = "brief"     // the generated agent brief, as the pod sees it
-	OpUp       = "up"
-	OpPs       = "ps"
-	OpDown     = "down"
-	OpSession  = "session" // attach a terminal and run Argv in the pod
-	OpAttach   = "attach"  // reconnect to a session the daemon is holding
-	OpWinch    = "winch"   // the client's terminal was resized
-	OpDetach   = "detach"  // left running, deliberately
-	OpInput    = "input"   // keystrokes for an attached session
+
+	// daemon -> vpnode, over ssh
+	OpHeld       = "held"       // what does this node pod hold?
+	OpInvalidate = "invalidate" // forget what you cached for this mount
+	OpLease      = "lease"      // the daemon is still here
+	OpBrief      = "brief"      // the generated agent brief, as the pod sees it
+	OpUp         = "up"
+	OpPs         = "ps"
+	OpDown       = "down"
+	OpSession    = "session" // attach a terminal and run Argv in the pod
+	OpAttach     = "attach"  // reconnect to a session the daemon is holding
+	OpWinch      = "winch"   // the client's terminal was resized
+	OpDetach     = "detach"  // left running, deliberately
+	OpInput      = "input"   // keystrokes for an attached session
 
 	// OpProgress is sent while a request is still being worked on, so that a
 	// wait long enough to look like a hang does not have to be one.
@@ -146,6 +151,14 @@ type MountSpec struct {
 	Cache string `json:"cache,omitempty"`
 	// Prefetch copies the tree up front rather than warming it lazily.
 	Prefetch bool `json:"prefetch,omitempty"`
+	// Generation is the version of the mount list this entry belongs to, so a node
+	// still holding an older definition of the same path is a fact rather than a
+	// guess. A path can be unmounted and remounted from a different machine.
+	Generation int64 `json:"gen,omitempty"`
+	// ManyWriters lets several machines write into this mount at once, accepting
+	// that the last flush of any one file wins. Off by default: one write-back
+	// cache per mount is the only coherence vibepod can enforce (see isWriter).
+	ManyWriters bool `json:"many_writers,omitempty"`
 }
 
 // NodeSpec is what a node needs to build its own pod: the composed zone, and
@@ -169,6 +182,10 @@ type NodeSpec struct {
 	Hostname string   `json:"hostname,omitempty"`
 	// Cache bounds the on-node disk cache, as rclone spells it (e.g. "200G").
 	Cache string `json:"cache,omitempty"`
+	// Lease is how long this pod outlives silence from the daemon before it
+	// flushes, unmounts and exits. Empty means forever, which is right for a
+	// machine you own and wrong for one you share.
+	Lease string `json:"lease,omitempty"`
 	// Version is the build that wrote this spec, so a node running an older
 	// pushed binary is noticed rather than debugged.
 	Version string `json:"version,omitempty"`
@@ -235,6 +252,10 @@ type Msg struct {
 	// mount. A compute node with no data of its own is the case that needs this:
 	// it is named under `hosts:` and is a machine you dispatch to.
 	Machines []string `json:"machines,omitempty"`
+	// Held is what a node pod reports it has, and Generation the desired state's
+	// version. Together they are the whole of the reconciler's input.
+	Held       []Held `json:"held,omitempty"`
+	Generation int64  `json:"generation,omitempty"`
 
 	// Detail is human-facing text: what a slow request is waiting for, or why
 	// it stopped waiting.
@@ -317,14 +338,36 @@ type PodInfo struct {
 	Uptime   string        `json:"uptime"`
 	Default  string        `json:"default,omitempty"`
 	Live     []SessionInfo `json:"live,omitempty"`
+	// Behind is, per machine, the mounts its node pod does not hold yet.
+	Behind map[string][]string `json:"behind,omitempty"`
 }
 
-// NodeInfo is one machine with a pod on it: what it holds, and which of those it
-// owns outright rather than caching.
+// NodeInfo is one machine with a pod on it: what it holds, which of those it owns
+// outright rather than caching, and where it is behind.
 type NodeInfo struct {
-	Host   string   `json:"host"`
-	Mounts []string `json:"mounts"`
-	Native []string `json:"native,omitempty"`
+	Host   string `json:"host"`
+	Mounts []Held `json:"mounts"`
+	// Generation is the mount list this node has converged to. Lower than the
+	// pod's own means it is behind, and on what is in Behind.
+	Generation int64    `json:"generation"`
+	Behind     []string `json:"behind,omitempty"`
+	Reachable  bool     `json:"reachable"`
+}
+
+// Held is one mount as a node pod holds it. Identity, not just a path: a path can
+// be unmounted and remounted from a different machine, and a node still holding
+// the old one is exactly the case a generation exists to catch.
+type Held struct {
+	At     string `json:"at"`
+	Host   string `json:"host,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Native bool   `json:"native,omitempty"`
+	// ReadOnly is set when this node is not the writer for the mount. §6a: one
+	// write-back cache per mount, because two of them means two nodes holding
+	// dirty copies of one file and the last flush winning silently.
+	ReadOnly bool `json:"ro,omitempty"`
+	// Generation this mount entered the desired list at.
+	Generation int64 `json:"gen,omitempty"`
 }
 
 // SessionInfo is one session and the machine it is on — the fact `ps` exists to

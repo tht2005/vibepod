@@ -513,6 +513,9 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	for _, h := range m.Nodes {
 		s.consented[h] = true
 	}
+	// How long a node pod outlives silence from this daemon. Empty means forever,
+	// which is right for a machine you own and wrong for one you share.
+	s.lease = m.Detail
 	if s.toolHosts == nil {
 		s.toolHosts = map[string]string{}
 	}
@@ -547,6 +550,7 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 
 	go d.servePodSocket(s)
 	go s.watchExits()
+	go s.leaseLoop()
 	d.bus.Publish(event.Event{Kind: event.KindPod, Pod: name, Detail: "up",
 		PID: p.Pid})
 	d.logf("pod %s up (vpinit pid %d, default backend %s)", name, p.Pid,
@@ -563,7 +567,7 @@ func (s *podState) planLocal(m *proto.Msg) {
 		}
 		rec := &mountRec{At: ms.At, Src: ms.Src, Owner: route.Pod,
 			ExecOn: ms.ExecOn, Kind: "bind", ReadOnly: ms.ReadOnly,
-			Identity: ms.Identity}
+			Identity: ms.Identity, Gen: s.bumpGeneration()}
 		s.mu.Lock()
 		s.mounts = append(s.mounts, rec)
 		s.mu.Unlock()
@@ -687,6 +691,7 @@ func (d *Daemon) ps() []proto.PodInfo {
 			Uptime:   time.Since(s.started).Truncate(time.Second).String(),
 			Default:  s.table().Default,
 			Live:     live,
+			Behind:   s.staleness(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

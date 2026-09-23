@@ -215,7 +215,7 @@ func TestNodeDropTakesTheMachineOutOfService(t *testing.T) {
 	// mounts. Other pods' state is none of this pod's business, so the check is
 	// this pod's own directory.
 	left, _ := sshCapture(t, "vptest2",
-		"test -e ~/.vp/run/e2e-node-drop && echo kept || echo gone")
+		"test -e ~/.vp/run/e2e-node-drop@vptest2 && echo kept || echo gone")
 	if strings.TrimSpace(left) != "gone" {
 		t.Errorf("the node kept this pod's state after it was dropped: %q", left)
 	}

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"vibepod/internal/proto"
 	"vibepod/internal/route"
@@ -33,6 +34,10 @@ type Config struct {
 	// network path out of a containment sandbox, so it is allowlisted, but the
 	// allowlist you already maintain is your ssh config.
 	CanMount []string `yaml:"can_mount"`
+	// Lease is how long a node pod outlives silence from the daemon before it
+	// flushes, unmounts and exits. Empty means forever: right on a machine you own,
+	// wrong on one you share.
+	Lease string `yaml:"lease"`
 }
 
 type Host struct {
@@ -60,6 +65,12 @@ type Mount struct {
 	// cache handles badly: many small files, where the first pass is
 	// latency-bound while the machine that asked for the data sits idle.
 	Prefetch bool `yaml:"prefetch"`
+	// Writers is "one" (the default) or "many". One means the first machine to
+	// take this mount writable keeps it and every other node pod gets it
+	// read-only — the only way to guarantee two write-back caches never hold dirty
+	// copies of the same file. Many lifts that, and with it accepts that the last
+	// flush of any one file wins.
+	Writers string `yaml:"writers"`
 }
 
 type Exec struct {
@@ -158,7 +169,8 @@ func (t *RemoteTools) UnmarshalYAML(n *yaml.Node) error {
 
 // Resolved is a config checked against the filesystem and flattened.
 type Resolved struct {
-	Name string
+	Name  string
+	Lease string
 	// Machines is every machine this config names, mount or no mount. A compute
 	// node with no data of its own is still a machine this pod runs commands on.
 	Machines   []string
@@ -228,8 +240,14 @@ func Find(dir string) (string, bool) {
 // Resolve expands paths and applies the placement guard. Every refusal happens
 // here, at up time, while a human is watching — never mid-run.
 func (c *Config) Resolve() (*Resolved, error) {
-	r := &Resolved{Name: c.Pod, Default: c.Exec.Default, Machines: c.HostList(),
-		Tools: c.RemoteTools.Names, ToolHosts: c.RemoteTools.Hosts,
+	if c.Lease != "" {
+		if _, err := time.ParseDuration(c.Lease); err != nil {
+			return nil, fmt.Errorf("lease: %q is not a duration like 24h", c.Lease)
+		}
+	}
+	r := &Resolved{Name: c.Pod, Lease: c.Lease, Default: c.Exec.Default,
+		Machines: c.HostList(),
+		Tools:    c.RemoteTools.Names, ToolHosts: c.RemoteTools.Hosts,
 		CanMount: c.CanMount, ForwardEnv: c.Exec.ForwardEnv}
 	if r.ForwardEnv.Mode == "" {
 		r.ForwardEnv.Mode = "delta"
@@ -312,9 +330,16 @@ func (c *Config) Resolve() (*Resolved, error) {
 			if mode == "" {
 				mode = "fuse"
 			}
+			switch m.Writers {
+			case "", "one", "many":
+			default:
+				return nil, fmt.Errorf("mount %s: writers must be one or many, not %q",
+					m.Remote, m.Writers)
+			}
 			r.Mounts = append(r.Mounts, proto.MountSpec{At: at, Host: host,
 				Path: path, ReadOnly: m.ReadOnly, Mode: mode, ExecOn: m.ExecOn,
-				Requires: m.Requires, Cache: m.Cache, Prefetch: m.Prefetch})
+				Requires: m.Requires, Cache: m.Cache, Prefetch: m.Prefetch,
+				ManyWriters: m.Writers == "many"})
 
 		default:
 			return nil, fmt.Errorf("a mount needs local: or remote:")

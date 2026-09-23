@@ -53,6 +53,7 @@ func loadSpec(name string) (*proto.Msg, error) {
 			Names: res.ForwardEnv.Names},
 		Mounts:    res.Mounts,
 		Machines:  res.Machines,
+		Detail:    res.Lease, // the lease, carried in the one free text field
 		ToolHosts: res.ToolHosts,
 		CanMount:  res.CanMount,
 		Config:    path,
@@ -219,6 +220,14 @@ func cmdPs() error {
 	}
 	if err := w.Flush(); err != nil {
 		return err
+	}
+	// A machine behind on a mount is refused for commands under that mount and
+	// only that mount, so say exactly which.
+	for _, p := range reply.Pods {
+		for host, mounts := range p.Behind {
+			fmt.Printf("%s: @%s is behind on %s\n", p.Name, host,
+				strings.Join(mounts, ", "))
+		}
 	}
 	// Which machine each session is on is the fact v2 added, so it gets its own
 	// block rather than a column that would be empty for most pods.

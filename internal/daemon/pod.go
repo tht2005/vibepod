@@ -57,6 +57,17 @@ type podState struct {
 	// nodePods are the pods this pod has on other machines: the same composed
 	// zone, at the same paths, on each backend that runs one.
 	nodePods nodePods
+	// lease is how long a node pod outlives silence from this daemon. It is the only
+	// thing that keeps one alive, and the only thing that cleans one up.
+	lease string
+	// gen is the version of the desired mount list. Every change bumps it, and a
+	// node pod that has converged to a lower one is behind — on the mounts it is
+	// missing, not on the machine as a whole.
+	gen int64
+	// writers is which machine may write to each mount, and manyWriters the mounts
+	// where the config said not to bother deciding.
+	writers     map[string]string
+	manyWriters map[string]bool
 	// waits is how a pod process's exit code gets back to whoever started it.
 	// vpinit reports exits by pid, and a session can hold several processes —
 	// one shell per backend it has visited — so the pid is the only key that

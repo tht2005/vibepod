@@ -43,6 +43,12 @@ func main() {
 				os.Exit(exitUnavailable)
 			}
 			return
+		case "nodectl":
+			if err := node.Ctl(args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, "nodectl:", err)
+				os.Exit(1)
+			}
+			return
 		case "nodedown":
 			if err := node.Down(args[1:]); err != nil {
 				fmt.Fprintln(os.Stderr, "nodedown:", err)

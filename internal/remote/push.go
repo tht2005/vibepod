@@ -64,6 +64,10 @@ u=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 1); [ "$u" = 0 ] 
 	for _, r := range requires {
 		script += fmt.Sprintf("[ -e %s ] || printf 'missing=%%s\\n' %s\n", quote(r), quote(r))
 	}
+	// Every line above is a test whose failure is an answer, not an error, so the
+	// script's own status would be whatever the last test happened to be. It ends
+	// here explicitly: a non-zero exit means ssh itself failed.
+	script += "exit 0\n"
 	args := append(h.Opts(), h.Alias, "sh -c "+quote(script))
 	out, err := exec.Command("ssh", args...).Output()
 	if err != nil {
@@ -142,6 +146,21 @@ func (h *Host) WriteFile(remotePath string, content []byte) error {
 			strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// Feed runs one command on a machine with something on its standard input, and
+// returns what it printed. The control channel to a node pod: one request, one
+// reply, on the multiplexed connection.
+func (h *Host) Feed(command string, input []byte) (string, error) {
+	args := append(h.Opts(), h.Alias, command)
+	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = strings.NewReader(string(input))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("%s: %v: %s", h.Alias, err,
+			strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
 }
 
 // Capture runs one command on a machine and returns its output, for the short

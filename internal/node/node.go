@@ -69,6 +69,19 @@ type server struct {
 
 	mu    sync.Mutex
 	waits map[int]chan int
+	// held is what this pod has, in the order it was added. The daemon reconciles
+	// against it: it is the reconciler's only input from this side.
+	held []proto.Held
+	// seq names the next mountpoint. Indexed rather than named after the host,
+	// because several mounts from one machine is ordinary.
+	seq int
+	// leaseUntil is when this pod gives up on ever hearing from the daemon again
+	// and takes itself down. Zero means no lease was asked for.
+	leaseUntil time.Time
+	lease      time.Duration
+	// expired is set when the lease ran out, which is the one shutdown with nobody
+	// on the other end to clear this pod's state afterwards — so it clears its own.
+	expired bool
 
 	rpcMu   sync.Mutex
 	nextID  uint64
@@ -280,7 +293,16 @@ func serve(specPath string) error {
 	}
 	s.mu.Lock()
 	s.ln = ln
+	if spec.Lease != "" {
+		if d, err := time.ParseDuration(spec.Lease); err == nil && d > 0 {
+			s.lease = d
+			s.leaseUntil = time.Now().Add(d)
+		}
+	}
 	s.mu.Unlock()
+	if s.lease > 0 {
+		go s.leaseWatch()
+	}
 	fmt.Fprintf(ready, "ready %s\n", sock)
 	ready.Close()
 	ready = nil
@@ -290,6 +312,16 @@ func serve(specPath string) error {
 		p.Kill()
 		if s.fsm != nil {
 			s.fsm.Unmount()
+		}
+		// An expired lease means the daemon is gone, so nothing will run `nodedown`
+		// to clear this directory. Nothing is left on a machine vibepod has stopped
+		// talking to except the binary it was allowed to put there.
+		s.mu.Lock()
+		expired := s.expired
+		s.mu.Unlock()
+		if expired {
+			fs.UnmountUnder(spec.RunDir)
+			_ = os.RemoveAll(spec.RunDir)
 		}
 	}()
 	for {
@@ -346,40 +378,213 @@ func (s *server) mountRemote(mounts []proto.MountSpec) error {
 		return fmt.Errorf("on %s: %w", s.spec.Node, err)
 	}
 	s.fsm = fs.NewManager(backend)
-	// The same options every vibepod ssh uses, including this one: on a node there
-	// is nobody to answer a prompt, so a mount that could wait for one would hang
-	// with no symptom at all.
-	sshCmd := "ssh " + strings.Join(append(remote.BaseOpts(), s.spec.SSHExtra...), " ")
-	// The node's log is the only place a failure here can be read from, since
-	// whoever asked for the pod is on another machine. Say what was attempted.
-	fmt.Printf("mounting %d remote(s) with %q\n", len(mounts), sshCmd)
-	for i, m := range mounts {
-		point := filepath.Join(s.spec.RunDir, "mnt", fmt.Sprintf("%d", i))
-		mount := &fs.Mount{Host: m.Host, RemotePath: m.Path, MountPoint: point,
-			At: m.At, ReadOnly: m.ReadOnly, Cache: cacheOf(m, s.spec),
-			Prefetch: m.Prefetch}
-		if err := s.fsm.Add(mount, sshCmd); err != nil {
-			return fmt.Errorf("%s cannot reach %s:%s: %w", s.spec.Node, m.Host,
-				m.Path, err)
-		}
-		if _, err := s.call(&proto.Msg{Op: proto.OpBind,
-			Src: pod.StagedPath(point), Dst: m.At, ReadOnly: m.ReadOnly}); err != nil {
-			return fmt.Errorf("bind %s into the node pod: %w", m.At, err)
-		}
-		fmt.Printf("%s:%s is at %s\n", m.Host, m.Path, m.At)
-		// Opt-in, and only for the shape a lazy cache handles badly: a run that
-		// touches one percent of a tree should not pay for all of it.
-		switch did, err := s.fsm.Prefetch(mount, sshCmd); {
-		case err != nil:
-			fmt.Printf("prefetch %s: %v\n", m.At, err)
-		case did:
-			fmt.Printf("prefetched %s onto local disk\n", m.At)
-		case m.Prefetch:
-			fmt.Printf("prefetch %s: %s cannot, so the first pass reads over the "+
-				"network\n", m.At, s.fsm.Backend())
+	fmt.Printf("mounting %d remote(s) with %q\n", len(mounts), s.sshCmd())
+	for _, m := range mounts {
+		if err := s.addMount(m); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// sshCmd is what this node's own outbound ssh looks like. The same options every
+// vibepod ssh uses: on a node there is nobody to answer a prompt, so a mount that
+// could wait for one would hang with no symptom at all.
+func (s *server) sshCmd() string {
+	return "ssh " + strings.Join(append(remote.BaseOpts(), s.spec.SSHExtra...), " ")
+}
+
+// addMount brings up one mount and binds it into the pod. The same code at build
+// time and an hour later, which is what lets a pod here converge to a mount list
+// that changed on the machine that owns the agent.
+func (s *server) addMount(m proto.MountSpec) error {
+	if m.Host == s.spec.Node {
+		// This machine's own directory: a native bind, no FUSE and no cache. At
+		// build time these travel in the spec; arriving later they come here.
+		if _, err := s.call(&proto.Msg{Op: proto.OpBind, Src: m.Path, Dst: m.At,
+			ReadOnly: m.ReadOnly}); err != nil {
+			return fmt.Errorf("bind %s into the node pod: %w", m.At, err)
+		}
+		s.remember(proto.Held{At: m.At, Host: m.Host, Path: m.Path, Native: true,
+			ReadOnly: m.ReadOnly, Generation: m.Generation})
+		fmt.Printf("%s is this machine's own, bound at %s\n", m.Path, m.At)
+		return nil
+	}
+	if s.fsm == nil {
+		backend, err := fs.Pick()
+		if err != nil {
+			return fmt.Errorf("on %s: %w", s.spec.Node, err)
+		}
+		s.fsm = fs.NewManager(backend)
+	}
+	s.mu.Lock()
+	s.seq++
+	point := filepath.Join(s.spec.RunDir, "mnt", fmt.Sprintf("%d", s.seq))
+	s.mu.Unlock()
+
+	mount := &fs.Mount{Host: m.Host, RemotePath: m.Path, MountPoint: point,
+		At: m.At, ReadOnly: m.ReadOnly, Cache: cacheOf(m, s.spec),
+		Prefetch: m.Prefetch}
+	if err := s.fsm.Add(mount, s.sshCmd()); err != nil {
+		return fmt.Errorf("%s cannot reach %s:%s: %w", s.spec.Node, m.Host, m.Path,
+			err)
+	}
+	if _, err := s.call(&proto.Msg{Op: proto.OpBind,
+		Src: pod.StagedPath(point), Dst: m.At, ReadOnly: m.ReadOnly}); err != nil {
+		s.fsm.Remove(mount)
+		return fmt.Errorf("bind %s into the node pod: %w", m.At, err)
+	}
+	s.remember(proto.Held{At: m.At, Host: m.Host, Path: m.Path,
+		ReadOnly: m.ReadOnly, Generation: m.Generation})
+	fmt.Printf("%s:%s is at %s\n", m.Host, m.Path, m.At)
+	// Opt-in, and only for the shape a lazy cache handles badly: a run that
+	// touches one percent of a tree should not pay for all of it.
+	switch did, err := s.fsm.Prefetch(mount, s.sshCmd()); {
+	case err != nil:
+		fmt.Printf("prefetch %s: %v\n", m.At, err)
+	case did:
+		fmt.Printf("prefetched %s onto local disk\n", m.At)
+	case m.Prefetch:
+		fmt.Printf("prefetch %s: %s cannot, so the first pass reads over the "+
+			"network\n", m.At, s.fsm.Backend())
+	}
+	return nil
+}
+
+// removeMount takes one mount out of this pod.
+//
+// Flush first, and refuse if it cannot be flushed. Write-back caching means this
+// machine may be holding a checkpoint that exists nowhere else, and discarding one
+// silently would be the worst bug in this program.
+func (s *server) removeMount(at string) error {
+	s.mu.Lock()
+	var found *proto.Held
+	for i := range s.held {
+		if s.held[i].At == at {
+			found = &s.held[i]
+		}
+	}
+	s.mu.Unlock()
+	if found == nil {
+		return fmt.Errorf("%s is not mounted in the pod on %s", at, s.spec.Node)
+	}
+	var mount *fs.Mount
+	if s.fsm != nil {
+		for _, m := range s.fsm.Mounts() {
+			if m.At == at {
+				mount = m
+			}
+		}
+	}
+	if mount != nil && !mount.ReadOnly {
+		if err := s.fsm.Flush(mount, 30*time.Second); err != nil {
+			return fmt.Errorf("%s still has unwritten data for %s: %w", s.spec.Node,
+				at, err)
+		}
+	}
+	if _, err := s.call(&proto.Msg{Op: proto.OpUnbind, Dst: at}); err != nil {
+		return fmt.Errorf("unbind %s in the node pod: %w", at, err)
+	}
+	if mount != nil {
+		s.fsm.Remove(mount)
+	}
+	s.mu.Lock()
+	for i := range s.held {
+		if s.held[i].At == at {
+			s.held = append(s.held[:i], s.held[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+	fmt.Printf("released %s\n", at)
+	return nil
+}
+
+func (s *server) remember(h proto.Held) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.held = append(s.held, h)
+}
+
+func (s *server) heldList() []proto.Held {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]proto.Held(nil), s.held...)
+}
+
+// invalidate drops what this machine cached for a mount, because a command just
+// finished somewhere else and those bytes may no longer be current.
+//
+// One cache became N when every backend got a pod. Execution-aware invalidation
+// was built for one copy, where forgetting a whole host's mounts was harmless;
+// with several holders it has to reach each of them, and per mount rather than per
+// host so an unrelated mount's cache is not thrown away for nothing.
+func (s *server) invalidate(at string) {
+	if s.fsm == nil {
+		return
+	}
+	for _, m := range s.fsm.Mounts() {
+		if at != "" && m.At != at {
+			continue
+		}
+		s.fsm.InvalidateMount(m)
+	}
+}
+
+// renew pushes the lease out. Called whenever the daemon says anything at all: a
+// pod that is being used is a pod somebody still wants.
+func (s *server) renew() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lease > 0 {
+		s.leaseUntil = time.Now().Add(s.lease)
+	}
+}
+
+// leaseWatch takes this pod down when the daemon has been gone too long.
+//
+// Both obvious answers are wrong. Dying with the ssh channel kills an eight-hour
+// training run because somebody shut a laptop lid; living forever leaves caches and
+// a namespace on a machine other people share, with nobody who remembers why. A
+// lease does neither: the run survives a disconnect, and an abandoned pod cleans up
+// after itself. On expiry it flushes first — the bytes it is holding may exist
+// nowhere else.
+func (s *server) leaseWatch() {
+	for {
+		s.mu.Lock()
+		check := s.lease / 4
+		s.mu.Unlock()
+		if check > 15*time.Second {
+			check = 15 * time.Second
+		}
+		if check < 100*time.Millisecond {
+			check = 100 * time.Millisecond
+		}
+		time.Sleep(check)
+		s.mu.Lock()
+		until, lease := s.leaseUntil, s.lease
+		s.mu.Unlock()
+		if lease <= 0 || until.IsZero() || time.Now().Before(until) {
+			continue
+		}
+		fmt.Printf("the daemon has not been heard from in %s; flushing and "+
+			"shutting down\n", lease)
+		if s.fsm != nil {
+			for _, m := range s.fsm.Mounts() {
+				if m.ReadOnly {
+					continue
+				}
+				if err := s.fsm.Flush(m, 2*time.Minute); err != nil {
+					fmt.Printf("flush %s: %v\n", m.At, err)
+				}
+			}
+		}
+		s.mu.Lock()
+		s.expired = true
+		s.mu.Unlock()
+		s.stop()
+		return
+	}
 }
 
 // stop tears the pod down. The listener's Close makes serve's accept loop
@@ -426,7 +631,41 @@ func (s *server) handle(c *proto.Conn) {
 			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
 			s.stop()
 			return
+		case proto.OpHeld:
+			closeAll(fds)
+			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Held: s.heldList(),
+				Version: Version, Path: s.spec.Pod})
+		case proto.OpMount:
+			closeAll(fds)
+			if len(m.Mounts) != 1 {
+				_ = c.Send(&proto.Msg{Op: proto.OpErr, ID: m.ID,
+					Err: "mount takes one mount"})
+				break
+			}
+			if err := s.addMount(m.Mounts[0]); err != nil {
+				_ = c.Send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
+				break
+			}
+			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Held: s.heldList()})
+		case proto.OpUnmount:
+			closeAll(fds)
+			if err := s.removeMount(m.Path); err != nil {
+				_ = c.Send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
+				break
+			}
+			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Held: s.heldList()})
+		case proto.OpInvalidate:
+			closeAll(fds)
+			s.invalidate(m.Path)
+			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
+		case proto.OpLease:
+			// The daemon is still there. Renewing is the only thing that keeps this
+			// pod alive: see leaseWatch for what happens when it stops.
+			closeAll(fds)
+			s.renew()
+			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID})
 		case proto.OpPs:
+			closeAll(fds)
 			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Version: Version,
 				Path: s.spec.Pod})
 		default:
@@ -733,4 +972,54 @@ func alive(runDir string) bool {
 		return false
 	}
 	return syscall.Kill(pid, 0) == nil
+}
+
+// Ctl is `vibepod nodectl`: one control message in, one reply out, both as JSON.
+//
+// It exists because a node pod is reached by ssh and nothing else. The daemon needs
+// to ask it things — what do you hold, take this mount, release that one, forget
+// what you cached, I am still here — and the alternative to a generic pipe is a
+// flag per question and a parser to match.
+func Ctl(args []string) error {
+	podName := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--pod" && i+1 < len(args) {
+			i++
+			podName = args[i]
+		}
+	}
+	if podName == "" {
+		return fmt.Errorf("nodectl needs --pod")
+	}
+	var m proto.Msg
+	if err := json.NewDecoder(os.Stdin).Decode(&m); err != nil {
+		return fmt.Errorf("read the request: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	c, err := proto.Dial(SockPath(home, podName))
+	if err != nil {
+		return fmt.Errorf("no node pod %q on this machine: %w", podName, err)
+	}
+	defer c.Close()
+	if err := c.Send(&m); err != nil {
+		return err
+	}
+	reply, fds, err := c.Recv()
+	closeAll(fds)
+	if err != nil {
+		return err
+	}
+	out, err := json.Marshal(reply)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", out)
+	if reply.Op == proto.OpErr {
+		// The message is in the JSON; the status is for the ssh that carried it.
+		os.Exit(1)
+	}
+	return nil
 }

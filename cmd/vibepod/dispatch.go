@@ -322,19 +322,28 @@ func cmdNode(args []string) error {
 			return nil
 		}
 		for _, n := range reply.NodeInfos {
-			fmt.Printf("@%s\n", n.Host)
-			native := map[string]bool{}
-			for _, at := range n.Native {
-				native[at] = true
+			state := fmt.Sprintf("generation %d", n.Generation)
+			if !n.Reachable {
+				state += " · not answering"
 			}
-			for _, at := range n.Mounts {
-				how := "cached from its owner"
-				if native[at] {
+			if len(n.Behind) > 0 {
+				// Per mount, not per machine: commands under the mounts it does
+				// have are still correct, and only the paths it is missing are
+				// refused.
+				state += " · behind on " + strings.Join(n.Behind, ", ")
+			}
+			fmt.Printf("@%s  %s\n", n.Host, state)
+			for _, h := range n.Mounts {
+				how := "cached from " + h.Host
+				if h.Native {
 					// Its own disk: no FUSE, no cache, no round trip. Running work
 					// where the data lives is full speed with nothing to configure.
 					how = "its own"
 				}
-				fmt.Printf("  %-40s %s\n", short(at), how)
+				if h.ReadOnly {
+					how += " · read-only"
+				}
+				fmt.Printf("  %-40s %s\n", short(h.At), how)
 			}
 		}
 		return nil

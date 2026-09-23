@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Mount is one remote directory, mounted on the host.
@@ -51,6 +52,27 @@ type Backend interface {
 }
 
 var ErrNoInvalidate = fmt.Errorf("backend cannot be told to forget cached state")
+
+// Flusher is a backend with a write-back cache that can be asked whether it has
+// finished writing. Only rclone has one.
+type Flusher interface {
+	Flush(m *Mount, timeout time.Duration) error
+}
+
+// Flush waits for a mount's unwritten data to reach the machine that owns it.
+//
+// This is what makes unmounting safe rather than fast. A write-back cache means
+// the node holds bytes that exist nowhere else — a checkpoint written a second ago
+// — and unmounting without flushing would discard them silently, which would be
+// the worst bug in this program. A backend with no cache has nothing to wait for
+// and says so by not implementing this.
+func (mg *Manager) Flush(m *Mount, timeout time.Duration) error {
+	f, ok := mg.backend.(Flusher)
+	if !ok {
+		return nil
+	}
+	return f.Flush(m, timeout)
+}
 
 // Prefetcher is a backend that can fill its cache up front. Only rclone can, and
 // only the one shape needs it: many small files, where a lazy cache is
@@ -115,19 +137,39 @@ func (mg *Manager) Add(m *Mount, sshCommand string) error {
 }
 
 // InvalidateAfter is the execution-aware part: a command has just finished on
-// host, so anything mounted from it may have changed and nothing else could
-// have changed it.
+// host, so anything mounted from it may have changed and nothing else could have
+// changed it.
+//
+// Per host was right when there was one cache. With a pod on every backend there
+// are several, and the grain matters twice: the daemon has to reach the other
+// holders too (see the reconciler), and throwing away an unrelated mount's cache
+// because a command touched a different one on the same machine is waste.
 func (mg *Manager) InvalidateAfter(host string) {
-	mg.mu.Lock()
-	defer mg.mu.Unlock()
-	for _, m := range mg.mounts {
-		if m.Host != host {
-			continue
-		}
-		if err := mg.backend.Invalidate(m, "/"); err != nil && err != ErrNoInvalidate {
-			continue
+	for _, m := range mg.Mounts() {
+		if m.Host == host {
+			mg.InvalidateMount(m)
 		}
 	}
+}
+
+// InvalidateMount forgets one mount's cached state.
+func (mg *Manager) InvalidateMount(m *Mount) {
+	if err := mg.backend.Invalidate(m, "/"); err != nil && err != ErrNoInvalidate {
+		// Nothing to do about it here: the cache is merely stale, which the
+		// backend's own timeouts will eventually correct. The caller has no better
+		// recovery than that either.
+		_ = err
+	}
+}
+
+// MountsAt returns the mount occupying a path in the pod, if any.
+func (mg *Manager) MountAt(at string) *Mount {
+	for _, m := range mg.Mounts() {
+		if m.At == at {
+			return m
+		}
+	}
+	return nil
 }
 
 // Remove releases one mount, for `vp unmount`. The pod's bind is detached by

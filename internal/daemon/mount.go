@@ -42,7 +42,13 @@ type mountRec struct {
 	Requires []string
 	Cache    string
 	Prefetch bool
-	Runtime  bool // added with `vp mount`, after the pod was up
+	// Gen is the generation this mount entered the list at, so a node holding an
+	// older definition of the same path is a fact rather than a guess.
+	Gen int64
+	// ManyWriters means the config accepted several machines writing into this
+	// mount, and with it that the last flush of any one file wins.
+	ManyWriters bool
+	Runtime     bool // added with `vp mount`, after the pod was up
 	// Identity marks the agent's own configuration and credentials. They are
 	// the one plane that never leaves this machine.
 	Identity bool
@@ -114,7 +120,16 @@ func (s *podState) addMount(rm proto.MountSpec, pr *Progress, runtime bool) (*mo
 	rec := &mountRec{At: at, Src: point, Owner: rm.Host, RemotePath: rm.Path,
 		ExecOn: rm.ExecOn, Kind: s.fs.Backend(), ReadOnly: rm.ReadOnly,
 		Requires: rm.Requires, Cache: rm.Cache, Prefetch: rm.Prefetch,
+		ManyWriters: rm.ManyWriters, Gen: s.bumpGeneration(),
 		Runtime: runtime, fsMount: m}
+	if rm.ManyWriters {
+		s.mu.Lock()
+		if s.manyWriters == nil {
+			s.manyWriters = map[string]bool{}
+		}
+		s.manyWriters[at] = true
+		s.mu.Unlock()
+	}
 	s.mu.Lock()
 	s.mounts = append(s.mounts, rec)
 	s.mu.Unlock()
@@ -279,6 +294,11 @@ func (s *podState) removeMount(what string) error {
 		s.d.logf("pod %s: unmounted %s (%s)", s.name, m.At, m.source())
 	}
 	s.rebuildRoutes()
+	// The mounts are gone from here, so they have to go from every node pod too: a
+	// node still holding one would be the only holder of a directory this pod no
+	// longer has, which is divergence rather than staleness.
+	s.bumpGeneration()
+	s.reconcileAll("an unmount")
 	// Sessions sitting on a machine that is no longer mounted go back to the
 	// pod, which is the only answer that cannot be wrong.
 	for _, m := range hit {
