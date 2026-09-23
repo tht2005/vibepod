@@ -103,8 +103,14 @@ func cmdTree(args []string) error {
 	fs := flag.NewFlagSet("tree", flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	all := fs.Bool("all", false, "include completed commands instead of a count")
+	follow := fs.Bool("f", false, "stream changes as NDJSON instead of a snapshot")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *follow {
+		// The tree and the log are two renderings of one event stream, so
+		// following either is the same act: subscribe to it.
+		return streamEvents(fs.Arg(0))
 	}
 	c, err := connect()
 	if err != nil {
@@ -126,6 +132,32 @@ func cmdTree(args []string) error {
 	}
 	renderTree(t, *all)
 	return nil
+}
+
+// streamEvents is the daemon's own event stream, one object per line. The
+// moment an agent parses this it is an API, which is what the "v" field is
+// for: it will outlive several rounds of the tree's visual layout.
+func streamEvents(pod string) error {
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	if err := c.Send(&proto.Msg{Op: proto.OpLog, Pod: podArg(pod), Follow: true}); err != nil {
+		return err
+	}
+	for {
+		m, _, err := c.Recv()
+		if err != nil {
+			return nil
+		}
+		switch m.Op {
+		case proto.OpErr:
+			return fmt.Errorf("%s", m.Err)
+		case proto.OpEvent:
+			fmt.Printf("%s\n", m.Event)
+		}
+	}
 }
 
 func renderTree(t *proto.Tree, all bool) {

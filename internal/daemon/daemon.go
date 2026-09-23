@@ -40,6 +40,10 @@ type Daemon struct {
 	creating map[string]chan struct{}
 }
 
+// Version is stamped into the binary; the daemon reports it so a client can
+// tell whether the daemon it is talking to is the one it was built with.
+var Version = "dev"
+
 // RunDir is where the daemon keeps its sockets and per-pod state.
 func RunDir() string {
 	if x := os.Getenv("VIBEPOD_RUNDIR"); x != "" {
@@ -134,7 +138,8 @@ func (k *ctlConn) serve() {
 		case proto.OpUp:
 			d.reply(k.c, m, d.up(m))
 		case proto.OpPs:
-			_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Pods: d.ps()})
+			_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Pods: d.ps(),
+				Version: Version})
 		case proto.OpDown:
 			d.reply(k.c, m, d.down(m.Pod))
 		case proto.OpLog:

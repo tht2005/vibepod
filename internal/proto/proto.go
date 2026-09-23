@@ -141,6 +141,11 @@ type Msg struct {
 	Tree   *Tree           `json:"tree,omitempty"`
 	Event  json.RawMessage `json:"event,omitempty"`
 
+	// Version identifies the build at each end. A daemon outlives the binary
+	// that started it, so an upgraded client can find itself talking to the
+	// old one.
+	Version string `json:"version,omitempty"`
+
 	Pods []PodInfo `json:"pods,omitempty"`
 }
 

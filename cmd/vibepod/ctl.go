@@ -11,6 +11,7 @@ import (
 	"os/exec"
 
 	"vibepod/internal/config"
+	"vibepod/internal/daemon"
 	"vibepod/internal/fs"
 	"vibepod/internal/proto"
 	"vibepod/internal/term"
@@ -258,6 +259,22 @@ func cmdUse(args []string) error {
 	return nil
 }
 
+func daemonVersion() (string, error) {
+	c, err := connect()
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+	reply, err := call(c, &proto.Msg{Op: proto.OpPs})
+	if err != nil {
+		return "", err
+	}
+	if reply.Version == "" {
+		return "(before versions were reported)", nil
+	}
+	return reply.Version, nil
+}
+
 func cmdPs() error {
 	c, err := connect()
 	if err != nil {
@@ -330,6 +347,21 @@ func cmdDoctor() error {
 			bad++
 		}
 		c.print()
+	}
+
+	// A daemon outlives the binary that spawned it, so after an upgrade the
+	// running one is still the old one. Not a reason a pod cannot start, but
+	// worth saying plainly: the symptom is behaviour that does not match the
+	// binary on disk.
+	if v, err := daemonVersion(); err == nil {
+		fmt.Println("\ndaemon")
+		if v == daemon.Version {
+			(check{"build " + v, nil}).print()
+		} else {
+			(check{"build", fmt.Errorf("daemon is %s, this binary is %s; "+
+				"`vpctl down` your pods and it restarts on next use",
+				v, daemon.Version)}).print()
+		}
 	}
 
 	fmt.Println("\nremote filesystems")
