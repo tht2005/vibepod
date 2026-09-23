@@ -52,6 +52,11 @@ func onPTYIn(t *testing.T, dir string, args ...string) *ptyRun {
 	if err != nil {
 		t.Fatalf("open pty: %v", err)
 	}
+	// A terminal with no size is not a terminal anything can draw on, and a
+	// fresh pty has none until somebody says otherwise.
+	if err := sys.SetWinsize(master.Fd(), 24, 100); err != nil {
+		t.Fatalf("set winsize: %v", err)
+	}
 	cmd := exec.Command(binDir+"/vp", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+runDir, "SHELL=/bin/sh",

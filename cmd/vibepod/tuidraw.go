@@ -44,11 +44,9 @@ func (co *cockpit) draw() {
 	title := fmt.Sprintf("vibepod · %s", co.pod)
 	b.WriteString(bold + pad(title, cols) + reset + "\r\n")
 
-	lines := make([]string, 0, rows)
-	lines = append(lines, co.leftRight(co.machineLines(left), co.activityLines(right),
-		left, right)...)
-
 	body := rows - 3 // title, status, keys
+	lines := co.leftRight(co.machineLines(left, body), co.activityLines(right),
+		left, right)
 	for i := 0; i < body; i++ {
 		if i < len(lines) {
 			b.WriteString("\x1b[K" + lines[i] + "\r\n")
@@ -70,45 +68,42 @@ func (co *cockpit) draw() {
 }
 
 func (co *cockpit) keyline() string {
-	backend := "—"
+	// The backend of the focused session, or — with no sessions — the one a new
+	// session would open on. Either way it is the thing you most need to know
+	// before pressing a key.
+	backend := co.deflt
 	if co.selSess < len(co.sessions) {
 		backend = co.sessions[co.selSess].Backend
+	}
+	if backend == "" {
+		backend = "—"
 	}
 	return fmt.Sprintf(" backend %s │ m mount  u unmount  b backend  ⏎ attach  "+
 		"⇥ pane  / filter  q quit", backend)
 }
 
-// machineLines is the left column: the machines, then the sessions. Both are
-// lists of things you can act on, so they share a column and the focus moves
-// between them.
-func (co *cockpit) machineLines(w int) []string {
-	out := []string{bold + "MACHINES" + reset}
-	for i, h := range co.hosts {
-		dot := "●"
-		switch {
-		case h.Local:
-			dot = "●"
-		case !h.Mounted:
-			dot = "○"
-		case !h.Connected:
-			dot = "◌"
+// machineLines is the left column: machines, sessions, mounts. All three are
+// lists of things you act on, so they share a column and the focus moves between
+// them.
+//
+// The budget matters more than it sounds. A well-used ssh config has thirty
+// hosts, and listing every machine this pod *could* mount would push the
+// sessions — the thing you came to look at — off the bottom of the screen. So
+// mounted machines are always shown, and the unmounted ones take whatever room
+// is left over after the sessions and the mounts have had theirs.
+func (co *cockpit) machineLines(w, avail int) []string {
+	var mounted, unmounted []proto.HostInfo
+	for _, h := range co.hosts {
+		if h.Mounted {
+			mounted = append(mounted, h)
+		} else {
+			unmounted = append(unmounted, h)
 		}
-		where := "local"
-		switch {
-		case !h.Mounted:
-			where = "not mounted"
-		case len(h.Dirs) > 0:
-			where = short(h.Dirs[0])
-		}
-		row := fmt.Sprintf("%s %-9s %s", dot, h.Name, where)
-		if h.Default {
-			row = fmt.Sprintf("%s %-9s %s", dot, h.Name+"*", where)
-		}
-		out = append(out, co.mark(row, w, co.focus == 0 && i == co.selHost))
 	}
-	out = append(out, "", bold+"SESSIONS"+reset)
+
+	sessions := []string{"", bold + "SESSIONS" + reset}
 	if len(co.sessions) == 0 {
-		out = append(out, dim+"  none — `vp shell` opens one"+reset)
+		sessions = append(sessions, dim+"  none — `vp shell` opens one"+reset)
 	}
 	for i, s := range co.sessions {
 		kind := s.Kind
@@ -116,14 +111,74 @@ func (co *cockpit) machineLines(w int) []string {
 			kind = "session"
 		}
 		row := fmt.Sprintf("%-3s %-10s ▸ %s", s.ID, kind, s.Backend)
-		out = append(out, co.mark(row, w, co.focus == 1 && i == co.selSess))
+		sessions = append(sessions, co.mark(row, w, co.focus == 1 && i == co.selSess))
 	}
-	out = append(out, "", bold+"MOUNTS"+reset)
+	mounts := []string{"", bold + "MOUNTS" + reset}
 	for _, m := range co.mounts {
-		out = append(out, trim(fmt.Sprintf("  %-16s %s", short(m.At),
+		mounts = append(mounts, trim(fmt.Sprintf("  %-16s %s", short(m.At),
 			shortSource(m)), w))
 	}
+
+	out := []string{bold + "MACHINES" + reset}
+	room := avail - 1 - len(sessions) - len(mounts) - len(mounted)
+	shown := len(unmounted)
+	if room < shown {
+		shown = room
+		if shown < 0 {
+			shown = 0
+		}
+	}
+	for i, h := range co.hosts {
+		if !h.Mounted {
+			continue
+		}
+		out = append(out, co.mark(co.hostRow(h, w), w, co.focus == 0 && i == co.selHost))
+	}
+	for i, h := range co.hosts {
+		if h.Mounted {
+			continue
+		}
+		if shown == 0 {
+			break
+		}
+		shown--
+		out = append(out, co.mark(co.hostRow(h, w), w, co.focus == 0 && i == co.selHost))
+	}
+	if left := len(unmounted) - (room - shown); room < len(unmounted) && left > 0 {
+		out = append(out, dim+fmt.Sprintf("  …%d more this pod could mount", left)+reset)
+	}
+	out = append(out, sessions...)
+	// A section header with nothing under it is worse than no section, and on a
+	// short terminal the mounts are the part you can go and read elsewhere.
+	if avail-len(out) >= len(mounts) || avail-len(out) > 2 {
+		out = append(out, mounts...)
+	}
 	return out
+}
+
+func (co *cockpit) hostRow(h proto.HostInfo, w int) string {
+	dot := "●"
+	switch {
+	case h.Local:
+	case !h.Mounted:
+		dot = "○"
+	case !h.Connected:
+		dot = "◌"
+	}
+	where := "local"
+	switch {
+	case !h.Mounted:
+		where = dim + "vp mount " + h.Name + ":/path" + reset
+	case len(h.Dirs) > 0:
+		where = short(h.Dirs[0])
+	}
+	name := h.Name
+	if h.Default {
+		// The machine a new session opens on, which is the one fact about the
+		// list that is not visible from the list.
+		name += "*"
+	}
+	return fmt.Sprintf("%s %-11s %s", dot, trim(name, 11), where)
 }
 
 // mark highlights the focused row. The marker is a reverse-video line rather

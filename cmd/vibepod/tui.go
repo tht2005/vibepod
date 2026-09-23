@@ -42,13 +42,16 @@ type cockpit struct {
 	sessions []proto.SessionInfo
 	mounts   []proto.TreeMount
 	activity []string
-	filter   string
-	status   string
-	focus    int // 0: machines, 1: sessions
-	selHost  int
-	selSess  int
-	rows     int
-	cols     int
+	// deflt is the backend a new session opens on, which is what the status line
+	// says when no session is focused.
+	deflt   string
+	filter  string
+	status  string
+	focus   int // 0: machines, 1: sessions
+	selHost int
+	selSess int
+	rows    int
+	cols    int
 	// prompt is non-nil while the bottom line is asking for something.
 	prompt *prompt
 	// handoff is the session's connection while it owns the terminal. The one
@@ -388,6 +391,11 @@ func (co *cockpit) setBackend(target string) {
 }
 
 // attachSelected hands the terminal to the focused session.
+//
+// It does not wait for the session to finish, and that is not an optimisation:
+// the loop that called this is the same loop that has to forward keystrokes to
+// the session, so waiting here would hand over a terminal nobody is reading. The
+// console this replaced learned that the hard way.
 func (co *cockpit) attachSelected() {
 	co.mu.Lock()
 	var id string
@@ -404,42 +412,51 @@ func (co *cockpit) attachSelected() {
 		co.say("vibepod: " + err.Error())
 		return
 	}
-	// Leave the alt-screen first: from here the session owns the real screen,
-	// and it expects to find it the way any program expects to find a terminal.
+	// Claim the keyboard before anything is written, so that a keystroke arriving
+	// while the session is opening reaches the session rather than being read as
+	// a cockpit key.
+	co.mu.Lock()
+	co.handoff = c
+	co.mu.Unlock()
+
+	// Leave the alt-screen: from here the session owns the real screen, and it
+	// expects to find it the way any program expects to find a terminal.
 	os.Stdout.WriteString(altOff)
 	state, err := attachSend(c, &proto.Msg{Op: proto.OpAttach, Pod: co.pod,
 		Session: id})
 	if err != nil {
+		co.mu.Lock()
+		co.handoff = nil
+		co.mu.Unlock()
 		c.Close()
 		os.Stdout.WriteString(altOn)
 		co.say("attach: " + err.Error())
 		return
 	}
-	co.mu.Lock()
-	co.handoff = c
-	co.mu.Unlock()
-
-	code, detached, werr := attachWait(c)
-	co.mu.Lock()
-	co.handoff = nil
-	co.mu.Unlock()
-	state.Restore()
-	c.Close()
-	// Back to raw, back to the alt-screen, and redraw: the cockpit was never
-	// running while the session had the screen, so there is nothing to catch up.
-	if st, err := term.MakeRaw(os.Stdin.Fd()); err == nil {
-		co.state = st
-	}
-	os.Stdout.WriteString(altOn)
-	switch {
-	case werr != nil:
-		co.say("attach: " + werr.Error())
-	case detached:
-		co.say("session " + id + " left running")
-	default:
-		co.say(fmt.Sprintf("session %s ended (%d)", id, code))
-	}
-	co.refresh()
+	go func() {
+		code, detached, werr := attachWait(c)
+		co.mu.Lock()
+		co.handoff = nil
+		co.mu.Unlock()
+		state.Restore()
+		c.Close()
+		// Back to raw, back to the alt-screen, and redraw: the cockpit was not
+		// running while the session had the screen, so there is nothing to catch
+		// up on — only a frame to paint.
+		if st, err := term.MakeRaw(os.Stdin.Fd()); err == nil {
+			co.state = st
+		}
+		os.Stdout.WriteString(altOn)
+		switch {
+		case werr != nil:
+			co.say("attach: " + werr.Error())
+		case detached:
+			co.say("session " + id + " left running")
+		default:
+			co.say(fmt.Sprintf("session %s ended (%d)", id, code))
+		}
+		co.refresh()
+	}()
 }
 
 func (co *cockpit) say(s string) {
@@ -465,6 +482,7 @@ func (co *cockpit) refresh() {
 	}
 	if tree != nil && tree.Tree != nil {
 		co.mounts = tree.Tree.Mounts
+		co.deflt = tree.Tree.Default
 		co.sessions = co.sessions[:0]
 		for _, s := range tree.Tree.Sessions {
 			co.sessions = append(co.sessions, proto.SessionInfo{ID: s.ID,

@@ -114,16 +114,13 @@ func (s *podState) startSession(m *proto.Msg, kind string) (*session, error) {
 	s.sessions[id] = sess
 	s.mu.Unlock()
 
-	sh, err := s.openShell(sess, backend, m.Argv)
+	sh, err := s.openShell(sess, backend, m.Argv, true)
 	if err != nil {
 		s.mu.Lock()
 		delete(s.sessions, id)
 		s.mu.Unlock()
 		return nil, err
 	}
-	sess.mu.Lock()
-	sess.primary, sess.cur = sh, sh
-	sess.mu.Unlock()
 
 	s.d.bus.Publish(event.Event{Kind: event.KindSession, Pod: s.name,
 		Session: id, PID: sh.pid, Argv: m.Argv, Target: backend,
@@ -136,7 +133,8 @@ func (s *podState) startSession(m *proto.Msg, kind string) (*session, error) {
 // argv is honoured only in the pod: a session started to run `claude` runs
 // claude, and the same session moved to gpu03 gets gpu03's login shell, because
 // the agent is the thing that must not be installed there.
-func (s *podState) openShell(sess *session, backend string, argv []string) (*shellHandle, error) {
+func (s *podState) openShell(sess *session, backend string, argv []string,
+	primary bool) (*shellHandle, error) {
 	sh := &shellHandle{backend: backend, ring: term.NewRing(scrollback),
 		wait: make(chan int, 1)}
 	sess.mu.Lock()
@@ -192,8 +190,14 @@ func (s *podState) openShell(sess *session, backend string, argv []string) (*she
 		}()
 	}
 
+	// Before the pump can run: it decides what a shell's exit means by whether
+	// that shell is the session's first, and a shell that fails immediately would
+	// otherwise be judged before anyone had said.
 	sess.mu.Lock()
 	sess.shells[backend] = sh
+	if primary {
+		sess.primary, sess.cur = sh, sh
+	}
 	sess.mu.Unlock()
 	go sess.pump(s, sh)
 	return sh, nil
@@ -212,7 +216,7 @@ func (sess *session) switchTo(s *podState, backend string) error {
 
 	if sh == nil {
 		var err error
-		if sh, err = s.openShell(sess, backend, sess.argv); err != nil {
+		if sh, err = s.openShell(sess, backend, sess.argv, false); err != nil {
 			return err
 		}
 	}
@@ -366,12 +370,18 @@ func (sess *session) attach(out *os.File, detachCh <-chan struct{}) (code int, d
 	case <-detachCh:
 		return 0, true
 	case <-a.stop:
+		// This terminal went away without saying so: the ssh dropped, the window
+		// closed, the laptop lid shut. That is a detach, not an end. An agent
+		// halfway through something must not be killed by the disappearance of
+		// the thing that was watching it — which is the whole reason the daemon
+		// owns the pty rather than the client.
 		select {
 		case code = <-sess.done:
 			sess.done <- code
+			return code, false
 		default:
+			return 0, true
 		}
-		return code, false
 	}
 }
 
