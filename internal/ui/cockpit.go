@@ -327,7 +327,7 @@ func (co *cockpit) do(what string, f func() error) tea.Cmd {
 func (co *cockpit) setBackend(target string) tea.Cmd {
 	s, ok := co.selected()
 	if !ok {
-		co.status = "no session selected; ⇥ to the session list first"
+		co.status = "no session selected; tab to the session list first"
 		return nil
 	}
 	target = strings.TrimPrefix(target, "@")
@@ -644,7 +644,7 @@ func (co *cockpit) statusLine(w int) string {
 		machine = "—"
 	}
 	left := " " + paint(machine).Bold(true).Render(machine) + "  " + who
-	keys := stDim.Render("m mount · u unmount · b backend · ⏎ attach · ⇥ pane · / filter · q quit ")
+	keys := stDim.Render("m mount · u unmount · b backend · ⏎ attach · tab switch list · / filter · q quit ")
 	if lipgloss.Width(left)+lipgloss.Width(keys)+2 > w {
 		keys = stDim.Render("⏎ attach · q quit ")
 	}
