@@ -1,0 +1,34 @@
+# A pod with nothing remote in it.
+#
+# Everything runs here, so this tests only the machinery below the routing:
+# the namespace, the exec gate, and the shims. It needs no network, so it is
+# the first thing to try, and the first thing to blame if something is wrong.
+#
+#   cd examples/local
+#   vpctl run -- /bin/sh -c 'pwd; ls'
+#   vpctl tree
+#   vpctl log
+#
+# Then, for the real thing — an agent working in a pod, on this repo:
+#
+#   vpctl new              # opens the console; type `claude` at the prompt
+#
+# Inside the pod the agent can read ~/.claude (its own config and credentials)
+# and ~/Git/vibepod, and nothing else of yours: not ~/.ssh, not ~/Documents,
+# not another project. Check that from the console:
+#
+#   ls ~/.ssh              # No such file or directory
+pod: vibepod-local
+
+mounts:
+  # A local directory keeps its own path inside the pod, so nothing you type
+  # or read has to be translated.
+  - local: ~/Git/vibepod
+
+host_access:
+  # The identity plane: bound from this machine, never transmitted anywhere.
+  - ~/.claude
+  - ~/.claude.json
+
+exec:
+  default: pod

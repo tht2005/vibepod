@@ -3,10 +3,12 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/remote"
 	"vibepod/internal/route"
@@ -138,8 +140,18 @@ func (pc *podConn) routeExec(m *proto.Msg, files []*os.File) {
 	if dec.Target == route.Pod {
 		stash, ok := s.stashOf(m.Path)
 		if !ok {
-			// The shim is only reachable because it was bound over this path,
-			// so the stash must exist. If it does not, something unmounted it.
+			// A remote-only tool has no original here to fall back to. Say so
+			// in those terms: the command is fine, the directory is the
+			// problem, and moving is the fix.
+			if strings.HasPrefix(m.Path, pod.BinDir+"/") {
+				pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: fmt.Sprintf(
+					"%s exists only on a remote, and %s runs here; "+
+						"run it from a directory that belongs to that machine",
+					filepath.Base(m.Path), m.Cwd)})
+				return
+			}
+			// Otherwise the shim is only reachable because it was bound over
+			// this path, so the stash must exist unless something unmounted it.
 			pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID,
 				Err: "no stashed original for " + m.Path})
 			return

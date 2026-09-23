@@ -97,9 +97,17 @@ host_access:                   # bound from the host, never transmitted
   - ~/.claude
   - ~/.claude.json
 
+remote_tools:                  # tools this machine has never heard of
+  - rocm-smi                   # a shim is placed ahead of PATH for these,
+  - nvidia-smi                 # since there is nothing here to shadow
+
 exec:
   default: pod                 # for a directory matching no mount
 ```
+
+Two ready-to-run configs are in `examples/`: `local/` needs no network and
+tests everything below the routing, `gpu/` mounts a directory from a real
+remote and runs commands on it.
 
 A remote directory mounts at **its own absolute path**. That is not cosmetic:
 arguments forward verbatim, and remote tool output stays openable — a compiler
@@ -170,6 +178,16 @@ not what it returned, so the field is absent rather than zero.
 **Guardrails.** There are none, by choice. vibepod routes and records; it does
 not judge. Your agent already gates commands, and pattern-matching shell
 strings for `rm -rf` is leaky in both directions. The log is the answer.
+
+## Where a tool has to exist
+
+A shim is bind-mounted *over* a binary, so the binary has to be in the pod for
+one to be placed. That is fine for `git`, `make` or `python3`, which you have
+here too — they are shimmed, and routed. It is not fine for `rocm-smi` on a GPU
+box, which your laptop has never heard of; name those in `remote_tools:` and a
+shim goes into `/vp/bin`, which leads `PATH`. Run one from a local directory
+and it refuses in those terms, rather than saying "not found" and sending you
+looking in the wrong place.
 
 ## Not in v1
 

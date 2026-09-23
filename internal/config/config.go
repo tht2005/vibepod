@@ -23,6 +23,11 @@ type Config struct {
 	HostAccess []string        `yaml:"host_access"`
 	Ports      []string        `yaml:"ports"`
 	Exec       Exec            `yaml:"exec"`
+	// RemoteTools name commands that exist only on a remote. Without an entry
+	// here there is nothing in the pod to shim, so `rocm-smi` in a routed
+	// directory fails as "not found" rather than being sent to the machine
+	// that has it.
+	RemoteTools []string `yaml:"remote_tools"`
 }
 
 type Host struct {
@@ -47,6 +52,7 @@ type Exec struct {
 // Resolved is a config checked against the filesystem and flattened.
 type Resolved struct {
 	Name        string
+	RemoteTools []string
 	Binds       []proto.Bind
 	Remotes     []RemoteMount
 	Routes      []proto.Route
@@ -102,7 +108,7 @@ func Find(dir string) (string, bool) {
 // Resolve expands paths and applies the placement guard. Every refusal happens
 // here, at up time, while a human is watching — never mid-run.
 func (c *Config) Resolve() (*Resolved, error) {
-	r := &Resolved{Name: c.Pod, ExecDefault: c.Exec.Default}
+	r := &Resolved{Name: c.Pod, ExecDefault: c.Exec.Default, RemoteTools: c.RemoteTools}
 	if r.Name == "" {
 		r.Name = "default"
 	}

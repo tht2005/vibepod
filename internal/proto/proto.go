@@ -67,14 +67,18 @@ type Bind struct {
 // Spec is everything vpinit needs to build a pod. It crosses the socketpair
 // once, before the pod exists.
 type Spec struct {
-	Name     string   `json:"name"`
-	Root     string   `json:"root"`     // host dir that becomes the pod root
-	RunDir   string   `json:"run_dir"`  // host dir bound in at /vp/run
-	ShimBin  string   `json:"shim_bin"` // host path of vpsh
-	CtlBin   string   `json:"ctl_bin"`  // host path of the vibepod binary
-	Binds    []Bind   `json:"binds"`
-	Env      []string `json:"env,omitempty"`
-	Hostname string   `json:"hostname,omitempty"`
+	Name    string `json:"name"`
+	Root    string `json:"root"`     // host dir that becomes the pod root
+	RunDir  string `json:"run_dir"`  // host dir bound in at /vp/run
+	ShimBin string `json:"shim_bin"` // host path of vpsh
+	CtlBin  string `json:"ctl_bin"`  // host path of the vibepod binary
+	// RemoteTools are commands that exist only on a remote. A shim can only
+	// be bind-mounted over a binary that exists here, so a tool this machine
+	// has never heard of needs one placed for it, ahead of PATH.
+	RemoteTools []string `json:"remote_tools,omitempty"`
+	Binds       []Bind   `json:"binds"`
+	Env         []string `json:"env,omitempty"`
+	Hostname    string   `json:"hostname,omitempty"`
 }
 
 // Route is one cwd-to-machine rule, as resolved by vpctl from the config.

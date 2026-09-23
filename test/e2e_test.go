@@ -88,7 +88,8 @@ func setup(m *testing.M) (int, error) {
 		}
 		if err := os.WriteFile(filepath.Join(remoteDir, "vibepod.yaml"), []byte(
 			"pod: e2e-remote\nmounts:\n  - remote: vptest:"+remoteSrv+
-				"\n  - local: "+workDir+"\nexec:\n  default: pod\n"), 0o644); err != nil {
+				"\n  - local: "+workDir+
+				"\nremote_tools:\n  - vp-only-tool\nexec:\n  default: pod\n"), 0o644); err != nil {
 			return 0, err
 		}
 	}
@@ -399,5 +400,27 @@ func TestSessionWhoseFirstProgramNeedsAShim(t *testing.T) {
 	case <-done:
 	case <-time.After(20 * time.Second):
 		t.Fatal("starting a session whose first program needs a shim deadlocked")
+	}
+}
+
+// A shim is normally bind-mounted over a binary that already exists in the
+// pod, so a tool that lives only on a remote has nothing to shadow. Naming it
+// in remote_tools puts a shim ahead of PATH instead.
+func TestRemoteOnlyToolIsRoutedAndExplainsItself(t *testing.T) {
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	out, _, _ := onRemote(t, "cd "+workDir+" && ls -1 /vp/bin")
+	if !strings.Contains(out, "vp-only-tool") {
+		t.Fatalf("no shim was placed for the remote-only tool:\n%s", out)
+	}
+	// From a local directory there is no machine that has it, and saying
+	// "not found" would send the reader looking in the wrong place.
+	_, errOut, code := onRemote(t, "cd "+workDir+" && vp-only-tool")
+	if code != 75 {
+		t.Errorf("exit %d, want 75; stderr=%q", code, errOut)
+	}
+	if !strings.Contains(errOut, "exists only on a remote") {
+		t.Errorf("the error does not explain itself: %q", errOut)
 	}
 }

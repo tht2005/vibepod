@@ -1,0 +1,53 @@
+# A pod that edits here and runs on an MI250 box.
+#
+# The mount is 798K of a 131G tree on gpu03's CephFS. Nothing is copied: the
+# directory is mounted lazily over sftp, and any command whose working
+# directory is inside it runs *on gpu03*, against gpu03's own disk and its own
+# toolchain — ROCm, its Python, its GPUs.
+#
+#   cd examples/gpu
+#   vpctl run -- /bin/sh -c 'cd /remote/vast0/duongnguyen/gpu-intern-26/amd_matrix_instruction_calculator && pwd && ls'
+#   vpctl log                # every command, and the machine it ran on
+#
+# The thing worth actually looking at — run these two and compare:
+#
+#   vpctl run -- /bin/sh -c 'cd /remote/vast0/duongnguyen/gpu-intern-26/amd_matrix_instruction_calculator && rocm-smi --showproductname'
+#   vpctl run -- /bin/sh -c 'cd ~/Git/vibepod && rocm-smi'
+#
+# The first prints the MI250s. The second refuses, and says why: rocm-smi
+# exists only on a remote, and ~/Git/vibepod runs here. Same pod, same shell,
+# same agent — the directory decided.
+#
+# Mounted at /remote/vast0/... rather than /home/duongnguyen/..., because
+# `readlink -f $HOME` on gpu03 says that is the canonical path: it is what the
+# remote's own compilers and tracebacks will print, and therefore what has to
+# be openable from in here.
+pod: gpu
+
+hosts:
+  gpu03: {}
+
+mounts:
+  - remote: gpu03:/remote/vast0/duongnguyen/gpu-intern-26/amd_matrix_instruction_calculator
+    # readonly: true      # uncomment while you are still nervous
+
+  # Local, so you can see the split: commands here stay on this machine.
+  - local: ~/Git/vibepod
+
+# Tools that exist on gpu03 and not on this laptop. A shim is normally
+# bind-mounted *over* a binary that is already here, so a tool this machine has
+# never heard of needs one placed for it. Named here, `rocm-smi` from a routed
+# directory goes to gpu03 like everything else.
+remote_tools:
+  - rocm-smi
+  - rocminfo
+  - hipcc
+
+host_access:
+  - ~/.claude
+  - ~/.claude.json
+
+exec:
+  # For a directory that matches no mount. Local is the safe default: a
+  # command has to be somewhere that belongs to gpu03 before it goes there.
+  default: pod

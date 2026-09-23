@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"vibepod/internal/proto"
@@ -173,6 +174,19 @@ func buildVp(vp string, spec *proto.Spec) error {
 	if spec.CtlBin != "" {
 		if err := sys.BindOver(spec.CtlBin, filepath.Join(vp, "bin", "vpctl"), true); err != nil {
 			return err
+		}
+	}
+	// Tools that exist only on a remote get a shim of their own, since there
+	// is nothing here to shadow. /vp/bin leads PATH, so a bare `rocm-smi`
+	// finds this and is routed like everything else; an absolute path to a
+	// binary this machine does not have still fails, as it must.
+	for _, name := range spec.RemoteTools {
+		if name == "" || strings.ContainsRune(name, '/') {
+			continue
+		}
+		dst := filepath.Join(vp, "bin", name)
+		if err := sys.BindOver(spec.ShimBin, dst, true); err != nil {
+			return fmt.Errorf("remote tool %s: %w", name, err)
 		}
 	}
 	return os.Chmod(vp, 0o555)

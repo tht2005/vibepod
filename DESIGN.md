@@ -414,6 +414,9 @@ mounts:
   - remote: staging:/srv/api       # collides with prod:/srv/api
     at: /staging-api               # explicit override required
 
+remote_tools:                      # exist only on a remote; shimmed in /vp/bin
+  - rocm-smi                       # ahead of PATH, since nothing here to shadow
+
 host_access:                       # bound from host into pod
   - ~/.claude
   - ~/.config/opencode
@@ -650,6 +653,7 @@ replays the buffer. Killing the pod kills everything inside it.
 | Remote footprint | push on demand, prompt first, `toolbin:` pre-authorizes | no speculative installs, no mid-run interruptions once trusted |
 | Pod identity | named, resolved from cwd's `vibepod.yaml` | docker-like when explicit, zero-argument in a project |
 | Path identity | mount at the remote's own absolute path | args forward verbatim; remote tool output stays openable. Shadowing guarded by a deny-list at `up` |
+| Remote-only tools | `remote_tools:`, shimmed into `/vp/bin` ahead of `PATH` | a shim needs a binary to shadow, and the GPU box's own tools are not on your laptop |
 | Host access | explicit allowlist | nothing granted implicitly; the agent cannot read unrelated projects or credentials |
 | Link drops | fail loudly, exit `75` | never silently re-run a partially-applied non-idempotent command |
 | Console | cockpit: status + log + input | a command surface that shows routing, without rebuilding a shell |

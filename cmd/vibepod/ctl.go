@@ -115,9 +115,10 @@ func loadSpec(name string, shimAll bool) (*proto.Msg, error) {
 	return &proto.Msg{
 		Op: proto.OpUp,
 		Spec: &proto.Spec{
-			Name:     res.Name,
-			Binds:    res.Binds,
-			Hostname: res.Name,
+			Name:        res.Name,
+			Binds:       res.Binds,
+			Hostname:    res.Name,
+			RemoteTools: res.RemoteTools,
 		},
 		Routes:      res.Routes,
 		Remotes:     remotes,
