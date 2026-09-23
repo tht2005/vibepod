@@ -172,6 +172,18 @@ Without it, detaching would destroy the pod.
 
 Per-command override: `@prod cmd`, `@local cmd`, `@pod cmd`.
 
+### Multiple hosts
+
+A pod mounts from and executes on **any number of hosts at once**. Nothing in the model is
+singular: the route table is a `path → (host, path)` map, the SSH mux pool is keyed by
+host, `toolbin` and `forward_credentials` are already per-host, and `vpctl tree` carries a
+host column. A single-host special case would have to be deliberately added, and then
+removed again.
+
+What is genuinely extra for several hosts is narrow: `expose_to: [a, b]` means one reverse
+transport per target, and a command spanning two hosts picks one side (§3). M1 exercises a
+single remote to keep the first integration small — a scoping choice, not a limit.
+
 Rules 2 and 3 are both properties of the *directory*, which is what lets agents inherit
 routing for free — they obey the same cwd rule everything else does, with nothing to
 learn and no session state to track. `exec_on:` covers "my code is local, the machine
@@ -504,12 +516,41 @@ exec exit); the console pane, `vpctl tree -f`, and `vpctl log -f` are all subscr
 Collection is solved by the exec gate — this is only a rendering problem.
 
 ```
-vpctl tree --json                 # structured, for agents
+vpctl tree --json                 # frugal: live in full, completed as counts
+vpctl tree --json --all           # everything the daemon knows
+vpctl tree --json -f              # NDJSON, one event per line
 vpctl tree --running              # what is still alive
 vpctl tree --failed --since 10m   # what broke recently
 vpctl tree 412                    # one subtree
 vpctl tree --mounts | --exec      # one half
 ```
+
+**Agent-facing output is frugal by default.** The human view collapses completed subtrees
+for readability; `--json` collapses them for context budget — an hour of agent work is
+hundreds of execs, and a complete tree is tens of kilobytes spent on `rustc` invocations
+nobody asked about. `--all` is there when something is genuinely parsing it.
+
+Note that plain `vpctl tree` is already a fine agent interface, and a cheaper one — JSON
+costs roughly twice the tokens for the same facts:
+
+```
+{"pid":412,"argv":["cargo","test"],"target":"prod","state":"running","elapsed_ms":12400}
+412  cargo test  prod  running  12.4s
+```
+
+`--json` is for consumers that parse (a script, `jq`), not for consumers that read. Which
+is a reason to keep the default rendering compact and column-aligned rather than pretty.
+
+Streaming is **NDJSON events**, the daemon's own event stream exposed directly — one
+object per line, tailable, composable:
+
+```
+{"v":1,"ev":"exec","pid":412,"ppid":88,"argv":["cargo","test"],"target":"prod","ts":"…"}
+{"v":1,"ev":"exit","pid":412,"code":0,"elapsed_ms":12400,"ts":"…"}
+```
+
+`"v": 1` matters more than it looks: the moment an agent parses this it is an API, and it
+will outlive several rounds of the tree's visual layout.
 
 `vpctl log` and `vpctl tree` pair rather than overlap: **log is flat, chronological,
 finished; tree is hierarchical, live, running.**
@@ -624,7 +665,8 @@ replays the buffer. Killing the pod kills everything inside it.
    or is `nsenter` the only reliable route?
 3. **rclone as a dependency** — vendor the binary, require it, or reconsider a custom
    Go FUSE once access patterns are known?
-4. **Multiple remotes in one pod** — the model supports it; v1 goal or M4?
+4. **Reverse mounts to several targets** — `expose_to: [a, b]` needs one transport per
+   target. Worth supporting, or is one target per local mount enough?
 5. **`sync` mode implementation** — rsync loop, or a mutagen-style watcher?
 6. **`@host` prefix parsing** — with the shell now local, where does the override live?
 7. **`host_access` defaults** — ship per-agent presets so the first run is not empty?
@@ -640,10 +682,10 @@ replays the buffer. Killing the pod kills everything inside it.
 - **M0 — the trick works.** bwrap pod, seccomp exec gate, lazy bind-shim redirect, local
   binds only. Success is running Claude Code inside it and seeing every exec intercepted
   with cwd tracking intact. This is the riskiest assumption in the design.
-- **M1 — one remote.** Daemon, rclone mount with execution-aware invalidation, cwd
-  routing to a single host, warm ControlMaster. First genuinely useful version.
+- **M1 — remotes.** Daemon, rclone mount with execution-aware invalidation, cwd routing,
+  warm ControlMaster. Plural structures throughout; one remote exercised end to end.
+  First genuinely useful version.
 - **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, the event
   stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`.
 - **M3 — real work.** Credential proxy, toolbin prompts, port forwards, reverse mounts.
-- **M4 — polish.** Multi-host, `exec_on`/`expose_to` beyond one target, `doctor`,
-  `sync` mode.
+- **M4 — polish.** `expose_to` to several targets, `doctor`, `sync` mode.
