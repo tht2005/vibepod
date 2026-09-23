@@ -1,9 +1,13 @@
 # vibepod — design
 
-> Status: **v1 built and verified** — M0-M2 (§13). See PLAN.md for what was
-> measured before building, the six bugs verification found, and three
-> deviations from this document that the implementation forced. Remaining
-> unknowns in §12.
+> Status: **v1 built and verified** (M0-M2) — and **superseded in design by v2**,
+> which is what this document now describes. v1 routed commands by working
+> directory through a seccomp exec gate; using it showed that the mechanism
+> cannot be made trustworthy, so v2 replaces it with an explicit per-session
+> **backend** and a live shell on it (§3), adds runtime mounting (§9), and makes
+> the TUI the primary surface. PLAN.md records what was measured before building
+> v1 and the six bugs verification found. §13 has the v2 milestones; §12 the
+> remaining unknowns.
 
 ## 1. Problem
 
@@ -25,19 +29,82 @@ A *pod* is a local namespace that composes three planes:
 |---|---|---|
 | **Composition** | unify local dirs + remote dirs into one filesystem view | pod mount namespace |
 | **Identity** | agent config, skills, MCP, API keys | bound from host, never crosses the wire |
-| **Execution** | decide which machine a command actually runs on | routing layer |
+| **Execution** | run a command on the machine you chose | per-session backend |
 
 Planes 1 and 2 are plumbing. Plane 3 is the product.
 
 ## 3. The mechanism
 
-Two parts: an **exec gate** that sees every program launch, and **lazy bind-shims** that
-do the redirecting.
+A *backend*, a **live shell** on it per session, and a **dispatching shell** in the pod.
 
-### Why not intercept the shell
+This section replaced an earlier one. v1 routed by working directory through a seccomp
+`SECCOMP_RET_USER_NOTIF` gate on `execve`, redirecting with lazy bind-shims. That was
+built, it worked, and it was removed. The reason it was removed is the first thing worth
+writing down, because it is the only part of this design that was learned by using it.
 
-The obvious design — bind `vpsh` over `/bin/sh` and forward the `-c` string verbatim —
-does not survive contact with a real agent. Measured, in this repo:
+### Why the exec gate was removed
+
+**A routed `execve` is not a process. It is an `ssh`.** The gate made the call *look*
+local, but what ran on the far side was a fresh remote shell, and everything a process
+carries beyond `argv`, environment and cwd was gone:
+
+- `/tmp` is a different `/tmp`, so a local writer and a remote reader do not meet
+- file descriptors past the first three do not inherit
+- no process group, no job control, no `rlimit`s, no cgroup
+- signals are best-effort through a pidfile, not delivery to a child
+- writes on the far side invalidate the host's FUSE cache non-atomically
+
+No single item is fatal. **The list not terminating is fatal.** You can close any one gap
+and still not be able to say "this is correct now", so the mechanism can never be trusted,
+so every command gets checked by hand, so it bought nothing. A promise that cannot be
+completed is worse than no promise.
+
+The gate was a bad teleporter and an excellent observer — it saw every exec, with its cwd,
+before it ran. That is why deleting it has a real cost, recorded under *What this costs*
+below. It is not why it was kept.
+
+### What a backend is
+
+A **backend** is a named machine that a session's commands run on: `pod`, or any ssh alias
+the pod has mounted. Each session has exactly one current backend, and vibepod holds **one
+persistent shell** on that machine for as long as the session lives.
+
+The persistence is the whole point. Most of what made cwd-routing feel broken was that
+every command got a new shell: `cd` did not stick, `export` did not stick, background jobs
+died, job control did not exist. A session-bound shell fixes that class of problem at once,
+and fixes it by *not emulating anything*.
+
+Backend is **per-session state**, never global. The human pressing a key in the TUI and an
+agent running a command are separate sessions with separate backends, so neither can move
+the other's ground. Two ways to say it, one meaning:
+
+```
+vp backend            # what is this session on?          → gpu03
+vp use gpu05          # move this session
+vp @gpu03 rocm-smi    # one command elsewhere; the mode does not change
+```
+
+and `b` in the TUI, which moves the backend of the focused session.
+
+### Interactive: the session *is* the shell
+
+Attach to a session whose backend is `gpu03` and you are in a real shell on gpu03. Not a
+proxy, not a per-command `ssh` — the shell vibepod opened for that session, with your
+terminal wired to it.
+
+This is why `cd` works: it is `cd`. Shell variables, `jobs`, `fg`, history, `!!`, a
+half-typed heredoc — all of it behaves, because none of it is being reproduced. Switching
+backend swaps which shell your keystrokes reach; the one you left keeps its cwd and its
+jobs, and is still there when you switch back.
+
+Path identity (§5) is what makes this coherent rather than disorienting: `/remote/gpu03/x`
+in the pod and `/remote/gpu03/x` on gpu03 are the same string, so moving between backends
+does not move the ground under your prompt.
+
+### Non-interactive: the agent's shell stays local
+
+The original argument against intercepting the shell was never wrong, and it is what forces
+the split. Measured in this repo, the primary agent runs:
 
 ```
 $SHELL = /usr/bin/zsh                      # not /bin/sh, not /bin/bash
@@ -48,127 +115,104 @@ $SHELL = /usr/bin/zsh                      # not /bin/sh, not /bin/bash
                  && pwd -P >| /tmp/claude-XXXX-cwd'
 ```
 
-Each call is a fresh `zsh -c`, not a persistent shell. Environment continuity comes from
-replaying a snapshot file; cwd continuity comes from writing `pwd -P` to a **local** temp
-file that the next call reads. Ship that string to a remote and:
+Each call is a fresh `zsh -c`. Environment continuity comes from replaying a snapshot file;
+cwd continuity comes from writing `pwd -P` to a **local** temp file the next call reads.
+Ship that string to a remote and the snapshot path does not exist, `setopt` needs zsh,
+`pwd -P >| /tmp/...` writes on the wrong machine so `cd` silently stops persisting, and the
+whole thing is zsh syntax handed to whatever shell the remote has.
 
-- the snapshot path does not exist there, so the environment silently evaporates
-- `setopt` is a zsh builtin, so the remote needs zsh
-- `pwd -P >| /tmp/claude-XXXX-cwd` **writes on the wrong machine**, so `cd` stops
-  persisting between calls — silently
-- the whole string is zsh syntax handed to whatever shell the remote has
+So a non-interactive shell **always runs in the pod**. The wrapper, the `source`, the
+redirections and the `pwd -P` capture all stay where they work. Dispatch happens one level
+down, at the program, by two mechanisms that need no kernel help:
 
-This is the default path for the primary agent, not a corner case. The shell must stay
-local, where its wrapper, builtins, redirections, and cwd tracking all work untouched.
-Interception belongs one level down, at the program.
+- **`/vp/bin` ahead of `PATH`** — a wrapper per remote-only tool (`remote_tools:`) and per
+  tool the agent should not run locally. Each is three lines: `exec vp @<backend> <tool>
+  "$@"`. This is what `remote_tools:` already meant; it no longer needs a bind-shim to
+  stand on.
+- **`vp @host cmd` and `vp use`**, which the generated `CLAUDE.md` fragment (§9) teaches.
+  This is the honest channel: all three agents read project instructions, which is the
+  capability the gate was built to work around.
 
-### The exec gate
+### The dispatching shell
 
-`vpinit` installs a seccomp filter with `SECCOMP_RET_USER_NOTIF` on `execve`/`execveat`,
-passes the listener fd to `vibepod` over `SCM_RIGHTS`, then drops its capabilities. The
-filter is inherited by every descendant, so the daemon observes **every exec in the pod** —
-including statically-linked and agent-bundled binaries that no `$PATH` shim could catch.
+The pod's `$SHELL` is vibepod's own, roughly sixty lines. It records the command line,
+consults the session's backend, and either runs the command in the pod or writes it into
+that backend's live shell.
 
-This requires `CAP_SYS_ADMIN` in the pod's user namespace. `vpinit` receives it through
-the **ambient** capability set when the daemon clones it, scoped to the pod's userns and
-never the host. It keeps the capability — lazy bind-shims need it for the pod's whole life
-— but clears the *ambient* set immediately, so every process it spawns, the agent
-included, has an empty capability set and cannot mount, unmount, or unshim anything
-(verified: `CapEff: 0`, child `mount()` → `EPERM`).
+It is bypassable by anything that calls `execve` directly, and **that is the trade**: it
+catches what agents and humans actually do — they shell out — at a small fraction of the
+complexity of a seccomp gate, and it logs *command lines as written* rather than
+post-resolution `execve` argv, which is the more useful record.
 
-### Lazy bind-shims
+### What crosses with a dispatched command
 
-seccomp-notify is a **gate, not a rewriter** — the supervisor may allow, deny, or
-`CONTINUE`, but cannot alter `execve`'s arguments. The redirect uses the one thing notify
-does provide: it freezes the syscall while the daemon decides.
+The shell stays local, but a command still has an environment, and which parts of it follow
+the command to another machine is a separate question with a different answer.
 
-```
-agent execs /usr/bin/cargo
-  → notify fires; the process is frozen mid-syscall
-  → daemon: cargo, cwd /srv/api → prod. No shim at that path yet.
-  → daemon asks vpinit to stash the original, then bind vpsh over /usr/bin/cargo
-  → reply CONTINUE
-  → the kernel resolves the path now, and finds the shim
-```
+**Blanket forwarding is refused**, for two reasons that are each disqualifying:
 
-Path resolution happens after the syscall resumes, so the bind lands in time. First exec
-of a binary pays one mount (~1ms); every exec after is free. No `$PATH` enumeration, no
-shim-set staleness, and no ptrace — which matters, because ptrace is exclusive and would
-break `strace` and `gdb` *inside* the pod.
+- A pod's environment holds `ANTHROPIC_API_KEY`, `HF_TOKEN` and their relatives. §7
+  promises those never leave this machine. Sending the environment sends them.
+- `PATH`, `HOME`, `LD_LIBRARY_PATH`, `PYTHONHOME`, `SSH_AUTH_SOCK` and the `XDG_*` family
+  describe *this* machine. Imposing them on a remote breaks its toolchain in ways harder to
+  diagnose than the thing they were meant to fix — a wrong `PATH` is worse than a missing
+  variable.
 
-Where seccomp-notify is unavailable (older kernels, nested containers), this degrades to a
-statically generated shim directory built from the remote's own `$PATH`. Same daemon-side
-policy, weaker coverage.
+**Sending nothing is also wrong**, and fails silently, which is worse. A dropped
+`PYTHONPATH` surfaces as `ModuleNotFoundError`, which reads as a broken install rather than
+a discarded environment, and sends the user to debug the wrong machine.
 
-### What crosses with a routed command
+So what crosses is the **delta**: the difference between the command's environment and the
+environment its session started with. That is exactly `VAR=value cmd`, and `export VAR=...`
+earlier in the same shell, and nothing else — because anything untouched is by construction
+identical to the baseline. Identity variables are excluded even when set deliberately, and
+**a refusal is reported rather than swallowed**: it goes to the event stream as a notice,
+where `vp log` shows it. Silence is how the original bug survived.
 
-Interception keeps the shell local, but a command still has an environment, and
-the question of which parts of it follow the command to another machine is a
-separate one with a different answer.
+Assignments are emitted before `exec` in the remote script, not after — `exec VAR=v cmd`
+would have the shell look for a program named `VAR=v` — which also leaves the pid the
+shell's own, so the pid file and the signal path are untouched.
 
-**Blanket forwarding is refused**, for two reasons that are both disqualifying
-on their own:
+`exec.forward_env` can set this to `none`, or to an explicit list for anyone who would
+rather say precisely what travels.
 
-- A pod's environment holds `ANTHROPIC_API_KEY`, `HF_TOKEN` and their
-  relatives. §7 promises those never leave this machine. Sending the
-  environment sends them.
-- `PATH`, `HOME`, `LD_LIBRARY_PATH`, `PYTHONHOME`, `SSH_AUTH_SOCK` and the
-  `XDG_*` family describe *this* machine. Imposing them on a remote breaks its
-  toolchain in ways that are harder to diagnose than the thing they were meant
-  to fix — a wrong `PATH` is worse than a missing variable.
+With a persistent per-session shell, the baseline is that shell's own environment at open
+time, which makes the delta smaller and better defined than it was under one-ssh-per-exec.
 
-**Sending nothing is also wrong**, and fails silently, which is worse. A
-dropped `PYTHONPATH` surfaces as `ModuleNotFoundError`, which reads as a broken
-install rather than a discarded environment; the user is sent to debug the
-wrong machine.
+### What this costs
 
-So what crosses is the **delta**: the difference between the command's
-environment and the environment its session started with. That is exactly
-`VAR=value cmd`, and `export VAR=...` earlier in the same shell, and nothing
-else — because anything a user did not touch is, by construction, identical to
-the baseline. Identity variables are excluded from the delta even when set
-deliberately, and **a refusal is reported rather than swallowed**: it goes to
-the event stream as a notice, where `vpctl log` shows it. Silence is how the
-original bug survived.
+Three things, stated plainly because they were bought deliberately.
 
-Assignments are emitted before `exec` in the remote script, not after — `exec
-VAR=v cmd` would have the shell look for a program named `VAR=v` — which also
-leaves the pid the shell's own, so the pid file and the signal path are
-untouched.
-
-`exec.forward_env` can set this to `none`, or to an explicit list of names for
-anyone who would rather say precisely what travels.
-
-### What this buys
-
-- **Agent wrappers work untouched.** The wrapper, `source`, `setopt`, and the `pwd -P`
-  capture all run locally, so cwd tracking keeps working.
-- **`cd /srv/api` is a local operation** against the mount, and needs no special handling.
-- **Pipelines split naturally.** `rg foo | head -20` runs `rg` on the remote and `head`
-  in the pod, streaming between them — better than routing the whole pipeline one way.
-- **Direct execs are caught.** The agent's built-in Grep spawns ripgrep without a shell;
-  under shell-level interception that read would have gone over FUSE.
-
-Known cost: a redirection like `cmd > out.txt`, where `out.txt` sits in a FUSE mount, has
-the remote program's stdout streamed back and written locally over FUSE. Correct, slower
-than native, optimisable later.
+- **Bundled binaries bypass `/vp/bin`.** Claude Code's built-in Grep spawns its own
+  ripgrep at an absolute path, so it never consults `PATH` and reads through FUSE instead of
+  running on the machine that owns the files. The seccomp gate caught exactly this. The
+  mitigations are the FUSE cache and telling the agent to dispatch searches; neither is as
+  good as catching it.
+- **The exec log narrows.** It records what the dispatching shell and `vp` see, which is
+  every dispatch and every shelled-out command, but not a direct `execve` from a bundled
+  binary. An `rm -rf /remote/gpu03/project` run *locally in the pod* still destroys real
+  data on gpu03 through the mount, and now goes unrecorded unless it came through a shell.
+- **Pipelines no longer split.** `rg foo | head -20` used to run `rg` remotely and `head`
+  locally. Now the pipeline belongs to one shell, so it runs entirely on one backend. This
+  is a loss in elegance and a gain in predictability.
 
 ### Terminal and signals
 
-SSH does not forward `SIGINT` without a PTY, so Ctrl-C on a routed `make` would otherwise
-leave an orphan on the remote. But `-tt` merges stderr into stdout and mangles binary
-output, and agents parse those streams separately.
+SSH does not forward `SIGINT` without a PTY, so Ctrl-C on a dispatched `make` would
+otherwise leave an orphan on the remote. But `-tt` merges stderr into stdout and mangles
+binary output, and agents parse those streams separately.
 
 So: **piped by default**, with signals forwarded by killing the remote *process group* over
 a second multiplexed channel (~5ms, pure POSIX, nothing installed remotely). **PTY only
-when vpsh's own stdio is a tty** — which is exactly `vpctl shell` and interactive programs.
+when the session's own stdio is a tty** — which is exactly an attached session and
+interactive programs. This is the same line that separates the two dispatch paths above.
 
 ## 4. Architecture
 
 ```
 ┌─ your machine ─────────────────────────────────────────────────┐
 │                                                                │
-│  vpctl ──unix socket──► vibepod  (rootless user daemon)        │
+│  vp ──unix socket──► vibepod  (rootless user daemon)        │
 │                            ├─ pod registry & lifecycle         │
 │                            ├─ route table (path → host:path)   │
 │                            ├─ ssh ControlMaster pool           │
@@ -177,9 +221,9 @@ when vpsh's own stdio is a tty** — which is exactly `vpctl shell` and interact
 │                            └─ audit log                        │
 │                            ▲                                   │
 │  ┌─ pod "work" (bwrap namespace) │                             │
-│  │   vpinit (PID 1) ─────────────┤  holds ns; owns exec gate   │
-│  │     └ seccomp notify fd ──────┤  every execve, to the daemon│
-│  │   vpsh (bind-mounted lazily) ─┘  over intercepted binaries  │
+│  │   vpinit (PID 1) ─────────────┤  holds ns; owns pod mounts  │
+│  │   vpsh ($SHELL in the pod) ───┤  logs, then runs or dispatch│
+│  │   /vp/bin wrappers ───────────┘  ahead of PATH              │
 │  │   /srv/api    ← sshfs  prod:/srv/api                        │
 │  │   ~/Git/notes ← bind   (local)                              │
 │  │   ~/.claude   ← bind   (local, rw)                          │
@@ -195,56 +239,65 @@ when vpsh's own stdio is a tty** — which is exactly `vpctl shell` and interact
 
 | Name | Role |
 |---|---|
-| `vpctl` | thin client. `up`, `ps`, `shell`, `run`, `attach`, `exec`, `down` |
+| `vp` | thin client and the verb surface: `use`, `@host`, `mount`, `hosts`, `log`, `tree` |
 | `vibepod` | rootless user daemon, auto-spawned on first use. Owns everything long-lived |
-| `vpinit` | PID 1 inside each pod. Holds the mount namespace open, installs the seccomp exec gate then drops caps, reaps zombies, forwards signals |
-| `vpsh` | the shim, bind-mounted over intercepted binaries on demand. Forwards `(cwd, argv, env, fds, tty)` to the daemon, proxies exit code |
+| `vpinit` | PID 1 inside each pod. Holds the mount namespace open, performs every pod mount on its one capable thread — including mounts added long after `up` — reaps zombies, forwards signals |
+| `vpsh` | the pod's `$SHELL`. Records the command line, then runs it locally or writes it into the session backend's live shell |
 
 `vpinit` exists because **a mount namespace only survives while a process is inside it.**
 Without it, detaching would destroy the pod.
 
-## 5. Routing
+## 5. Backends and paths
 
-**cwd decides the machine.** Resolved in precedence order:
+**The session decides the machine; the path decides the directory.** Two independent
+questions, which v1 conflated into one and got wrong in both halves.
 
-| # | rule | source |
+| | question | answered by |
 |---|---|---|
-| 1 | session pin | `vpctl use <host>`, inherited via `VIBEPOD_EXEC` |
-| 2 | mount's `exec_on:` | config — the durable "this directory runs there" |
-| 3 | mount owner | remote mount → its host · local mount → the pod |
-| 4 | `exec.default` | config, for cwd matching no mount |
+| **Which machine** | where does this command run? | the session's backend — `vp use`, `b` in the TUI, or `@host` for a single command |
+| **Which directory** | what is this path called there? | path identity, then the mount table |
 
-Per-command override: `@prod cmd`, `@local cmd`, `@pod cmd`.
+There is no precedence chain any more, and nothing is inferred from the working directory.
+A session stays on its backend until something says otherwise, the TUI status bar says
+which one, and `vp backend` answers in a word. The old chain — session pin over `exec_on:`
+over mount owner over `exec.default` — existed only because the machine was being *guessed*.
+`exec.default` survives as the backend a new session opens on. `exec_on:` becomes a
+**suggestion** that the TUI and the generated `CLAUDE.md` fragment surface ("this directory
+lives on gpu03") rather than a rule that acts on its own — which also disarms the trap where
+`exec_on:` could be accepted at `up` and only fail at run time.
+
+**A backend that cannot see the cwd is refused at dispatch**, naming both sides, instead of
+silently running where that path means something else. The exception is a configured
+cross-mount, below.
 
 ### Multiple hosts
 
 A pod mounts from and executes on **any number of hosts at once**. Nothing in the model is
 singular: the route table is a `path → (host, path)` map, the SSH mux pool is keyed by
-host, `toolbin` and `forward_credentials` are already per-host, and `vpctl tree` carries a
+host, `toolbin` and `forward_credentials` are already per-host, and `vp tree` carries a
 host column. A single-host special case would have to be deliberately added, and then
 removed again.
 
-What is genuinely extra for several hosts is narrow: `expose_to: [a, b]` means one reverse
-transport per target, and a command spanning two hosts picks one side (§3). M1 exercises a
-single remote to keep the first integration small — a scoping choice, not a limit.
+Several hosts is where the model earns its keep, because the interesting configurations are
+all plural: compute on one machine and data on another (cross-mounts, §6), or code here and
+GPUs there. What is genuinely extra is narrow — `expose_to: [a, b]` means one reverse
+transport per target, and a command cannot span two hosts, so it picks one side.
 
-Rules 2 and 3 are both properties of the *directory*, which is what lets agents inherit
-routing for free — they obey the same cwd rule everything else does, with nothing to
-learn and no session state to track. `exec_on:` covers "my code is local, the machine
-that should run it is not":
+`exec_on:` covers "my code is local, the machine that should run it is not". Under §5 it
+sets the backend a session **opens on** in that directory, and is shown as a suggestion
+rather than applied silently:
 
 ```yaml
   - local: ~/Git/proj
     expose_to: [gpu-box]     # gpu-box can see this directory
-    exec_on: gpu-box         # commands whose cwd is here run on gpu-box
+    exec_on: gpu-box         # a session opening here starts on gpu-box
 ```
 
-Rule 1 is the ad-hoc escape hatch for interactive work. It is inherited by child
-processes, so `vpctl use gpu-box` followed by `claude` sends every command that agent
-runs to gpu-box regardless of cwd. That is deliberate — it is the original `set_remote`
-workflow — but it is also the one route the console's status bar cannot really protect
-you from, since agent output scrolls faster than it can be read. Prefer `exec_on:` for
-anything durable.
+A session that then runs `vp use pod` stays on the pod, and the TUI says so. This is the
+part v1 got backwards: a directory that silently changed the executing machine could not be
+read off the screen fast enough to be trusted, because agent output scrolls faster than
+anyone can follow. The backend is now a thing you set and can see, not a thing a `cd`
+decides for you.
 
 Pod-internal paths are permanently exempt, so MCP servers and agent-internal helpers
 always run locally and never get shipped to a remote.
@@ -276,7 +329,7 @@ in the remote's own real filesystem; the pod namespace exists only on your machi
 Hardcoded paths in remote binaries are as correct as they ever were.
 
 **The hazard runs the other way**: a mount can shadow a *local* system path, so a pod-local
-process reading `/usr/lib/...` silently gets remote files over FUSE. `vpctl up` prevents
+process reading `/usr/lib/...` silently gets remote files over FUSE. `vp up` prevents
 this at startup rather than leaving it as a runtime mystery:
 
 - refuse to mount over `/usr`, `/bin`, `/lib`, `/lib64`, `/sbin`, `/etc`, `/proc`,
@@ -308,16 +361,19 @@ grants capabilities, but the `execve` that follows drops them again for a non-ro
 
 ### Who actually reads through FUSE
 
-Less than it first appears. Under routing, `rg`, `make`, and `cargo` execute **on the
-remote against its local disk** and never touch FUSE. The FUSE load is only:
+Less than it first appears. On a remote backend, `rg`, `make`, and `cargo` execute **on that
+machine against its local disk** and never touch FUSE. The FUSE load is only:
 
 - the agent's built-in file tools (Read / Glob / Grep)
 - MCP servers
 - pod-local commands
 
-The worst of these is the agent's own Grep running ripgrep over the mount — which is
-precisely the direct exec the exec gate catches. **The FUSE performance risk is mostly the
-interception-gap problem wearing a different hat**; closing one closes the other.
+The worst of these is the agent's own Grep running ripgrep over the mount. It spawns a
+bundled binary at an absolute path, so it consults neither `$SHELL` nor `PATH`, and §3's
+removal of the exec gate gave up catching it. **The FUSE performance risk and the
+dispatch-gap problem are the same problem wearing two hats** — which is why the VFS cache
+carries more weight in v2 than it did in v1, and why the `CLAUDE.md` fragment has to tell
+the agent to dispatch its searches.
 
 ### Backend: rclone sftp with a VFS cache
 
@@ -340,7 +396,10 @@ idea what is happening on the other end.
 remote tree could have changed — nothing else touches it. That permits effectively
 infinite attribute and entry timeouts, with invalidation driven by **command completion**
 rather than a timer. It is a correctness-preserving cache far more aggressive than any
-network FS can justify, and it exists only because of the routing layer.
+network FS can justify, and it exists only because vibepod knows when a dispatched command
+finished. It matters more in v2 than v1: with the exec gate gone, the agent's own bundled
+ripgrep reads through FUSE (§3), and the cache is most of what stands between that and a
+crawl.
 
 This is why the backend needs a `vfs/forget`-style hook. sshfs has none.
 
@@ -355,12 +414,48 @@ on the big machine" is impossible — the target has no such path.
     expose_to: [gpu-box]
 ```
 
-`exec_on:` without a matching `expose_to:` is a misconfiguration and is rejected at `up`.
+`exec_on:` is no longer a rule that acts on its own (§5) — it is the backend a session
+opens on in that directory, and a *suggestion* the TUI and the `CLAUDE.md` fragment show.
+That removes the v1 trap where a config with `exec_on:` and no `expose_to:` was accepted at
+`up` and could only fail at run time. What remains true: without a reverse mount, the target
+cannot see the path, and **the dispatch is refused with both sides named**.
 
 Transport is undecided (§12): sshfs slave mode over `ssh -R`, rclone serving sftp back
 through the tunnel, or a push-copy. Note the asymmetry — for a reverse mount, the
 *remote's* reads become network reads, so the caching story runs the opposite direction
 from a normal mount.
+
+### Cross-mounts: one machine's compute on another's data
+
+The case that motivated this: gpu03 has the GPUs, gpu05 has the dataset. Both are mounted in
+the pod, so *you* can see both — but gpu03 cannot see gpu05, and that is the whole problem.
+
+Three transports, and none of them is always available:
+
+| `via:` | path | cost | requires |
+|---|---|---|---|
+| `direct` | gpu03 mounts gpu05 itself | one hop, full speed | gpu03→gpu05 reachable, FUSE + sshfs on gpu03, agent forwarding permitted |
+| `host` | gpu05 → this machine → gpu03 | **every read crosses your uplink twice** | nothing beyond `expose_to:` |
+| `copy` | stage it with rsync, then run | fastest on re-read; two copies to keep straight | disk on the target |
+
+`direct` is the one worth wanting, and it is also the one that keeps §7's promise: gpu03
+authenticates to gpu05 through your **forwarded agent socket**, so no key is ever stored
+there and the authority dies with the connection. That is the credential proxy of §7 with a
+better justification than `git push` gave it.
+
+But it cannot be the assumption. Node-to-node ssh is firewalled on many clusters; compute
+nodes frequently have no `/dev/fuse` or no sshfs installed; `AllowAgentForwarding no` is
+common on shared machines. So `via:` is **configurable, and defaults to `auto`**: at mount
+time vibepod probes reachability, FUSE, sshfs and agent forwarding, picks the best available,
+and **reports which it chose and why the others were ruled out**. A failure reads
+
+```
+gpu03 → gpu05  direct: no sshfs on gpu03
+               falling back to host relay (2 hops, ~31ms + ~12ms)
+```
+
+rather than timing out with nothing to go on. The probe result is cached for the mount's
+life; `via:` set explicitly skips probing and fails loudly if that transport is unavailable.
 
 ### Mount modes
 
@@ -441,7 +536,7 @@ hosts:
     forward_credentials: true
 
 mounts:
-  - remote: prod:/srv/api          # → /srv/api in pod, commands here → prod
+  - remote: prod:/srv/api          # → /srv/api in pod; a session opening here starts on prod
     mode: fuse
   - local: ~/Git/proj              # → ~/Git/proj in pod
     expose_to: [gpu-box]           # ...and visible on gpu-box
@@ -452,6 +547,9 @@ mounts:
     readonly: true
   - remote: staging:/srv/api       # collides with prod:/srv/api
     at: /staging-api               # explicit override required
+  - remote: gpu05:/data            # gpu03's compute, gpu05's data (§6)
+    reachable_from: [gpu03]        # ...so gpu03 needs to see it too
+    via: auto                      # direct | host | copy; auto probes and reports
 
 remote_tools:                      # exist only on a remote; shimmed in /vp/bin
   - rocm-smi                       # ahead of PATH, since nothing here to shadow
@@ -463,8 +561,12 @@ host_access:                       # bound from host into pod
 ports:
   - prod:3000                      # auto -L forward
 
+can_mount:                         # what `vp mount` may reach from inside the pod
+  - "gpu*"                         # default: any host in your ssh config
+  - lab-7
+
 exec:
-  default: pod                     # when cwd matches no mount
+  default: pod                     # the backend a new session opens on
   forward_env: delta               # what the caller set, only (§3); or none,
                                    # or an explicit list of names
 ```
@@ -472,66 +574,113 @@ exec:
 Split `vibepod.yaml` (committed, shareable) from `vibepod.local.yaml` (your paths,
 gitignored).
 
+Every field here is also settable while the pod runs (§9), and `vp save` writes the live
+state back. The file is a starting point and a snapshot, not a thing you restart for.
+
 ## 9. Interface
 
 ### Command surface
 
+Two names. Bare `vibepod` opens the TUI; `vp` is the verb surface that you and the agent
+both type all day. The v1 names `vpctl` and the `vpsh` *shim* are retired — `vpsh` is
+reused as the pod's `$SHELL` (§3), which is never typed.
+
 ```
-vpctl new [name]            create pod + open the console
-vpctl up [name]             create pod, detached, no console     (scripts, CI)
-vpctl run claude [target]   create/attach and launch an agent
-vpctl shell [pod]           another independent terminal into a running pod
-vpctl attach [pod]          reattach to a detached console or agent session
-vpctl hosts [pod]           the machines this pod runs on, and what they own
-vpctl where [@host]         which machine runs this directory, or vice versa
-vpctl cd @host              switch to a machine's directory (console only)
-vpctl use <host|auto>       set this session's executor
-vpctl exec @prod -- cmd     one-off, explicit target
-vpctl ps                    list pods, routes, health
-vpctl tree [pod]            pod structure: mounts and live exec tree
-vpctl log [-f] [pod]        every exec and where it ran
-vpctl down [pod]            stop, unmount, disconnect
-vpctl doctor                check bwrap, seccomp, mounts, ssh reachability, toolchains
+vibepod [pod]                 open the cockpit                     (the TUI, below)
+vibepod up [name]             create pod, detached, no TUI         (scripts, CI)
+vibepod down [pod]            stop, unmount, disconnect
+vibepod doctor                namespaces, mounts, ssh reachability, toolchains
+
+vp use <host|pod>             move this session's backend
+vp backend                    which backend is this session on
+vp @host cmd ...              one command elsewhere; the mode does not change
+vp hosts                      machines this pod knows, mounted or not
+vp mount <host>:<path> [at]   connect and mount into a running pod
+vp unmount @host              unmount and disconnect
+vp cd @host                   go to a machine's directory
+vp where [@host]              what this directory is called on a machine, or the reverse
+vp shell [pod]                another independent terminal into a running pod
+vp attach [pod]               reattach to a detached session
+vp ps                         pods, backends, health
+vp tree [pod]                 mounts and live session/exec structure
+vp log [-f] [pod]             every dispatched and shelled command, and where it ran
+vp save                       write live state back to vibepod.yaml
 ```
 
-Pods are **named** and globally listable, but a bare `vpctl new`/`up` in a project
+Pods are **named** and globally listable, but a bare `vibepod`/`vibepod up` in a project
 directory takes its name from `./vibepod.yaml`.
 
-### The console
+#### The config is a live object, not a boot artifact
 
-`vpctl new` opens a cockpit — not a shell replacement. Competing with zsh and tmux means
-rebuilding completion, history, job control and a terminal emulator, and losing anyway.
+`vp mount`, `vp unmount` and `vp save` answer the complaint that shaped this revision:
+adding a machine meant `down`, edit YAML, `up` — losing every session and the agent's
+context with them. **Anything in `vibepod.yaml` is changeable while the pod runs**, and
+`vibepod.yaml` becomes a snapshot you can *take* rather than a file you restart for.
+
+The mechanism was already there and unused: `vpinit`'s mount worker is a thread pinned with
+`CAP_SYS_ADMIN` for the pod's whole life, `OpBind` is a generic `Src`→`Dst`, the FUSE
+manager's `Add` is incremental, and the ssh pool connects lazily. The only frozen piece was
+the route table, which becomes swappable under a lock.
+
+Mounting is outward-facing in a way `rm -rf` is not: it opens a network path from inside a
+sandbox whose purpose was containment. So unlike the guardrail ruling below, it is **not**
+unrestricted — any host already in your ssh config is allowed, anything else is refused, and
+when a TUI is attached an agent's mount request surfaces as a one-key confirmation.
+
+### The TUI
+
+Bare `vibepod` opens a cockpit: machines, sessions, and the live log, keyboard-driven.
 
 ```
-┌─ vibepod · work ───────────────────────────────────────────────┐
-│ exec: auto            /srv/api → prod       8ms    2 mounts ✓  │
-├────────────────────────────────────────────────────────────────┤
-│ 14:22:31  prod    cargo test                          ✓ 12.4s  │
-│ 14:22:48  local   git commit -m "fix parser"          ✓  0.1s  │
-│ 14:23:02  prod    rm -rf target                       ✓  0.3s  │
-│                                                                │
-│ /srv/api ❯ _                                                   │
-└────────────────────────────────────────────────────────────────┘
+┌ vibepod · demo ─────────────────────────────────────────────┐
+│ MACHINES                   │ ACTIVITY                       │
+│ ● pod         local        │ 14:02:11 gpu03 python train.py │
+│ ● gpu03  12ms /remote/gpu03│          … running 4m12s       │
+│ ● gpu05  31ms /remote/gpu05│ 14:01:40 pod   rg TODO    ✓ .3s│
+│ ○ lab-7   —   unmounted    │ 13:58:02 gpu05 ls -l      ✓    │
+│                            │                                │
+│ SESSIONS                   │                                │
+│ 1 claude     pod     4m    │                                │
+│ 2 shell    ▸ gpu03  12m    │                                │
+├─────────────────────────────────────────────────────────────┤
+│ backend gpu03 │ m mount  u unmount  b backend  ⏎ attach  q │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Header: pod, executor mode, routes, health. Body: the live exec log. Bottom: a command
-input. Anything needing a real TTY (`vim`, `htop`, `claude` itself) takes over the full
-screen and hands it back on exit.
+`m` mounts (prompting for `host:path`), `u` unmounts, `b` moves the focused session's
+backend, `⏎` attaches, `/` filters the log, `q` quits.
 
-A pod supports **many concurrent sessions** — `vpctl shell` attaches another independent
+#### Handoff, not nesting
+
+`⏎` does not render a terminal inside a pane. It **leaves the alt-screen, restores the
+terminal to exactly what the program expects, attaches raw, and redraws on detach** — what
+`lazygit` does with `$EDITOR`.
+
+This is deliberate, and it is the reason the TUI is a cockpit rather than a multiplexer.
+Running Claude Code inside a homemade multiplexer means nested alt-screens, mouse reporting
+fighting mouse reporting, bracketed paste arriving mangled, and resize storms — a large
+budget spent reimplementing tmux badly, and a *worse* `claude` at the end of it. Handoff
+costs a tenth of the work, has none of those failure modes, and gives up only side-by-side
+panes, which tmux already provides for anyone who wants them.
+
+The detach key therefore belongs to the **session**, not the TUI: swallowing keystrokes that
+Claude Code wants is exactly the failure being avoided. `ctrl-\` is unclaimed by all three
+agents.
+
+A pod supports **many concurrent sessions** — `vp shell` attaches another independent
 terminal to a running pod, `docker exec -it` style. Each session has its own cwd and its
-own executor pin.
+own backend.
 
 ### The tree
 
-`vpctl tree` is the one view nothing else can produce. `pstree` stops at the machine
-boundary; the exec gate sees every `execve` with its routing decision, so here **the
-machine is a column**. It renders the pod's whole structure — what is mounted from where,
-and what is executing where — and replaces a separate `vpctl mounts`.
+`vp tree` is the one view nothing else can produce. `pstree` stops at the machine
+boundary; vibepod knows every session's backend and every command it dispatched, so here
+**the machine is a column**. It renders the pod's whole structure — what is mounted from where,
+and what is executing where — and replaces a separate `vp mounts`.
 
 ```
-$ vpctl tree work
-work · running 3m12s · exec: auto
+$ vp tree work
+work · running 3m12s · 2 sessions
 
 mounts
 ├─ /srv/api         ← prod:/srv/api       fuse  rw   8ms  ✓
@@ -547,7 +696,7 @@ exec
 │  └─ claude                              pod      3m12s
 │     ├─ (47 completed)                            1m02s
 │     └─ cargo test                       prod     12.4s  ●
-└─ session 2  (vpctl shell)
+└─ session 2  (vp shell)
    └─ zsh                                 pod      8m40s
       └─ python train.py                  gpu-box  1m04s  ●
 ```
@@ -559,23 +708,24 @@ The two halves are deliberately in one view: **the mount tree explains the exec 
 Sessions are the roots, since a pod has several. Completed subtrees collapse to a count —
 an hour of agent work is hundreds of execs, and an uncollapsed tree is unreadable.
 
-**Remote depth.** We gate execs in the pod, not on prod, so a routed command is a **leaf**:
-the `rustc` and `ld` that `cargo` spawns on prod are invisible. `vpctl tree -x` polls
+**Remote depth.** We know what we dispatched, not what it spawned, so a dispatched command
+is a **leaf**:
+the `rustc` and `ld` that `cargo` spawns on prod are invisible. `vp tree -x` polls
 `ps --ppid` over the warm mux to expand a remote subtree on demand, marked as polled and
 approximate. Honest by default, deep when asked.
 
 **One data source, three renderings.** The daemon emits a single event stream (exec start,
-exec exit); the console pane, `vpctl tree -f`, and `vpctl log -f` are all subscribers.
-Collection is solved by the exec gate — this is only a rendering problem.
+exec exit); the TUI's activity pane, `vp tree -f`, and `vp log -f` are all subscribers.
+Collection is solved by the dispatching shell — this is only a rendering problem.
 
 ```
-vpctl tree --json                 # frugal: live in full, completed as counts
-vpctl tree --json --all           # everything the daemon knows
-vpctl tree --json -f              # NDJSON, one event per line
-vpctl tree --running              # what is still alive
-vpctl tree --failed --since 10m   # what broke recently
-vpctl tree 412                    # one subtree
-vpctl tree --mounts | --exec      # one half
+vp tree --json                 # frugal: live in full, completed as counts
+vp tree --json --all           # everything the daemon knows
+vp tree --json -f              # NDJSON, one event per line
+vp tree --running              # what is still alive
+vp tree --failed --since 10m   # what broke recently
+vp tree 412                    # one subtree
+vp tree --mounts | --exec      # one half
 ```
 
 **Agent-facing output is frugal by default.** The human view collapses completed subtrees
@@ -583,7 +733,7 @@ for readability; `--json` collapses them for context budget — an hour of agent
 hundreds of execs, and a complete tree is tens of kilobytes spent on `rustc` invocations
 nobody asked about. `--all` is there when something is genuinely parsing it.
 
-Note that plain `vpctl tree` is already a fine agent interface, and a cheaper one — JSON
+Note that plain `vp tree` is already a fine agent interface, and a cheaper one — JSON
 costs roughly twice the tokens for the same facts:
 
 ```
@@ -605,35 +755,40 @@ object per line, tailable, composable:
 `"v": 1` matters more than it looks: the moment an agent parses this it is an API, and it
 will outlive several rounds of the tree's visual layout.
 
-`vpctl log` and `vpctl tree` pair rather than overlap: **log is flat, chronological,
+`vp log` and `vp tree` pair rather than overlap: **log is flat, chronological,
 finished; tree is hierarchical, live, running.**
 
 ### The in-pod control plane
 
-The agent runs *inside* the pod, where `vpctl` reaches the daemon through a socket bound
+The agent runs *inside* the pod, where `vp` reaches the daemon through a socket bound
 into the namespace. That socket is a control plane, and reading is not the same as writing.
 
 | | pod socket | host socket |
 |---|---|---|
-| `tree`, `log`, `ps`, `where` | ✓ | ✓ |
-| `use` (own session only) | ✓ *if the session has a tty* | ✓ |
-| `down`, `allow`, `up` | ✗ | ✓ |
+| `tree`, `log`, `ps`, `where`, `hosts`, `backend` | ✓ | ✓ |
+| `use` (own session only) | ✓ | ✓ |
+| `mount`, `unmount` | ✓ *allowlisted hosts only* | ✓ |
+| `down`, `save`, `up` | ✗ | ✓ |
 
-The tty gate on `use` is the important one. Without it **the agent can re-route itself** —
-pin its own execution to a machine cwd would never have chosen, granting itself a
-capability you did not give it. With it, you can still pin from `vpctl shell`, because a
-human at a terminal has one and an agent's subprocess does not. A config flag opens it
-deliberately for the cases that want it.
+v1 put a tty check on `use`, reasoning that an agent must not re-route itself. **v2 drops
+that**, because in v2 an agent choosing its own backend is the entire interface — it is how
+work reaches gpu03 at all. What was a privilege is now the mechanism, and the thing it was
+protecting (you not knowing where a command ran) is handled instead by the backend being
+explicit, per-session, and on screen.
 
-The tty check is a proxy for intent, not proof of it. It is cheap, it fails closed, and
-the alternative — an explicit grant step — costs a round trip at exactly the moment you
+`mount` is where the real boundary moved, and it is a different kind of boundary: it opens a
+**network path** out of a sandbox built for containment, which no `rm -rf` does. So hosts
+already in your ssh config are allowed, anything else is refused, and with a TUI attached the
+request surfaces as a one-key confirmation. That is a proxy for intent, not proof of it. It is
+cheap, it fails closed, and the alternative — an explicit grant step — costs a round trip at
+exactly the moment you
 are trying to work.
 
 ### Knowing where things ran
 
 Two audiences, two mechanisms.
 
-**You:** `vpctl log -f` is the trust surface. Since the daemon mediates every exec, it can
+**You:** `vp log -f` is the trust surface. Since the daemon mediates every exec, it can
 show the one thing nothing else can — what the agent is doing *and where*. It is a primary
 surface, not a debugging afterthought.
 
@@ -646,7 +801,7 @@ You are in a vibepod. Commands run on the machine that owns their directory:
   ~/Git/proj    → gpu-box  (local files, remote execution)
   ~/Git/notes   → local
 
-Run `vpctl tree --json` to see what is executing and where.
+Run `vp tree --json` to see what is executing and where.
 ```
 
 ### Prompts
@@ -671,7 +826,7 @@ appears if a terminal is attached; otherwise the command fails fast and actionab
 
 ```
 vibepod: rg not available on prod
-         run `vpctl allow toolbin prod` to push it
+         run `vp allow toolbin prod` to push it
 ```
 
 ### Guardrails
@@ -681,13 +836,13 @@ permission system already gates commands, and pattern-matching shell strings for
 is leaky in both directions — false positives block real work, and evasion is trivial.
 The log is the answer.
 
-Non-invasive by default: `VIBEPOD_POD` and `VIBEPOD_TARGET` are exported and a prompt
-snippet is opt-in, rather than rewriting anyone's `PS1`.
+Non-invasive by default: `VIBEPOD_POD`, `VIBEPOD_SESSION` and `VIBEPOD_BACKEND` are
+exported and a prompt snippet is opt-in, rather than rewriting anyone's `PS1`.
 
 ## 10. Detach & reattach
 
 `vibepod` owns the PTY and keeps a scrollback ring buffer (dtach/abduco-style, built in —
-no tmux dependency). Detaching leaves the agent running; `vpctl attach` reconnects and
+no tmux dependency). Detaching leaves the agent running; `vp attach` reconnects and
 replays the buffer. Killing the pod kills everything inside it.
 
 ## 11. Decisions locked
@@ -697,10 +852,10 @@ replays the buffer. Killing the pod kills everything inside it.
 | Pod backend | own user+mount+pid namespace | ~10ms start, no image, reuses host binaries. bubblewrap cannot host this design — see below |
 | Topology | central `vibepod` daemon + per-pod `vpinit` | one socket, one audit log, shared ssh muxes; `vpinit` covers the namespace-lifetime requirement |
 | Privilege | rootless, auto-spawned | credentials are user-owned; root buys nothing and costs the security story |
-| Exec routing | cwd-inferred + `@host` override | no invisible mode state; agents get it right with zero prompting |
-| Interception | seccomp exec gate + lazy bind-shims | agents wrap commands in generated shell scripts; the shell must stay local. Catches bundled and static binaries that `$PATH` shims cannot |
-| Redirect | bind-mount `vpsh` while notify holds the syscall | notify is a gate, not a rewriter; ptrace would break `strace`/`gdb` inside the pod |
-| Sandbox | native `clone` + `pivot_root`, behind an interface | bwrap nests a *second* userns after building the root, so nothing inside can mount — fatal to lazy bind-shims. Measured, not assumed |
+| Exec target | per-session backend; `@host` for one command | the machine is chosen, never guessed. cwd-inference was built, used, and removed — §3 |
+| Dispatch | the pod's `$SHELL`, plus `/vp/bin` wrappers ahead of `PATH` | bypassable by a direct `execve`, and worth it: it catches what agents and humans actually do at a fraction of a seccomp gate's cost, and logs command lines rather than resolved argv |
+| Remote execution | one live shell per session per backend | `cd`, `export`, jobs and job control stop needing emulation, because nothing is emulated. One-`ssh`-per-exec is what made routing untrustworthy |
+| Sandbox | native `clone` + `pivot_root`, behind an interface | bwrap nests a *second* userns after building the root, so nothing inside can mount — and mounting after `up` is required for `vp mount`. Measured, not assumed |
 | Capabilities | `CAP_SYS_ADMIN` to `vpinit` via the ambient set, ambient then cleared | vpinit needs it for the pod's whole life; nothing it spawns gets any |
 | FUSE placement | mounted on the host, bound in | `NoNewPrivs=1` kills setuid `fusermount3`; the agent also cannot tamper with mounts |
 | FS backend | rclone sftp + VFS cache | local-disk re-reads, and a `vfs/forget` hook for execution-aware invalidation |
@@ -711,87 +866,112 @@ replays the buffer. Killing the pod kills everything inside it.
 | Remote footprint | push on demand, prompt first, `toolbin:` pre-authorizes | no speculative installs, no mid-run interruptions once trusted |
 | Pod identity | named, resolved from cwd's `vibepod.yaml` | docker-like when explicit, zero-argument in a project |
 | Path identity | mount at the remote's own absolute path | args forward verbatim; remote tool output stays openable. Shadowing guarded by a deny-list at `up` |
-| Remote-only tools | `remote_tools:`, shimmed into `/vp/bin` ahead of `PATH` | a shim needs a binary to shadow, and the GPU box's own tools are not on your laptop |
+| Remote-only tools | `remote_tools:`, three-line wrappers in `/vp/bin` ahead of `PATH` | the GPU box's tools are not on your laptop, and with no exec gate a wrapper no longer needs a binary to shadow |
 | Host access | explicit allowlist | nothing granted implicitly; the agent cannot read unrelated projects or credentials |
 | Link drops | fail loudly, exit `75` | never silently re-run a partially-applied non-idempotent command |
-| Console | cockpit: status + log + input | a command surface that shows routing, without rebuilding a shell |
-| Navigation | by machine (`vpctl cd @host`), never plain `cd` | path identity makes paths long; a directory can be named `@host`, and a `cd` that guessed would silently change machines |
+| TUI | cockpit plus terminal handoff | dashboard for machines, sessions and the log; selecting a session suspends the TUI and hands the raw terminal over, so Claude Code is never nested inside our alt-screen, mouse reporting or bracketed paste |
+| Navigation | by machine (`vp cd @host`), never plain `cd` | path identity makes paths long; a directory can be named `@host`, and a `cd` that guessed would silently change machines |
 | Prompt | full path plus the machine it runs on | the path is the honest cost of path identity; the machine is what you need before pressing return |
-| Sessions | many per pod | `vpctl shell` attaches independent terminals, `docker exec -it` style |
-| Exec target | `exec_on:` on a mount, session pin overrides | keeps "cwd decides" as the one rule; agents inherit routing with nothing to learn |
+| Sessions | many per pod | `vp shell` attaches independent terminals, `docker exec -it` style |
+| Live config | every `vibepod.yaml` field changeable at runtime; `vp save` snapshots | a config that needs a restart costs you the session and the agent's context to add one machine |
 | Reverse mounts | `expose_to:` on local mounts | "edit locally, run on the big machine" is impossible without them |
-| Visibility | live exec log + generated `CLAUDE.md` | one mechanism per audience; no output annotation to corrupt parsed streams |
-| `vpctl tree` | mounts and exec structure in one view | the mount half explains the exec half; replaces a separate `mounts` command |
-| Remote depth | leaf by default, `-x` polls `ps` | we gate execs in the pod, not on the remote; do not fake fidelity we lack |
-| In-pod scope | read-only, plus own-session `use` behind a tty check | stops the agent re-routing itself while keeping `vpctl shell` usable |
+| Visibility | live exec log + generated `CLAUDE.md` | one mechanism per audience; no output annotation to corrupt parsed streams. The fragment carries more weight in v2: it is how the agent learns `vp` at all |
+| `vp tree` | mounts and exec structure in one view | the mount half explains the exec half; replaces a separate `mounts` command |
+| Remote depth | leaf by default, `-x` polls `ps` | we see what we dispatched, not what it spawned; do not fake fidelity we lack |
+| In-pod scope | read-only, plus own-session `use` and `mount` | the agent moving *its own* backend is the design, not an escape; what it may mount is allowlisted instead |
 | Routed env | forward the caller's delta; never identity, never credentials | blanket forwarding breaks §7's promise and the remote's toolchain; sending nothing fails silently as a broken install |
 | Guardrails | none — the log is the answer | pattern-matching shell strings is leaky both ways; the agent already gates commands |
 | Hosts | ssh_config aliases | inherits ProxyJump/keys/ports for free |
-| Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; ~3ms vpsh startup is negligible against RTT |
+| Cross-machine data | `via: auto \| direct \| host \| copy`, probed at mount time | node-to-node ssh is often firewalled, compute nodes often lack FUSE or sshfs, and `AllowAgentForwarding no` is common — so direct cannot be assumed, and a fallback must be explained rather than time out |
+| Remote credentials | forwarded ssh-agent socket, never a key | lets gpu03 mount gpu05 as you, with nothing stored there and authority that dies with the connection |
+| Names | `vibepod` for the TUI, `vp` for verbs | one is opened, the other is typed constantly; `vpctl` was a mouthful for the common case |
+| Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; process startup is negligible against RTT |
 
 ## 12. Open questions
 
 1. **Sandbox hardening parity** — bwrap has years of hardening (`/proc` masking, device
    allowlists, `--die-with-parent`) that our own root construction must re-derive.
-2. **Seccomp availability** — `TSYNC|TSYNC_ESRCH|NEW_LISTENER` needs Linux 5.7+. What is
-   the floor we support, and does the static-shim fallback carry its weight?
+2. **How much the narrowed log costs in practice** — with the exec gate gone, a bundled
+   binary's direct `execve` is unrecorded, including a destructive one against a mount
+   (§3, *What this costs*). Is the dispatching shell's coverage enough in real sessions, or
+   does something cheaper than seccomp — read-only mounts by default, FUSE-level write
+   logging — have to make up the difference?
 3. **rclone as a dependency** — vendor the binary, require it, or reconsider a custom
    Go FUSE once access patterns are known?
 4. **Reverse mounts to several targets** — `expose_to: [a, b]` needs one transport per
    target. Worth supporting, or is one target per local mount enough?
 5. **`sync` mode implementation** — rsync loop, or a mutagen-style watcher?
-6. **`@host` prefix parsing** — with the shell now local, where does the override live?
+6. **Backend switch mid-command** — a session's live remote shell may be busy when `vp use`
+   or `b` arrives. Queue the switch, refuse it, or open a second shell and leave the first
+   running?
 7. **`host_access` defaults** — ship per-agent presets so the first run is not empty?
 8. **Reverse-mount transport** — sshfs slave over `ssh -R`, rclone serving sftp back
    through the tunnel, or a push-copy? Caching runs the opposite direction here.
 9. **Bind-shim accumulation** — one mount per distinct binary. Is there a ceiling worth
    caring about, and do shims need eviction? Measured in practice: a full Claude Code
    session shims a handful, so this is not urgent.
-10. **Exit status for pod-local commands** — vibepod observes their execs but does not
-   own them, so it never learns what they returned. Worth a `PTRACE_O_TRACEEXIT`-style
-   mechanism, or is "we only report what we know" the right answer?
-11. **Daemon upgrades** — the daemon outlives the binary that spawned it, so after an
+10. **Live-shell recovery** — a session-bound remote shell is state that a link drop
+   destroys. Reopen it silently at the last known cwd, or surface the gap, given §7a's rule
+   about never silently re-running a partially-applied command?
+11. **`vp save` and hand-edited YAML** — writing live state back over a file with comments
+   and ordering the user cares about. Round-trip the comments, write a separate lockfile, or
+   only ever append?
+12. **Daemon upgrades** — the daemon outlives the binary that spawned it, so after an
    upgrade the running one is stale. `doctor` reports the mismatch; should the daemon
    instead hand over, or refuse a client whose build differs?
 
 ## 13. Milestones
 
-**v1 = M0-M2.**
+**v1 = M0-M2, built. v2 = M3-M7, not started.**
 
-- **M0 — the trick works. [done]** bwrap pod, seccomp exec gate, lazy bind-shim redirect, local
-  binds only. Success is running Claude Code inside it and seeing every exec intercepted
-  with cwd tracking intact. This is the riskiest assumption in the design.
-- **M1 — remotes. [done]** Daemon, rclone mount with execution-aware invalidation, cwd routing,
-  warm ControlMaster. Plural structures throughout; one remote exercised end to end.
-  First genuinely useful version.
-- **M2 — lifecycle. [v1 ships here — done]** `vpinit`, detach/attach, PTY buffer, the
-  event stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`.
-- **M3 — real work.** Not started. Credential proxy for a routed `git push`,
-  `toolbin` pushes, port forwards, reverse mounts (`expose_to:`).
-  **`exec_on:` depends on M3 and is a trap until then**: the config accepts it,
-  but without the reverse mount the target cannot see the directory, so it fails
-  at run time rather than at `up`. Either implement `expose_to:` or refuse
-  `exec_on:` at `up` — the current middle is the one thing §9 says not to do.
-- **M4 — polish.** Not started. `expose_to` to several targets, `sync` mode,
-  and the rest of the tree's views from §9: `-x` to expand a remote subtree,
-  `--running`, `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
-  (`doctor` shipped in v1 and has moved out of here.)
+- **M0 — the trick works. [done, then superseded]** Pod, seccomp exec gate, lazy bind-shim
+  redirect, local binds only. It did work: Claude Code ran inside it with every exec
+  intercepted and cwd tracking intact. §3 records why the mechanism was removed anyway —
+  the assumption it validated was the wrong assumption.
+- **M1 — remotes. [done]** Daemon, FUSE mount with execution-aware invalidation, cwd
+  routing, warm ControlMaster. Plural structures throughout; one remote end to end.
+- **M2 — lifecycle. [done — v1 shipped here]** `vpinit`, detach/attach, PTY buffer, the
+  event stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`, `doctor`.
+
+**v2 is a turn, not a continuation.** M3-M5 below assume §3's backend model. They are
+ordered so that each one is usable on its own.
+
+- **M3 — backends.** Not started. Delete the exec gate, `vpsh`-as-shim, the bind-shim
+  machinery and most of `gate.go`. Add: per-session backend state, one live shell per
+  session per backend, the dispatching `$SHELL`, `/vp/bin` wrappers replacing `remote_tools`
+  shims, `vp use` / `vp backend` / `vp @host`. Success is `cd` persisting in an attached
+  gpu03 session, and the log still showing every shelled command.
+  *Net negative lines, which is the point.*
+- **M4 — live config.** Not started. `vp mount` / `vp unmount` into a running pod, a
+  swappable route table, `vp hosts` listing unmounted machines, `vp save`, the mount
+  allowlist. Mechanically cheap — §9 lists the four pieces that already exist — and it is
+  what lets an agent add a machine without losing its own context.
+- **M5 — the TUI.** Not started. The cockpit of §9: machines, sessions, activity, and
+  handoff on `⏎`. `console.go` is the rough draft; the new work is the handoff and the
+  keymap.
+- **M6 — cross-machine.** Not started. `via: auto|direct|host|copy` with the mount-time
+  probe, the forwarded-agent credential proxy, reverse mounts (`expose_to:`), `toolbin`
+  pushes, port forwards. This is where "gpu03's compute on gpu05's data" lands, and the
+  credential proxy finally has a use case worth its complexity.
+- **M7 — polish.** Not started. `expose_to` to several targets, `sync` mode, and the rest
+  of the tree's views from §9: `-x` to expand a remote subtree, `--running`,
+  `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
 
 ### Gaps inside v1's own surface
 
-Things this document specifies and v1 does not do. Each is small; listing them
-is cheaper than rediscovering them.
+Specified here, not built in v1. Two of the three are absorbed by the v2 work above; the
+first is not, and matters more in v2 than it did in v1.
 
-- **The generated `CLAUDE.md` fragment** (§9, and a locked decision in §11).
-  Half of "knowing where things ran" — the half aimed at the agent — was never
-  built. The log serves a human; nothing currently tells the agent, in its own
-  language, that its directories map to machines.
-- **`VIBEPOD_TARGET`** (§9). `VIBEPOD_POD` and `VIBEPOD_SESSION` are exported;
-  the target never was, so a prompt snippet cannot show it without asking.
-- **The `@host cmd` per-command override** (§5, open question 6). `@` ended up
-  naming machines for navigation instead. A one-off override still has no
-  spelling, and `vpctl exec @prod -- cmd` from the §9 command surface does not
-  exist.
+- **The generated `CLAUDE.md` fragment** (§9, and a locked decision in §11). Half of
+  "knowing where things ran" — the half aimed at the agent — was never built. In v1 the
+  agent inherited routing whether it knew or not, so this was a nicety. **In v2 it is the
+  primary mechanism**: with no exec gate, an agent that has not been told about `vp` will
+  simply run everything in the pod, over FUSE, on the wrong machine. Build it in M3, not
+  after.
+- **`VIBEPOD_TARGET`** (§9) — never exported, so a prompt cannot show the target without
+  asking. Becomes `VIBEPOD_BACKEND` and falls out of M3.
+- **The `@host cmd` per-command override** (§5) — `@` ended up naming machines for
+  navigation instead, and the one-off override had no spelling. Specified in M3.
 
 ### Built after the plan
 
@@ -802,7 +982,7 @@ way round. Recorded so the document is not behind the code:
   only on a remote had no way to be routed at all.
 - **`exec.forward_env`** — routed commands were losing the caller's
   environment silently (§3).
-- **Navigation by machine** — `vpctl hosts`, `vpctl where`, `vpctl cd @host`,
+- **Navigation by machine** — `vp hosts`, `vp where`, `vp cd @host`,
   because path identity makes paths too long to type.
 - **Setup progress and explained ssh failures** (§9) — a silent ten-second
   wait on an unreachable host was indistinguishable from a hang.
