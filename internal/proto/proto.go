@@ -46,6 +46,9 @@ const (
 	OpPs      = "ps"
 	OpDown    = "down"
 	OpSession = "session" // attach a terminal and run Argv in the pod
+	OpAttach  = "attach"  // reconnect to a session the daemon is holding
+	OpWinch   = "winch"   // the client's terminal was resized
+	OpDetach  = "detach"  // left running, deliberately
 
 	// generic replies
 	OpOK   = "ok"
@@ -113,6 +116,10 @@ type Msg struct {
 	Src      string `json:"src,omitempty"`
 	Dst      string `json:"dst,omitempty"`
 	ReadOnly bool   `json:"ro,omitempty"`
+
+	AllocPTY bool `json:"alloc_pty,omitempty"`
+	Rows     int  `json:"rows,omitempty"`
+	Cols     int  `json:"cols,omitempty"`
 
 	Pid  int `json:"pid,omitempty"`
 	Sig  int `json:"sig,omitempty"`

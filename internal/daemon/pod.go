@@ -9,10 +9,13 @@ import (
 	"sync"
 	"time"
 
+	"os"
+
 	"vibepod/internal/fs"
 	"vibepod/internal/pod"
 	"vibepod/internal/proto"
 	"vibepod/internal/route"
+	"vibepod/internal/term"
 )
 
 // podState is everything the daemon keeps about one running pod.
@@ -37,14 +40,21 @@ type podState struct {
 
 	rpcMu   sync.Mutex
 	nextID  uint64
-	pending map[uint64]chan *proto.Msg
+	pending map[uint64]chan rpcReply
 }
 
 type session struct {
 	id   string
+	kind string // "console", "shell", "agent"
 	pid  int
 	argv []string
 	done chan int
+
+	master *os.File
+	ring   *term.Ring
+
+	mu      sync.Mutex
+	clients map[*attachment]bool
 }
 
 func newPodState(d *Daemon, name string, p *pod.Pod, t *route.Table, shimAll bool) *podState {
@@ -55,7 +65,7 @@ func newPodState(d *Daemon, name string, p *pod.Pod, t *route.Table, shimAll boo
 		sessions: map[string]*session{},
 		pins:     map[string]string{},
 		execs:    map[int]*execRec{},
-		pending:  map[uint64]chan *proto.Msg{},
+		pending:  map[uint64]chan rpcReply{},
 		stopped:  make(chan struct{}),
 	}
 }
@@ -64,7 +74,7 @@ func newPodState(d *Daemon, name string, p *pod.Pod, t *route.Table, shimAll boo
 // without one is an event.
 func (s *podState) readLoop() {
 	for {
-		m, _, err := s.p.Conn.Recv()
+		m, fds, err := s.p.Conn.Recv()
 		if err != nil {
 			s.d.logf("pod %s: vpinit link closed: %v", s.name, err)
 			s.d.removePod(s.name)
@@ -87,7 +97,9 @@ func (s *podState) readLoop() {
 		delete(s.pending, m.ID)
 		s.rpcMu.Unlock()
 		if ch != nil {
-			ch <- m
+			ch <- rpcReply{msg: m, fds: fds}
+		} else {
+			closeAll(fds)
 		}
 	}
 }
@@ -95,11 +107,26 @@ func (s *podState) readLoop() {
 // call sends a request to vpinit and waits for its reply. Everything it is
 // used for is a local syscall away, so a slow reply means something is wrong
 // rather than merely busy.
+// rpcReply pairs vpinit's answer with any descriptor it handed back.
+type rpcReply struct {
+	msg *proto.Msg
+	fds []int
+}
+
 func (s *podState) call(m *proto.Msg, fds ...int) (*proto.Msg, error) {
+	r, err := s.callFD(m, fds...)
+	if err != nil {
+		return nil, err
+	}
+	closeAll(r.fds)
+	return r.msg, nil
+}
+
+func (s *podState) callFD(m *proto.Msg, fds ...int) (rpcReply, error) {
 	s.rpcMu.Lock()
 	s.nextID++
 	id := s.nextID
-	ch := make(chan *proto.Msg, 1)
+	ch := make(chan rpcReply, 1)
 	s.pending[id] = ch
 	s.rpcMu.Unlock()
 
@@ -108,19 +135,20 @@ func (s *podState) call(m *proto.Msg, fds ...int) (*proto.Msg, error) {
 		s.rpcMu.Lock()
 		delete(s.pending, id)
 		s.rpcMu.Unlock()
-		return nil, err
+		return rpcReply{}, err
 	}
 	select {
 	case reply := <-ch:
-		if reply.Op == proto.OpErr {
-			return nil, fmt.Errorf("%s", reply.Err)
+		if reply.msg.Op == proto.OpErr {
+			closeAll(reply.fds)
+			return rpcReply{}, fmt.Errorf("%s", reply.msg.Err)
 		}
 		return reply, nil
 	case <-time.After(10 * time.Second):
 		s.rpcMu.Lock()
 		delete(s.pending, id)
 		s.rpcMu.Unlock()
-		return nil, fmt.Errorf("vpinit did not answer %q in 10s", m.Op)
+		return rpcReply{}, fmt.Errorf("vpinit did not answer %q in 10s", m.Op)
 	}
 }
 

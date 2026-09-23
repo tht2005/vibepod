@@ -105,8 +105,9 @@ type spawnReq struct {
 }
 
 type spawnRes struct {
-	pid int
-	err error
+	pid    int
+	master *os.File // pty master, when the session asked for a terminal
+	err    error
 }
 
 // mountWorker is pinned to the one thread that keeps CAP_SYS_ADMIN. Every
@@ -131,8 +132,8 @@ func (s *initServer) spawnWorker(ready chan<- error) {
 	}
 	ready <- nil
 	for req := range s.spawns {
-		pid, err := s.doSpawn(req.m, req.fds)
-		req.reply <- spawnRes{pid: pid, err: err}
+		pid, master, err := s.doSpawn(req.m, req.fds)
+		req.reply <- spawnRes{pid: pid, master: master, err: err}
 	}
 }
 
@@ -157,13 +158,19 @@ func (s *initServer) serve() error {
 			reply := make(chan spawnRes, 1)
 			s.spawns <- &spawnReq{m: m, fds: fds, reply: reply}
 			res := <-reply
-			pid, err := res.pid, res.err
 			closeAll(fds)
-			if err != nil {
-				_ = s.conn.Errorf(m.ID, "%v", err)
-			} else {
+			switch {
+			case res.err != nil:
+				_ = s.conn.Errorf(m.ID, "%v", res.err)
+			case res.master != nil:
+				// The daemon keeps the master, which is what lets the session
+				// outlive the terminal that started it.
 				_ = s.conn.Send(&proto.Msg{Op: proto.OpSpawned, ID: m.ID,
-					Pid: pid, Session: m.Session})
+					Pid: res.pid, Session: m.Session}, int(res.master.Fd()))
+				res.master.Close()
+			default:
+				_ = s.conn.Send(&proto.Msg{Op: proto.OpSpawned, ID: m.ID,
+					Pid: res.pid, Session: m.Session})
 			}
 		case proto.OpSignal:
 			_ = syscall.Kill(m.Pid, syscall.Signal(m.Sig))
@@ -177,35 +184,58 @@ func (s *initServer) serve() error {
 // doSpawn starts a process on the caller's own file descriptors. Passing fds
 // rather than copying bytes keeps vpinit out of the data path entirely.
 // It runs only on the capability-free thread; see spawnWorker.
-func (s *initServer) doSpawn(m *proto.Msg, fds []int) (int, error) {
-	if len(fds) < 3 {
-		return 0, fmt.Errorf("spawn needs 3 fds, got %d", len(fds))
-	}
+func (s *initServer) doSpawn(m *proto.Msg, fds []int) (int, *os.File, error) {
 	if len(m.Argv) == 0 {
-		return 0, fmt.Errorf("spawn needs argv")
+		return 0, nil, fmt.Errorf("spawn needs argv")
+	}
+	var master, slave *os.File
+	var files []uintptr
+	if m.AllocPTY {
+		var err error
+		// From the pod's own devpts instance, not the host's.
+		master, slave, err = sys.OpenPTY()
+		if err != nil {
+			return 0, nil, err
+		}
+		defer slave.Close()
+		if m.Rows > 0 && m.Cols > 0 {
+			_ = sys.SetWinsize(master.Fd(), m.Rows, m.Cols)
+		}
+		files = []uintptr{slave.Fd(), slave.Fd(), slave.Fd()}
+	} else {
+		if len(fds) < 3 {
+			return 0, nil, fmt.Errorf("spawn needs 3 fds, got %d", len(fds))
+		}
+		files = []uintptr{uintptr(fds[0]), uintptr(fds[1]), uintptr(fds[2])}
 	}
 	attr := &syscall.ProcAttr{
 		Dir:   m.Cwd,
 		Env:   m.Env,
-		Files: []uintptr{uintptr(fds[0]), uintptr(fds[1]), uintptr(fds[2])},
+		Files: files,
 		Sys:   &syscall.SysProcAttr{Setsid: true},
 	}
-	if m.TTY {
+	if m.TTY || m.AllocPTY {
 		attr.Sys.Setctty = true
 		attr.Sys.Ctty = 0
 	}
 	path, err := lookPath(m.Argv[0], m.Env)
 	if err != nil {
-		return 0, err
+		if master != nil {
+			master.Close()
+		}
+		return 0, nil, err
 	}
 	pid, err := syscall.ForkExec(path, m.Argv, attr)
 	if err != nil {
-		return 0, err
+		if master != nil {
+			master.Close()
+		}
+		return 0, nil, err
 	}
 	s.mu.Lock()
 	s.sessions[pid] = m.Session
 	s.mu.Unlock()
-	return pid, nil
+	return pid, master, nil
 }
 
 // reap collects children. As PID 1 the pod's orphans land here, so this is not

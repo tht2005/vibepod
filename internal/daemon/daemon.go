@@ -89,57 +89,132 @@ func (d *Daemon) shutdown() {
 	d.pool.Close()
 }
 
+// ctlConn is one client connection. It keeps reading while a session is
+// attached, because a window resize or a detach arrives on this same socket
+// and must not queue behind the session it is about.
+type ctlConn struct {
+	d    *Daemon
+	c    *proto.Conn
+	host bool // false for connections that arrived on a pod socket
+
+	mu   sync.Mutex
+	sess *session
+}
+
 // handle serves one client. host is false for connections arriving on a pod
 // socket, which is what enforces the capability split in DESIGN.md §9: the
 // agent can look, but it cannot steer.
 func (d *Daemon) handle(c *proto.Conn, host bool) {
-	defer c.Close()
+	(&ctlConn{d: d, c: c, host: host}).serve()
+}
+
+func (k *ctlConn) serve() {
+	defer k.c.Close()
 	for {
-		m, fds, err := c.Recv()
+		m, fds, err := k.c.Recv()
 		if err != nil {
 			closeAll(fds)
 			return
 		}
-		if !host && !readOnlyOp(m.Op) {
+		if !k.host && !readOnlyOp(m.Op) {
 			closeAll(fds)
-			_ = c.Errorf(m.ID, "%q is not permitted from inside a pod", m.Op)
+			_ = k.c.Errorf(m.ID, "%q is not permitted from inside a pod", m.Op)
 			continue
 		}
+		d := k.d
 		switch m.Op {
 		case proto.OpUp:
-			d.reply(c, m, d.up(m))
+			d.reply(k.c, m, d.up(m))
 		case proto.OpPs:
-			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Pods: d.ps()})
+			_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Pods: d.ps()})
 		case proto.OpDown:
-			d.reply(c, m, d.down(m.Pod))
+			d.reply(k.c, m, d.down(m.Pod))
 		case proto.OpLog:
-			d.streamLog(c, m)
+			d.streamLog(k.c, m)
 		case proto.OpTree:
 			t, err := d.treeOf(m)
 			if err != nil {
-				_ = c.Errorf(m.ID, "%v", err)
+				_ = k.c.Errorf(m.ID, "%v", err)
 			} else {
-				_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Tree: t})
+				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Tree: t})
 			}
-		case proto.OpSession:
-			code, err := d.session(m, fds)
-			closeAll(fds)
-			if err != nil {
-				_ = c.Errorf(m.ID, "%v", err)
-			} else {
-				_ = c.Send(&proto.Msg{Op: proto.OpExit, ID: m.ID, Code: code})
+		case proto.OpSession, proto.OpAttach:
+			go k.runSession(m, fds)
+		case proto.OpWinch:
+			k.mu.Lock()
+			sess := k.sess
+			k.mu.Unlock()
+			if sess != nil {
+				sess.resize(m.Rows, m.Cols)
 			}
 		default:
 			closeAll(fds)
-			_ = c.Errorf(m.ID, "unknown op %q", m.Op)
+			_ = k.c.Errorf(m.ID, "unknown op %q", m.Op)
 		}
 	}
 }
 
-// readOnlyOp is the capability split of DESIGN.md §9, enforced by which
-// socket the connection arrived on. An agent inside a pod may look at
-// anything; it may not steer. In particular it may not re-route itself,
-// which would grant it a machine its directory would never have chosen.
+// runSession starts or rejoins a terminal session and stays with it until it
+// ends or the user detaches.
+func (k *ctlConn) runSession(m *proto.Msg, fds []int) {
+	files := adopt(fds)
+	defer closeFiles(files)
+	if len(files) < 3 {
+		_ = k.c.Errorf(m.ID, "a session needs stdin, stdout and stderr")
+		return
+	}
+	s, err := k.d.lookup(m.Pod)
+	if err != nil {
+		_ = k.c.Errorf(m.ID, "%v", err)
+		return
+	}
+	// Without a terminal there is nothing to detach from, so the process runs
+	// directly on the caller's own descriptors and the daemon stays out of
+	// the data path entirely.
+	if m.Op == proto.OpSession && !m.TTY {
+		code, err := k.d.runDirect(s, m, fds)
+		if err != nil {
+			_ = k.c.Errorf(m.ID, "%v", err)
+			return
+		}
+		_ = k.c.Send(&proto.Msg{Op: proto.OpExit, ID: m.ID, Code: code})
+		return
+	}
+
+	var sess *session
+	if m.Op == proto.OpAttach {
+		sess, err = s.findSession(m.Session)
+	} else {
+		sess, err = s.startSession(m, sessionKind(m))
+	}
+	if err != nil {
+		_ = k.c.Errorf(m.ID, "%v", err)
+		return
+	}
+	k.mu.Lock()
+	k.sess = sess
+	k.mu.Unlock()
+
+	code, detached := sess.attach(files[0], files[1])
+	k.mu.Lock()
+	k.sess = nil
+	k.mu.Unlock()
+	if detached {
+		_ = k.c.Send(&proto.Msg{Op: proto.OpDetach, ID: m.ID, Session: sess.id})
+		return
+	}
+	s.endSession(sess)
+	_ = k.c.Send(&proto.Msg{Op: proto.OpExit, ID: m.ID, Code: code,
+		Session: sess.id})
+}
+
+func sessionKind(m *proto.Msg) string {
+	if m.Session == "console" {
+		return "console"
+	}
+	return "shell"
+}
+
 func readOnlyOp(op string) bool {
 	switch op {
 	case proto.OpPs, proto.OpLog, proto.OpTree:
@@ -327,21 +402,14 @@ func (d *Daemon) lookup(name string) (*podState, error) {
 	return s, nil
 }
 
-// session runs a process in the pod on the client's own file descriptors, so
-// the daemon never sits in the data path.
-func (d *Daemon) session(m *proto.Msg, fds []int) (int, error) {
-	s, err := d.lookup(m.Pod)
-	if err != nil {
-		return 0, err
-	}
-	if len(fds) < 3 {
-		return 0, fmt.Errorf("a session needs stdin, stdout and stderr")
-	}
+// runDirect runs a process in the pod on the client's own file descriptors,
+// so the daemon never sits in the data path.
+func (d *Daemon) runDirect(s *podState, m *proto.Msg, fds []int) (int, error) {
 	id := m.Session
 	if id == "" {
 		id = fmt.Sprintf("s%d", time.Now().UnixNano()%100000)
 	}
-	sess := &session{id: id, argv: m.Argv, done: make(chan int, 1)}
+	sess := &session{id: id, kind: "run", argv: m.Argv, done: make(chan int, 1)}
 	s.mu.Lock()
 	s.sessions[id] = sess
 	s.mu.Unlock()

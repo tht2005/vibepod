@@ -10,13 +10,15 @@ import (
 
 	"vibepod/internal/config"
 	"vibepod/internal/proto"
+	"vibepod/internal/term"
 )
 
 const usage = `vpctl - run your agent here, run its commands where the code lives
 
   vpctl up [name]              create a pod, detached
   vpctl run [name] -- cmd...   run a command in a pod, creating it if needed
-  vpctl shell [name]           an interactive shell in a pod
+  vpctl shell [name]           another terminal on a running pod
+  vpctl attach [name] [sess]   return to a session you detached from
   vpctl ps                     running pods
   vpctl log [-f] [pod]         every command and the machine it ran on
   vpctl tree [pod]             mounts and live execs, in one view
@@ -38,7 +40,9 @@ func runCtl(args []string) int {
 	case "run":
 		return cmdRun(args[1:])
 	case "shell":
-		return cmdRun(append([]string{"--"}, shellArgs(args[1:])...))
+		return cmdShell(args[1:])
+	case "attach":
+		return cmdAttach(args[1:])
 	case "ps":
 		err = cmdPs()
 	case "log":
@@ -63,12 +67,13 @@ func runCtl(args []string) int {
 	return 0
 }
 
-func shellArgs(args []string) []string {
-	sh := os.Getenv("SHELL")
-	if sh == "" {
-		sh = "/bin/sh"
+// ensureUp creates the pod if it is not already running.
+func ensureUp(c *proto.Conn, m *proto.Msg) error {
+	if _, err := call(c, m); err != nil &&
+		!strings.Contains(err.Error(), "already running") {
+		return err
 	}
-	return append(args, sh)
+	return nil
 }
 
 // loadSpec turns the project config into an up request.
@@ -170,19 +175,30 @@ func cmdRun(args []string) int {
 		return 1
 	}
 	defer c.Close()
-	if _, err := call(c, m); err != nil &&
-		!strings.Contains(err.Error(), "already running") {
+	if err := ensureUp(c, m); err != nil {
 		fmt.Fprintln(os.Stderr, "vpctl:", err)
 		return 1
 	}
-	reply, err := call(c, &proto.Msg{
+	sess := &proto.Msg{
 		Op:   proto.OpSession,
 		Pod:  m.Spec.Name,
 		Argv: rest,
 		Env:  os.Environ(),
 		Cwd:  podCwd(m.Spec.Binds),
-		TTY:  false,
-	}, 0, 1, 2)
+	}
+	// On a terminal, run it on a pty the daemon owns, so it can be detached
+	// from and come back to. Piped, run it directly on the caller's own
+	// descriptors: there is nothing to detach from, and a pty would merge
+	// stdout with stderr, which agents read separately.
+	if term.IsTTY(os.Stdin) {
+		code, err := attachClient(c, sess)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "vpctl:", err)
+			return 1
+		}
+		return code
+	}
+	reply, err := call(c, sess, 0, 1, 2)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "vpctl:", err)
 		return 1
