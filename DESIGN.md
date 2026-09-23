@@ -6,7 +6,8 @@
 > cannot be made trustworthy, so v2 replaces it with an explicit per-session
 > **backend** and a live shell on it (§3), adds runtime mounting (§9), makes the
 > TUI the primary surface, and solves compute-on-one-machine/data-on-another by
-> reproducing paths on the compute node rather than translating them (§6). PLAN.md records what was measured before building
+> running a pod on **every** backend so the composed tree is uniform everywhere
+> (§6a) rather than translating paths. PLAN.md records what was measured before building
 > v1 and the six bugs verification found. §13 has the v2 milestones; §12 the
 > remaining unknowns.
 
@@ -28,9 +29,13 @@ A *pod* is a local namespace that composes three planes:
 
 | Plane | What it does | Where it lives |
 |---|---|---|
-| **Composition** | unify local dirs + remote dirs into one filesystem view | pod mount namespace |
-| **Identity** | agent config, skills, MCP, API keys | bound from host, never crosses the wire |
-| **Execution** | run a command on the machine you chose | per-session backend |
+| **Composition** | unify local dirs + remote dirs into one filesystem view | **replicates** — the same tree in a pod on every machine (§6a) |
+| **Identity** | agent config, skills, MCP, API keys | **never leaves this machine.** Bound into the local pod only |
+| **Execution** | run a command on the machine you chose | per-session backend: which pod the shell lives in |
+
+Those three rules are the design, and they compress to one sentence:
+
+> **One namespace, replicated on N machines. The agent lives in exactly one of them.**
 
 Planes 1 and 2 are plumbing. Plane 3 is the product.
 
@@ -244,7 +249,7 @@ interactive programs. This is the same line that separates the two dispatch path
 | `vibepod` | rootless user daemon, auto-spawned on first use. Owns everything long-lived |
 | `vpinit` | PID 1 inside each pod. Holds the mount namespace open, performs every pod mount on its one capable thread — including mounts added long after `up` — reaps zombies, forwards signals |
 | `vpsh` | the pod's `$SHELL`. Records the command line, then runs it locally or writes it into the session backend's live shell |
-| `vpnode` | the same binary on a *compute node*, pushed on consent. Builds a session-private userns so the pod's paths exist there verbatim (§6), and supervises that node's rclone cache |
+| `vpnode` | `vpinit` on a *backend machine*, pushed on consent: the node's pod. Builds the same composed tree over that node's own system layer, supervises its rclone cache, holds a renewable lease so a job survives a disconnect (§6a) |
 
 `vpinit` exists because **a mount namespace only survives while a process is inside it.**
 Without it, detaching would destroy the pod.
@@ -268,9 +273,10 @@ over mount owner over `exec.default` — existed only because the machine was be
 lives on gpu03") rather than a rule that acts on its own — which also disarms the trap where
 `exec_on:` could be accepted at `up` and only fail at run time.
 
-**A backend that cannot see the cwd is refused at dispatch**, naming both sides, instead of
-silently running where that path means something else. The exception is a configured
-cross-mount, below.
+Because every backend runs a pod with the same composed tree (§6a), a backend can see the cwd
+by construction — the question "does gpu05 have this path" stops being asked at dispatch time.
+What is still refused, naming both sides, is a cwd under a mount that node does not yet hold
+at the current generation: staleness costs a visible refusal, never a wrong path.
 
 ### Multiple hosts
 
@@ -431,7 +437,7 @@ cannot see the path, and **the dispatch is refused with both sides named**.
 
 A reverse mount is **the same problem as the next section with the origin changed**: some
 machine must see a directory it does not own, at the path the pod uses. So it uses the same
-mechanism — `vpnode` reproduces the path in a session-private userns and rclone serves the
+mechanism — the node's pod carries the path in its composed zone (§6a) and rclone serves the
 bytes with a local-disk cache — and the only difference is that the origin is this machine
 rather than another remote, which means the served side is the one behind a home uplink.
 That asymmetry is why the cache matters more here: the *remote's* reads are the network
@@ -468,53 +474,17 @@ for.** Introducing a second one would be indefensible. It also breaks the proper
 identity was bought for: if gpu05's traceback prints `/tmp/vp-abc/gpu03/remote/vast0/...`,
 you cannot paste it into an editor.
 
-#### Reproduce the path instead: the remote gets a pod too
+#### Reproduce the path instead: every machine runs a pod
 
-vibepod already knows how to build a user namespace with arbitrary paths arranged at
-arbitrary locations. That is what a pod *is*. Running the same construction on the compute
-node makes the problem disappear. Once per session, on gpu05:
+vibepod already knows how to build a namespace with arbitrary paths arranged at arbitrary
+locations. That is what a pod *is*. So the answer is not to arrange one path per command on
+the compute node — it is for **the compute node to run a pod too**, with the same composed
+tree. §6a is that design; the rest of this section is what flows through it.
 
-```
-rclone mount --vfs-cache-mode full   ~/.vp/raw/<id>     # gpu05's root ns, unprivileged
-unshare(CLONE_NEWUSER|CLONE_NEWNS)                      # a session-private namespace
-bind  ~/.vp/raw/<id> → /remote/vast0/duongnguyen/proj   # the exact path the pod uses
-exec the session's shell inside it
-```
-
-The FUSE placement repeats a lesson §6 already learned locally: mount rclone in the node's
-**root** namespace, where `fusermount3` is setuid and works, then bind it into the namespace.
-A bind mount inside a userns needs no privilege — it is what the pod does today — and it may
-land on a path that already exists on gpu05 without disturbing it, because the namespace is
-private to that session.
-
-What this buys is worth stating plainly: **the same absolute path in the pod, on gpu03, and
-on gpu05.** No rewriting anywhere, tracebacks from any machine openable in your editor, and
-a Makefile on gpu03 that hardcodes `/remote/vast0/...` keeps working. It is per *session*,
-not per command, so it fits the live-shell model of §3 exactly: arranged once, then every
-command in that session simply runs.
-
-#### Fallback: a uniform prefix, decided at `up`
-
-Unprivileged user namespaces are usually available and sometimes administratively disabled.
-Where they are, the fallback is **not** translation. It is to mount everything — in the pod
-*and* on every machine — at a prefix any user can create anywhere:
-
-```
-~/.vp/<pod>/<name>/...
-```
-
-Identical everywhere by construction, no privilege, no rewriting. The honest cost, and the
-reason this is the fallback rather than the default: absolute paths in existing remote
-scripts and configs stop resolving, including the remote's own. This is chosen at `up`,
-reported at `up`, and never switched underneath a running session.
-
-#### The marker file
-
-Underneath both modes, each mount carries a marker (`.vp/<pod>-<mount-uuid>`). The
-dispatcher stats it on the backend once per mount+backend pair and caches the result.
-Present means these are our bytes; absent means refuse, naming both sides. One round trip
-per pair, and it is what separates "already on shared storage, go ahead" from "gpu05 has a
-same-named directory, stop".
+The safety consequence is the reason it is worth the machinery. A node pod's composed paths
+are ones vibepod placed, so gpu05's *own* `/remote/vast0/...` is not in the namespace at all
+unless we put it there. The same-string-different-bytes catastrophe stops being something to
+detect and becomes something that cannot be expressed.
 
 #### Writes: cached on local disk, written back on close
 
@@ -572,6 +542,145 @@ Link drop with open fds yields stale handles and `EIO`; the daemon remounts and 
 (§7a). Buffered writes lost to a drop can leave a partial file. Log directories and other
 read-only sources should be mounted `readonly: true`.
 
+## 6a. The replicated tree
+
+**Every backend runs a pod.** Your machine runs one, gpu03 runs one, gpu05 runs one, and all
+of them present the same composed filesystem. A *backend* (§3) is therefore which pod your
+session's shell lives in, and the model is one sentence:
+
+> One namespace, replicated on N machines. The agent lives in exactly one of them.
+
+This is smaller than what it replaces, and it is mostly existing code aimed at another
+machine: `buildRoot`, `pivot_root` and `vpinit` already do this once. `vpnode` is `vpinit`
+with the identity plane omitted.
+
+### What replicates, and what must not
+
+§2's three planes turn out to have different replication rules, which is the whole design:
+
+| plane | rule |
+|---|---|
+| **Composition** | replicates — identical on every node, in config order |
+| **Identity** | **never leaves this machine.** Credentials, agent config, MCP, keys. Node pods are filesystem-uniform and identity-free |
+| **Execution** | per-session: which pod the shell is in |
+
+Within composition, uniformity is scoped, and the scope matters:
+
+- **The composed zone** — every mount named in config. Identical on every node, same paths,
+  same order. This is the guarantee.
+- **The system layer** — `/usr`, `/lib`, `/opt`, `/etc`, `/dev`. The node's **own**, and
+  necessarily different, because that difference is the reason to dispatch at all. gpu05's
+  `/opt/rocm`, `/dev/kfd` and its driver libraries are precisely what this machine does not
+  have. `remote_tools: [rocm-smi, rocminfo, hipcc]` exists because of that difference.
+
+Making the system layer uniform would mean installing a userspace on every server and losing
+the node's own toolchain — the thing §1 exists to avoid. So it stays per-node, and a node pod
+is built as **the node's own system layer with the composed zone applied over it**, not as a
+minimal root. On this machine the pod is minimal because it contains an agent and containment
+is the point; on a node there is no agent to contain and a toolchain to preserve. The
+asymmetry is deliberate.
+
+What can be checked instead of imposed: a mount may declare what the machine running it needs.
+
+```yaml
+  - remote: gpu03:/remote/vast0/duongnguyen/proj
+    requires: [/opt/rocm, /dev/kfd]    # a node lacking these is refused at `up`
+```
+
+That converts "is this node actually equivalent?" from a thing you find out when a job fails
+into a thing `up` answers.
+
+### Order is part of the state
+
+Mount order decides shadowing: with mounts at `/a` and `/a/b`, order decides what is visible.
+So the desired state is an ordered **list**, not a set, and every node applies it in the same
+order.
+
+Inserting into the middle of that list on a live node would mean unmounting and remounting
+everything above the insertion point — churn at exactly the moment something is running in
+those paths. So **runtime mounts append**. Order is insertion order: identical everywhere,
+reproducible from the file, and undisturbed by removals. Reordering is a config-time
+operation that needs `up`, and `vp save` writes the resulting order back.
+
+A runtime mount that would shadow an existing one is **refused, with both paths named** —
+the same guard the systemPaths deny-list already applies at `up`.
+
+### Keeping the tree the same: reconcile, do not transact
+
+The composed tree mutates at runtime (§9), so it is replicated mutable state. That makes this
+a small control plane, and the shape is a reconciler:
+
+- Desired state is the ordered mount list, each entry with a monotonic **generation**.
+- Each node pod reports the `(mount, generation)` pairs it currently holds.
+- A change bumps the generation and pushes; each node converges independently; a node that
+  was unreachable applies the diff when it returns.
+- **Dispatch is the guard.** A command whose cwd resolves into a mount the target node does
+  not hold at the current generation is refused, naming both sides. Staleness therefore
+  cannot cause a wrong-path execution — it can only cause a visible refusal.
+
+Two-phase commit is the obvious alternative and is rejected: one unreachable node would block
+every mount change, and it blocks on participants that may never return. Best-effort push
+with no tracking is rejected for the opposite reason — it produces exactly the silent
+divergence this section exists to prevent.
+
+**Staleness is tracked per mount, not per node.** If gpu08 missed a new mount, commands there
+under *other* mounts are still correct and keep working; refusal is scoped to the paths
+actually affected. It is a map lookup, not extra machinery, and it is the difference between
+one missed mount costing a path and costing a machine. `vp ps` and the TUI show which nodes
+are behind and on what.
+
+### Disconnection
+
+Three different failures, deliberately handled differently.
+
+**Deliberate unmount.** Write-back caching (§6) means a node may hold dirty data on its local
+disk, so unmount is two-phase: **flush, verify clean, then unmount** everywhere, then drop
+from desired state. If the flush cannot complete because the origin is unreachable, the
+unmount is **refused and names what is dirty**. Silently discarding a checkpoint would be the
+worst bug this system could have.
+
+**A link drop to a node.** There is a real tension here and no way to dodge it: dying with
+the ssh channel kills an eight-hour training run when a laptop lid closes, and surviving
+forever leaks namespaces, rclone processes and caches onto someone else's shared node.
+
+A **lease** resolves it. `vpnode` renews while connected and survives disconnection for the
+lease duration; on expiry it flushes what it can, unmounts, and exits. Reconnect reattaches
+with output replayed from a ring buffer on the node — which is §10's detach/reattach design
+running one level out, the same as everything else in this section.
+
+**This machine dying.** Node pods outlive the daemon under the lease, so the next `up` of the
+same pod **adopts** them: find the lease handle on the node, reattach, do not start fresh. A
+training run survives a reboot, which for the use case driving this design matters more than
+almost anything else here. Adoption checks the build, because a mismatched `vpnode` is the
+stale-daemon bug already paid for once.
+
+### What this deletes
+
+Worth recording, because the design got smaller:
+
+- **The uniform-prefix fallback.** A node pod can place `/remote/vast0/...` wherever it likes,
+  so nothing forces a `~/.vp/<pod>/...` compromise and the remote's own absolute paths never
+  stop resolving.
+- **`compute_on:`** — when every node has the tree, there is no per-mount declaration of who
+  needs to see what. It survives only as an optional prefetch hint.
+- **The marker file as a safety guard.** It stays as a cheap sanity check that rclone attached
+  where it was told, but the catastrophe it defended against is now inexpressible.
+
+### What it costs
+
+- **Unprivileged user namespaces become mandatory on every backend**, with no fallback: no
+  pod means no path guarantee and no collision safety, so the machine cannot be a backend.
+  `doctor` names the sysctl and what to ask an administrator for. §12's question about how
+  often this is disabled stops being academic.
+- **This is a distributed system now.** Generations, reconciliation, leases and adoption are
+  a control plane, and the failure modes are the ones control planes have. §13 sequences it
+  so a single-node pod works before any of it is built.
+- **Mount count × machines.** One `rclone rcd` per node pod manages many mounts in one
+  process, and mounts materialise on first use rather than at `up` — the tree is a guarantee,
+  not an eager allocation. That rc API is the same one §6 already wanted for `vfs/forget`.
+- **First-use latency** per node: a second or two cold (ssh, push binaries, rclone,
+  namespace), a few hundred milliseconds warm. Per backend, not per command.
+
 ## 7. Security model
 
 **What never leaves your machine**
@@ -623,9 +732,14 @@ When an SSH link drops mid-command, the command **fails loudly** with a reserved
 code (`75`, `EX_TEMPFAIL`) and a clearly-vibepod error on stderr. The daemon reconnects
 in the background so the next command succeeds.
 
-It does not silently retry. A routed `make deploy` or migration that already partially
+It does not silently retry. A dispatched `make deploy` or migration that already partially
 executed must not be re-run behind the agent's back — a visible failure the agent can
 reason about is strictly better than a half-applied change it never learns about.
+
+A dropped link to a **backend** is a different event, because the node pod and whatever it is
+running are still alive over there. That is handled by the lease in §6a — survive the blip,
+reattach with replayed output, and tear down only when the lease expires — so a long job is
+not collateral damage of a closed laptop lid.
 
 ## 8. Config
 
@@ -658,10 +772,10 @@ mounts:
     at: /staging-api               # explicit override required
   - remote: gpu03:/remote/vast0/duongnguyen/imagenet
     readonly: true
-    compute_on: [gpu05]            # gpu05 must see this at the same path (§6)
-    via: auto                      # direct | relay; auto probes and reports
-    cache: 200G                    # on the compute node's local disk
-    prefetch: true                 # many small files: copy up front, do not warm lazily
+    requires: [/opt/rocm, /dev/kfd]  # a backend lacking these is refused at `up` (§6a)
+    via: auto                        # direct | relay; auto probes and reports
+    cache: 200G                      # on each node's own local disk
+    prefetch: true                   # many small files: copy up front, don't warm lazily
 
 remote_tools:                      # exist only on a remote; shimmed in /vp/bin
   - rocm-smi                       # ahead of PATH, since nothing here to shadow
@@ -677,9 +791,8 @@ can_mount:                         # what `vp mount` may reach from inside the p
   - "gpu*"                         # default: any host in your ssh config
   - lab-7
 
-paths: identity                    # or `uniform` (~/.vp/<pod>/...) where a compute
-                                   # node has unprivileged userns disabled. Probed at
-                                   # `up` and reported; never switched mid-session.
+lease: 24h                         # how long a node pod outlives a lost connection
+                                   # before it flushes, unmounts and exits (§6a)
 
 exec:
   default: pod                     # the backend a new session opens on
@@ -998,9 +1111,15 @@ replays the buffer. Killing the pod kills everything inside it.
 | Routed env | forward the caller's delta; never identity, never credentials | blanket forwarding breaks §7's promise and the remote's toolchain; sending nothing fails silently as a broken install |
 | Guardrails | none — the log is the answer | pattern-matching shell strings is leaky both ways; the agent already gates commands |
 | Hosts | ssh_config aliases | inherits ProxyJump/keys/ports for free |
-| Cross-machine paths | reproduce the path in a session-private userns on the compute node | translating paths at run time misses config files, run-time-built paths and paths handed to later jobs — the same unbounded leak list §3 deleted the gate for. Reproducing costs one `unshare` per session and nothing after |
-| Path fallback | uniform `~/.vp/<pod>/...` prefix everywhere, chosen at `up` | where userns is disabled the answer is still not translation. Cost stated: the remote's own absolute paths stop resolving |
-| Same-name safety | a marker file per mount, checked once per mount+backend pair | a compute node holding a *same-named different* directory is the failure that loses work silently; one cached stat rules it out |
+| Cross-machine paths | **every backend runs a pod** with the same composed tree (§6a) | translating paths at run time misses config files, run-time-built paths and paths handed to later jobs — the same unbounded leak list §3 deleted the gate for. A node pod places the path instead, so a node's own same-named directory is not in the namespace and the catastrophe is inexpressible rather than detected |
+| Uniformity scope | composed zone identical everywhere; system layer is the node's own | the system layer *must* differ — gpu05's ROCm and `/dev/kfd` are why you dispatch there. Uniform userspace would mean installing one per server, which §1 exists to avoid. `requires:` checks equivalence instead of imposing it |
+| Node root | the node's own system layer, composed zone over it | the local pod is minimal because it holds an agent; a node holds a toolchain and no agent. A minimal root on a GPU box hides the GPUs, and that failure reads as "ROCm is broken" |
+| Tree consistency | per-mount generations, reconcile on reconnect | 2PC lets one dead node block every mount change; best-effort push produces silent divergence. Dispatch refuses a stale mount, so staleness costs a visible refusal, never a wrong path |
+| Staleness grain | per mount, not per node | one missed mount should cost a path, not a machine; unrelated sessions on that node stay correct |
+| Runtime mount order | append-only; reorder needs `up` | order decides shadowing, so it is part of the state. Inserting mid-list would remount everything above it while work is running in those paths |
+| Backend disconnect | renewable lease, then flush + unmount; adopt on reconnect | dying with the ssh channel kills an 8-hour run on a closed lid; surviving forever leaks caches onto shared nodes. A lease is the only answer that does neither |
+| Unmount | flush, verify clean, then unmount — refuse if dirty and unflushable | write-back caching means a node holds dirty checkpoints; discarding one silently would be the worst bug here |
+| No userns on a node | refuse it as a backend, explained at `up` | no pod means no path guarantee and no collision safety; a degraded second dispatch path would be the weakest link everything else is judged by |
 | Local-disk cache | rclone VFS on the **compute node**, write-back on close | a checkpoint over a network FS stalls the step loop, and a timer sweep is bloat. File close is the event. One mount then serves dataset caching, checkpoint write-back and re-reads |
 | Dataset warming | lazy cache, `prefetch: true` opt-in | a run touching one percent of a tree should not copy all of it; a first epoch over a million small files is latency-bound and wants the copy |
 | Transport | `via: auto` — direct, else relayed through this machine | node-to-node ssh is firewalled on many clusters and `AllowAgentForwarding no` is common, so direct cannot be assumed and a fallback must be *explained* rather than time out |
@@ -1020,9 +1139,10 @@ replays the buffer. Killing the pod kills everything inside it.
    logging — have to make up the difference?
 3. **rclone as a dependency** — vendor the binary, require it, or reconsider a custom
    Go FUSE once access patterns are known?
-4. **Unprivileged userns on compute nodes** — how common is it actually disabled on the
-   clusters this is for? `doctor` can report it, but the answer decides whether the uniform-
-   prefix fallback is a corner case or the path most people are on.
+4. **Unprivileged userns on compute nodes** — now load-bearing rather than academic: with
+   the fallback deleted, a node without it cannot be a backend at all. How often is it
+   disabled on the clusters this is for, and is "ask your admin for one sysctl" a reasonable
+   thing to require?
 5. **Cache eviction on a compute node** — `cache:` bounds the size, but a shared node's
    local disk is contended and a job that fills it hurts other people. Evict LRU, refuse to
    start when the bound cannot be met, or write to a node-specific scratch that is already
@@ -1039,16 +1159,24 @@ replays the buffer. Killing the pod kills everything inside it.
 10. **Live-shell recovery** — a session-bound remote shell is state that a link drop
    destroys. Reopen it silently at the last known cwd, or surface the gap, given §7a's rule
    about never silently re-running a partially-applied command?
-11. **`vp save` and hand-edited YAML** — writing live state back over a file with comments
+11. **Lease duration defaults** — long enough that a closed laptop does not kill a training
+   run, short enough that an abandoned pod does not sit on a shared node for a week. Is one
+   number right, or does this want `lease: 24h` per host with a shorter default on machines
+   flagged as shared?
+12. **Adoption across a config change** — the next `up` adopts a node pod under its lease,
+   but `vibepod.yaml` may have been edited meanwhile. Reconcile the adopted pod to the new
+   desired state, or refuse adoption and make the user choose?
+13. **`vp save` and hand-edited YAML** — writing live state back over a file with comments
    and ordering the user cares about. Round-trip the comments, write a separate lockfile, or
    only ever append?
-12. **Daemon upgrades** — the daemon outlives the binary that spawned it, so after an
+14. **Daemon upgrades** — the daemon outlives the binary that spawned it, so after an
    upgrade the running one is stale. `doctor` reports the mismatch; should the daemon
    instead hand over, or refuse a client whose build differs?
 
 ## 13. Milestones
 
-**v1 = M0-M2, built. v2 = M3-M7, not started.**
+**v1 = M0-M2, built. v2 = M3-M7, not started.** M6a is the first distributed piece and is
+split out deliberately, so a single-node pod is trusted before a control plane sits on it.
 
 - **M0 — the trick works. [done, then superseded]** Pod, seccomp exec gate, lazy bind-shim
   redirect, local binds only. It did work: Claude Code ran inside it with every exec
@@ -1075,14 +1203,22 @@ ordered so that each one is usable on its own.
 - **M5 — the TUI.** Not started. The cockpit of §9: machines, sessions, activity, and
   handoff on `⏎`. `console.go` is the rough draft; the new work is the handoff and the
   keymap.
-- **M6 — compute on one machine, data on another.** Not started, and the largest of these.
-  `vpnode` pushed on consent, the session-private userns that reproduces the pod's paths on a
-  compute node, the marker-file check, rclone on the node with a local-disk cache and
-  write-back on close, `prefetch:`, `via: auto` with the probe and its explanation, the
-  forwarded-agent credential proxy, and the uniform-prefix fallback for nodes without
-  userns. Also `toolbin` pushes and port forwards, which share the consent path.
+- **M6 — node pods.** Not started. `vpnode` pushed on consent; a pod on one backend, built
+  as that node's system layer with the composed zone over it; `requires:` checked at `up`;
+  rclone on the node with a local-disk cache and write-back on close; `prefetch:`; `via:
+  auto` with its probe and explanation; the forwarded-agent credential proxy. Also `toolbin`
+  pushes and port forwards, which share the consent path.
   Success is a training run whose data lives on gpu03, whose GPUs are gpu05's, and whose
   every path is the same string on all three machines.
+  **Deliberately excludes the control plane** — one node, mounts fixed at `up`. §6a's
+  replication is M6a, so that the single-node case is working and trusted before anything
+  distributed is built on it.
+- **M6a — the control plane.** Not started, and the first genuinely distributed piece.
+  Per-mount generations, reconcile-on-reconnect, per-mount staleness surfaced in `vp ps` and
+  the TUI, dispatch refusal on a stale mount, append-only runtime ordering with the shadow
+  guard, two-phase unmount with the dirty-flush refusal, the lease, and adoption on
+  reconnect. This is what makes `vp mount` safe with more than one backend; until it lands,
+  a second backend means `down` and `up`.
 - **M7 — polish.** Not started. Reverse mounts (`expose_to:`) for "edit here, run there",
   `sync` mode, and the rest of the tree's views from §9: `-x` to expand a remote subtree, `--running`,
   `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
