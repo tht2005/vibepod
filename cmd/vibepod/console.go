@@ -31,6 +31,7 @@ type console struct {
 	line    []rune
 	state   *term.State
 	cmdConn *proto.Conn // non-nil while a command owns the terminal
+	held    []string    // log lines that arrived while it did
 }
 
 func cmdNew(args []string) int {
@@ -201,6 +202,10 @@ func (con *console) runInPod(argv []string) {
 		con.cmdConn = nil
 		con.mu.Unlock()
 		state.Restore()
+		// The command's own exit event usually lands a moment after it
+		// stops writing; give it that moment so its route appears with it.
+		time.Sleep(120 * time.Millisecond)
+		con.flushHeld()
 		switch {
 		case err != nil:
 			con.out("vibepod: " + err.Error() + "\r\n")
@@ -231,16 +236,7 @@ func (con *console) changeDir(dir string) {
 	defer c.Close()
 	// Ask the pod, not the host: the pod's view is the one that decides
 	// routing, and it is not the same filesystem.
-	devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		return
-	}
-	defer devnull.Close()
-	fd := int(devnull.Fd())
-	reply, err := call(c, &proto.Msg{
-		Op: proto.OpSession, Pod: con.pod, Argv: []string{"/usr/bin/test", "-d", dir},
-		Env: os.Environ(), Cwd: "/",
-	}, fd, fd, fd)
+	reply, err := call(c, &proto.Msg{Op: proto.OpStat, Pod: con.pod, Path: dir})
 	if err != nil || reply.Code != 0 {
 		con.out("cd: " + dir + ": no such directory in the pod\r\n")
 		return
@@ -300,7 +296,7 @@ func (con *console) followEvents() {
 		if json.Unmarshal(m.Event, &e) != nil || e.Kind != event.KindExit {
 			continue
 		}
-		con.above(logLine(e, false))
+		con.above(logLine(e, false, false))
 	}
 }
 
@@ -316,13 +312,34 @@ func (con *console) header() {
 }
 
 // above prints a line without disturbing what is being typed.
+//
+// While a command owns the terminal it prints nothing at all. Redrawing the
+// prompt starts by erasing the current line, and the current line belongs to
+// whatever is running — an ls, a compiler, an agent. Those lines are held and
+// flushed when the terminal comes back, which also puts each command's route
+// directly under its own output.
 func (con *console) above(line string) {
 	if line == "" {
 		return
 	}
 	con.mu.Lock()
 	defer con.mu.Unlock()
+	if con.cmdConn != nil {
+		con.held = append(con.held, line)
+		return
+	}
 	fmt.Fprintf(os.Stdout, "\r\x1b[K%s\r\n%s", line, con.promptText())
+}
+
+// flushHeld prints what arrived while a command had the screen.
+func (con *console) flushHeld() {
+	con.mu.Lock()
+	held := con.held
+	con.held = nil
+	con.mu.Unlock()
+	for _, line := range held {
+		fmt.Fprintf(os.Stdout, "\r\x1b[K%s\r\n", line)
+	}
 }
 
 func (con *console) prompt() { con.redraw() }
@@ -338,7 +355,29 @@ func (con *console) promptText() string {
 	if exec == "" {
 		exec = "auto"
 	}
-	return fmt.Sprintf("%s [%s] ❯ %s", short(con.cwd), exec, string(con.line))
+	return fmt.Sprintf("%s [%s] ❯ %s", promptPath(con.cwd), exec, string(con.line))
+}
+
+// promptPath keeps the prompt short enough to type in front of. Remote
+// directories mount at their own absolute path, which is the right choice
+// everywhere except here, where it can be sixty characters of prefix.
+func promptPath(p string) string {
+	p = short(p)
+	const max = 28
+	if len(p) <= max {
+		return p
+	}
+	parts := strings.Split(p, "/")
+	for i := len(parts) - 1; i > 0; i-- {
+		tail := strings.Join(parts[i:], "/")
+		if len(tail) > max-2 {
+			return "…/" + parts[len(parts)-1]
+		}
+		if i == 1 || len(tail)+len(parts[i-1])+3 > max {
+			return "…/" + tail
+		}
+	}
+	return p
 }
 
 func (con *console) out(s string) {
@@ -346,5 +385,3 @@ func (con *console) out(s string) {
 	defer con.mu.Unlock()
 	fmt.Fprint(os.Stdout, s)
 }
-
-var _ = time.Second

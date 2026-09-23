@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -144,6 +145,17 @@ func (k *ctlConn) serve() {
 			d.reply(k.c, m, d.down(m.Pod))
 		case proto.OpLog:
 			d.streamLog(k.c, m)
+		case proto.OpStat:
+			ok, err := d.statInPod(m)
+			if err != nil {
+				_ = k.c.Errorf(m.ID, "%v", err)
+			} else {
+				code := 1
+				if ok {
+					code = 0
+				}
+				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Code: code})
+			}
 		case proto.OpTree:
 			t, err := d.treeOf(m)
 			if err != nil {
@@ -465,6 +477,29 @@ func (d *Daemon) lookup(name string) (*podState, error) {
 // pod that exists is what `vpctl run` does every time after the first.
 func errAlreadyRunning(name string) error {
 	return fmt.Errorf("pod %q is already running", name)
+}
+
+// statInPod answers "is this a directory in the pod" without running anything
+// in it. /proc/<pid>/root resolves inside that process's mount namespace, so
+// the daemon can look through vpinit's eyes.
+//
+// Running `test -d` in the pod would also work and did, but it put a command
+// nobody typed into a log whose whole value is that everything in it was
+// asked for.
+func (d *Daemon) statInPod(m *proto.Msg) (bool, error) {
+	s, err := d.lookup(m.Pod)
+	if err != nil {
+		return false, err
+	}
+	if !strings.HasPrefix(m.Path, "/") {
+		return false, fmt.Errorf("stat needs an absolute path")
+	}
+	// A symlink inside the pod pointing at an absolute path would resolve
+	// against our root, not the pod's, so this can say yes to a directory the
+	// pod cannot reach. The next command there fails plainly, which is the
+	// same answer one step later.
+	fi, err := os.Stat(filepath.Join("/proc", strconv.Itoa(s.p.Pid), "root", m.Path))
+	return err == nil && fi.IsDir(), nil
 }
 
 // use pins a session's executor. This is the sharp edge of the in-pod

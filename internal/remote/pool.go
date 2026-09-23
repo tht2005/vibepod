@@ -92,6 +92,10 @@ func (h *Host) Opts() []string {
 		"-o", "ControlPath="+h.ctlPath,
 		"-o", "ControlPersist=300",
 		"-o", "BatchMode=yes",
+		// Without this, every routed command that takes a terminal ends with
+		// "Shared connection to host closed." — ssh talking about itself in
+		// the middle of someone's output.
+		"-o", "LogLevel=ERROR",
 	)
 }
 

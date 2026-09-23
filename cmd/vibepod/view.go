@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ func cmdLog(args []string) error {
 	fs := flag.NewFlagSet("log", flag.ContinueOnError)
 	follow := fs.Bool("f", false, "keep printing as commands run")
 	asJSON := fs.Bool("json", false, "NDJSON, one event per line")
+	all := fs.Bool("all", false, "include the shells that wrapped these commands")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -59,14 +61,35 @@ func cmdLog(args []string) error {
 			if err := json.Unmarshal(m.Event, &e); err != nil {
 				continue
 			}
-			if line := logLine(e, *follow); line != "" {
+			if line := logLine(e, *follow, *all); line != "" {
 				fmt.Println(line)
 			}
 		}
 	}
 }
 
-func logLine(e event.Event, follow bool) string {
+// shellNames are wrappers, not commands.
+//
+// A shell is never routed — it stays in the pod by design, so that an agent's
+// generated wrapper keeps its environment snapshot and its cwd tracking — and
+// everything it runs is logged in its own right. Printing both says the same
+// thing twice, and the second line is the one that carries a machine.
+var shellNames = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true,
+	"fish": true, "busybox": true,
+}
+
+func isShell(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	return shellNames[filepath.Base(argv[0])]
+}
+
+func logLine(e event.Event, follow, all bool) string {
+	if !all && isShell(e.Argv) {
+		return ""
+	}
 	ts := "        "
 	if t, err := time.Parse(time.RFC3339Nano, e.Time); err == nil {
 		ts = t.Format("15:04:05")

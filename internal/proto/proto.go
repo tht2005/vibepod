@@ -42,6 +42,7 @@ const (
 	OpEvent   = "event"
 	OpEnd     = "end"
 	OpUse     = "use"
+	OpStat    = "stat" // does this path exist in the pod, and is it a directory?
 	OpUp      = "up"
 	OpPs      = "ps"
 	OpDown    = "down"

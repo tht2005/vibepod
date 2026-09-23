@@ -144,6 +144,9 @@ func (pc *podConn) routeExec(m *proto.Msg, files []*os.File) {
 			// in those terms: the command is fine, the directory is the
 			// problem, and moving is the fix.
 			if strings.HasPrefix(m.Path, pod.BinDir+"/") {
+				if pc.pid != 0 {
+					s.setExitCode(pc.pid, remote.ExitLinkDown)
+				}
 				pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: fmt.Sprintf(
 					"%s exists only on a remote, and %s runs here; "+
 						"run it from a directory that belongs to that machine",
@@ -161,8 +164,14 @@ func (pc *podConn) routeExec(m *proto.Msg, files []*os.File) {
 		return
 	}
 	code, err := pc.runRemote(dec, m, files)
-	if pc.pid != 0 && err == nil {
-		s.setExitCode(pc.pid, code)
+	if pc.pid != 0 {
+		if err != nil {
+			// vpsh will exit 75. Record that: a command vibepod could not
+			// place is exactly the kind of thing this log exists to show.
+			s.setExitCode(pc.pid, remote.ExitLinkDown)
+		} else {
+			s.setExitCode(pc.pid, code)
+		}
 	}
 	if err != nil {
 		pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})

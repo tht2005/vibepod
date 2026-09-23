@@ -75,7 +75,10 @@ func (d *Daemon) handleExec(s *podState, n *sys.Notif) {
 	// command that has been shimmed execs twice — the shim, then the stashed
 	// original — and recording both would show the user's command happening
 	// twice, which is worse than useless in a log whose job is to be trusted.
-	if strings.HasPrefix(path, pod.VpDir+"/") {
+	//
+	// A shim placed for a remote-only tool is the exception: there is no
+	// original behind it, so that exec *is* the command.
+	if isPlumbing(path) {
 		return
 	}
 
@@ -147,6 +150,15 @@ func (d *Daemon) shouldShim(s *podState, path, cwd string, pid uint32) bool {
 		return true
 	}
 	return false
+}
+
+// isPlumbing reports whether a path is vibepod's own, rather than something
+// a user or an agent asked to run.
+func isPlumbing(path string) bool {
+	if strings.HasPrefix(path, pod.StashDir+"/") {
+		return true
+	}
+	return path == pod.ShimPath || path == pod.CtlPath
 }
 
 // execPath recovers the program a frozen process is about to run. The

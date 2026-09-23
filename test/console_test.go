@@ -19,21 +19,29 @@ func TestConsoleRunsCommandsAndNamesTheirRoutes(t *testing.T) {
 		t.Fatalf("no prompt; got:\n%s", con.out.String())
 	}
 
-	con.send("echo console-works\r")
-	if !con.waitFor(t, "console-works", 15*time.Second) {
-		t.Fatalf("the console did not run the command; got:\n%s", con.out.String())
+	con.send("/usr/bin/ls /\r")
+	// A command's own output must survive. The live pane redraws by erasing
+	// the current line, and the current line belongs to whatever is running.
+	if !con.waitFor(t, "usr", 15*time.Second) {
+		t.Fatalf("the command's output never appeared; got:\n%s", con.out.String())
 	}
 	// The live pane is the reason the console exists: every command shows the
 	// machine it ran on.
 	if !con.waitFor(t, "pod", 10*time.Second) {
 		t.Errorf("the exec log did not name a target; got:\n%s", con.out.String())
 	}
+	// ...once. The console wraps each line in a shell, and a shell is never
+	// routed, so logging it says the same thing twice with the wrong answer.
+	if n := strings.Count(con.out.String(), "/bin/sh -c"); n > 0 {
+		t.Errorf("the console logged its own shell wrapper %d time(s):\n%s",
+			n, con.out.String())
+	}
 
 	// The console keeps the keyboard after a command finishes. It did not,
 	// once: the daemon was reading this terminal, and a read blocked on a tty
 	// does not come back when the descriptor is closed, so it went on eating
 	// every keystroke that followed.
-	con.send("echo and-again\r")
+	con.send("/usr/bin/echo and-again\r")
 	if !con.waitFor(t, "and-again", 15*time.Second) {
 		t.Fatalf("the console lost the keyboard after one command; got:\n%s",
 			con.out.String())
