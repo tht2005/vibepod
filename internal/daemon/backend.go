@@ -289,6 +289,15 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 	req := remote.Req{Dir: dir, Argv: r.argv, Env: env, TTY: r.tty, ID: id}
 	copy(req.Files[:], r.files[:3])
 	code, err := host.Run(req)
+	// 127 from the remote script means its final `exec` found no such program, so
+	// nothing ran — the one exit status after which trying again cannot repeat a
+	// half-applied command. If the machine is allowed a copy and this one has a
+	// usable binary, copy it and try once more.
+	if err == nil && code == 127 {
+		if s.supplyTool(backend, r.argv[0]) {
+			code, err = host.Run(req)
+		}
+	}
 	if r.onStart != nil {
 		r.onStart(nil, "")
 	}

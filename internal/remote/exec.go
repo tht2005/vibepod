@@ -62,7 +62,11 @@ func (h *Host) Run(r Req) (int, error) {
 	if r.Dir == "" {
 		cd = "cd || exit 1"
 	}
-	script := fmt.Sprintf(`d=%s; mkdir -p "$d"; echo $$ > "$d/%s"; %s; %sexec %s`,
+	// ~/.vp/bin goes on the *end* of PATH: it holds what vibepod was allowed to
+	// copy there (see toolbin), and a tool the machine has of its own must always
+	// win over a copy.
+	script := fmt.Sprintf(`d=%s; mkdir -p "$d"; echo $$ > "$d/%s"; %s; `+
+		`PATH="$PATH:$HOME/.vp/bin"; export PATH; %sexec %s`,
 		runDirExpr, r.ID, cd, assignments(r.Env), command)
 
 	args := h.Opts()

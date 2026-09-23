@@ -55,6 +55,7 @@ func loadSpec(name string) (*proto.Msg, error) {
 		Ports:       res.Ports,
 		Machines:    res.Machines,
 		Credentials: res.Credentials,
+		Toolbin:     res.Toolbin,
 		Detail:      res.Lease, // the lease, carried in the one free text field
 		ToolHosts:   res.ToolHosts,
 		CanMount:    res.CanMount,

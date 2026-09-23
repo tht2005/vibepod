@@ -68,6 +68,8 @@ type podState struct {
 	// socket each one has, once forwarded.
 	credentials map[string]bool
 	agents      map[string]string
+	toolbin     map[string]bool
+	arch        map[string]string
 	homes       map[string]string
 	// ports are the forwards this pod opened, closed when it goes down.
 	ports []proto.PortSpec

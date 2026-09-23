@@ -175,6 +175,7 @@ func (t *RemoteTools) UnmarshalYAML(n *yaml.Node) error {
 type Resolved struct {
 	// Credentials are the machines allowed to use this machine's ssh agent.
 	Credentials []string
+	Toolbin     []string
 	Name        string
 	Lease       string
 	Ports       []proto.PortSpec
@@ -384,8 +385,12 @@ func (c *Config) Resolve() (*Resolved, error) {
 		if h.ForwardCredentials {
 			r.Credentials = append(r.Credentials, name)
 		}
+		if h.Toolbin {
+			r.Toolbin = append(r.Toolbin, name)
+		}
 	}
 	sort.Strings(r.Credentials)
+	sort.Strings(r.Toolbin)
 	for _, s := range c.Ports {
 		p, err := ParsePort(s)
 		if err != nil {

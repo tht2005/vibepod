@@ -525,6 +525,10 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	for _, h := range m.Credentials {
 		s.credentials[h] = true
 	}
+	s.toolbin = map[string]bool{}
+	for _, h := range m.Toolbin {
+		s.toolbin[h] = true
+	}
 	s.toolHosts = m.ToolHosts
 	// Consent to put one binary in ~/.vp/bin on these machines, given at `up`
 	// where a person is watching. Without it a machine that needs a pod says so

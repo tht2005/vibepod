@@ -287,6 +287,8 @@ type Msg struct {
 	// Credentials are the machines the config allowed to use this machine's ssh
 	// agent (forward_credentials: true). Everything else gets nothing.
 	Credentials []string `json:"credentials,omitempty"`
+	// Toolbin are the machines vibepod may copy a missing static tool to.
+	Toolbin []string `json:"toolbin,omitempty"`
 	// Held is what a node pod reports it has, and Generation the desired state's
 	// version. Together they are the whole of the reconciler's input.
 	Held       []Held `json:"held,omitempty"`
