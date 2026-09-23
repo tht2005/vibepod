@@ -423,7 +423,7 @@ vpctl attach [pod]          reattach to a detached console or agent session
 vpctl use <host|auto>       set this session's executor
 vpctl exec @prod -- cmd     one-off, explicit target
 vpctl ps                    list pods, routes, health
-vpctl mounts [pod]          show the route table
+vpctl tree [pod]            pod structure: mounts and live exec tree
 vpctl log [-f] [pod]        every exec and where it ran
 vpctl down [pod]            stop, unmount, disconnect
 vpctl doctor                check bwrap, seccomp, mounts, ssh reachability, toolchains
@@ -457,6 +457,84 @@ A pod supports **many concurrent sessions** — `vpctl shell` attaches another i
 terminal to a running pod, `docker exec -it` style. Each session has its own cwd and its
 own executor pin.
 
+### The tree
+
+`vpctl tree` is the one view nothing else can produce. `pstree` stops at the machine
+boundary; the exec gate sees every `execve` with its routing decision, so here **the
+machine is a column**. It renders the pod's whole structure — what is mounted from where,
+and what is executing where — and replaces a separate `vpctl mounts`.
+
+```
+$ vpctl tree work
+work · running 3m12s · exec: auto
+
+mounts
+├─ /srv/api         ← prod:/srv/api       fuse  rw   8ms  ✓
+├─ /var/log/api     ← prod:/var/log/api   fuse  ro   8ms  ✓
+├─ ~/Git/proj       ← local               bind  rw        ✓
+│  ├─ exposed to    → gpu-box             sftp-R    14ms  ✓
+│  └─ exec_on       → gpu-box
+├─ ~/Git/notes      ← local               bind  rw        ✓
+└─ ~/.claude        ← local host_access   bind  rw        ✓
+
+exec
+├─ session 1  (console)
+│  └─ claude                              pod      3m12s
+│     ├─ (47 completed)                            1m02s
+│     └─ cargo test                       prod     12.4s  ●
+└─ session 2  (vpctl shell)
+   └─ zsh                                 pod      8m40s
+      └─ python train.py                  gpu-box  1m04s  ●
+```
+
+The two halves are deliberately in one view: **the mount tree explains the exec tree.**
+"Why did that run on gpu-box" is answered four lines up, by the `exec_on` under
+`~/Git/proj`.
+
+Sessions are the roots, since a pod has several. Completed subtrees collapse to a count —
+an hour of agent work is hundreds of execs, and an uncollapsed tree is unreadable.
+
+**Remote depth.** We gate execs in the pod, not on prod, so a routed command is a **leaf**:
+the `rustc` and `ld` that `cargo` spawns on prod are invisible. `vpctl tree -x` polls
+`ps --ppid` over the warm mux to expand a remote subtree on demand, marked as polled and
+approximate. Honest by default, deep when asked.
+
+**One data source, three renderings.** The daemon emits a single event stream (exec start,
+exec exit); the console pane, `vpctl tree -f`, and `vpctl log -f` are all subscribers.
+Collection is solved by the exec gate — this is only a rendering problem.
+
+```
+vpctl tree --json                 # structured, for agents
+vpctl tree --running              # what is still alive
+vpctl tree --failed --since 10m   # what broke recently
+vpctl tree 412                    # one subtree
+vpctl tree --mounts | --exec      # one half
+```
+
+`vpctl log` and `vpctl tree` pair rather than overlap: **log is flat, chronological,
+finished; tree is hierarchical, live, running.**
+
+### The in-pod control plane
+
+The agent runs *inside* the pod, where `vpctl` reaches the daemon through a socket bound
+into the namespace. That socket is a control plane, and reading is not the same as writing.
+
+| | pod socket | host socket |
+|---|---|---|
+| `tree`, `log`, `ps`, `where` | ✓ | ✓ |
+| `use` (own session only) | ✓ *if the session has a tty* | ✓ |
+| `down`, `allow`, `up` | ✗ | ✓ |
+
+The tty gate on `use` is the important one. Without it **the agent can re-route itself** —
+pin its own execution to a machine cwd would never have chosen, granting itself a
+capability you did not give it. With it, you can still pin from `vpctl shell`, because a
+human at a terminal has one and an agent's subprocess does not. A config flag opens it
+deliberately for the cases that want it.
+
+The tty check is a proxy for intent, not proof of it. It is cheap, it fails closed, and
+the alternative — an explicit grant step — costs a round trip at exactly the moment you
+are trying to work.
+
 ### Knowing where things ran
 
 Two audiences, two mechanisms.
@@ -473,6 +551,8 @@ You are in a vibepod. Commands run on the machine that owns their directory:
   /srv/api      → prod     (remote)
   ~/Git/proj    → gpu-box  (local files, remote execution)
   ~/Git/notes   → local
+
+Run `vpctl tree --json` to see what is executing and where.
 ```
 
 ### Prompts
@@ -529,6 +609,9 @@ replays the buffer. Killing the pod kills everything inside it.
 | Exec target | `exec_on:` on a mount, session pin overrides | keeps "cwd decides" as the one rule; agents inherit routing with nothing to learn |
 | Reverse mounts | `expose_to:` on local mounts | "edit locally, run on the big machine" is impossible without them |
 | Visibility | live exec log + generated `CLAUDE.md` | one mechanism per audience; no output annotation to corrupt parsed streams |
+| `vpctl tree` | mounts and exec structure in one view | the mount half explains the exec half; replaces a separate `mounts` command |
+| Remote depth | leaf by default, `-x` polls `ps` | we gate execs in the pod, not on the remote; do not fake fidelity we lack |
+| In-pod scope | read-only, plus own-session `use` behind a tty check | stops the agent re-routing itself while keeping `vpctl shell` usable |
 | Guardrails | none — the log is the answer | pattern-matching shell strings is leaky both ways; the agent already gates commands |
 | Hosts | ssh_config aliases | inherits ProxyJump/keys/ports for free |
 | Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; ~3ms vpsh startup is negligible against RTT |
@@ -559,8 +642,8 @@ replays the buffer. Killing the pod kills everything inside it.
   with cwd tracking intact. This is the riskiest assumption in the design.
 - **M1 — one remote.** Daemon, rclone mount with execution-aware invalidation, cwd
   routing to a single host, warm ControlMaster. First genuinely useful version.
-- **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, exec log,
-  the console, multiple sessions, `ps`/`down`.
+- **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, the event
+  stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`.
 - **M3 — real work.** Credential proxy, toolbin prompts, port forwards, reverse mounts.
 - **M4 — polish.** Multi-host, `exec_on`/`expose_to` beyond one target, `doctor`,
   `sync` mode.
