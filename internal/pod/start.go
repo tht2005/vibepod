@@ -13,9 +13,9 @@ import (
 // Pod is the daemon's handle on a running pod.
 type Pod struct {
 	Spec   *proto.Spec
-	Pid    int    // host pid of vpinit
+	Pid    int // host pid of vpinit
 	Conn   *proto.Conn
-	GateFD int    // seccomp listener: every exec in the pod arrives here
+	GateFD int // seccomp listener: every exec in the pod arrives here
 	cmd    *exec.Cmd
 }
 
@@ -51,8 +51,8 @@ func Start(spec *proto.Spec) (*Pod, error) {
 		GidMappings: []syscall.SysProcIDMap{
 			{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
 		GidMappingsEnableSetgroups: false,
-		AmbientCaps: []uintptr{sys.CapSysAdmin, sys.CapDacOverride},
-		Pdeathsig:   syscall.SIGKILL,
+		AmbientCaps:                []uintptr{sys.CapSysAdmin, sys.CapDacOverride},
+		Pdeathsig:                  syscall.SIGKILL,
 	}
 	if err := cmd.Start(); err != nil {
 		syscall.Close(ours)

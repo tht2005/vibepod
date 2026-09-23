@@ -93,14 +93,14 @@ func InstallExecGate() (int, error) {
 		return -1, err
 	}
 	prog := []sockFilter{
-		{0x20, 0, 0, 4},                 // 0: load arch
-		{0x15, 1, 0, auditArchX864},     // 1: == x86_64 ? -> 3
-		{0x06, 0, 0, retAllow},          // 2: other arch: allow
-		{0x20, 0, 0, 0},                 // 3: load syscall nr
-		{0x15, 2, 0, 59},                // 4: execve   -> 7
-		{0x15, 1, 0, 322},               // 5: execveat -> 7
-		{0x06, 0, 0, retAllow},          // 6: allow
-		{0x06, 0, 0, retUserNotif},      // 7: notify the supervisor
+		{0x20, 0, 0, 4},             // 0: load arch
+		{0x15, 1, 0, auditArchX864}, // 1: == x86_64 ? -> 3
+		{0x06, 0, 0, retAllow},      // 2: other arch: allow
+		{0x20, 0, 0, 0},             // 3: load syscall nr
+		{0x15, 2, 0, 59},            // 4: execve   -> 7
+		{0x15, 1, 0, 322},           // 5: execveat -> 7
+		{0x06, 0, 0, retAllow},      // 6: allow
+		{0x06, 0, 0, retUserNotif},  // 7: notify the supervisor
 	}
 	fp := sockFprog{length: uint16(len(prog)), filter: &prog[0]}
 	fd, _, errno := syscall.Syscall(sysSeccomp, seccompSetModeFilter,

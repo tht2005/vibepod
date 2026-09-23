@@ -89,7 +89,7 @@ func (h *Host) Opts() []string {
 	}
 	return append(opts,
 		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + h.ctlPath,
+		"-o", "ControlPath="+h.ctlPath,
 		"-o", "ControlPersist=300",
 		"-o", "BatchMode=yes",
 	)

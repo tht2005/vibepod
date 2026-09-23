@@ -19,9 +19,9 @@ type capData struct {
 }
 
 const (
-	prCapAmbient           = 47
-	prCapAmbientClearAll   = 4
-	prSetNoNewPrivs        = 38
+	prCapAmbient         = 47
+	prCapAmbientClearAll = 4
+	prSetNoNewPrivs      = 38
 	CapSysAdmin          = 21
 	capVersion3          = 0x20080522
 	sysCapset            = 126

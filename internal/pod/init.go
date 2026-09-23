@@ -64,7 +64,6 @@ func RunInit() error {
 		return fmt.Errorf("gate not accepted: %s", m.Err)
 	}
 
-
 	in := &initServer{
 		conn:     conn,
 		sessions: map[int]string{},

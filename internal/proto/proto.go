@@ -115,8 +115,8 @@ type Msg struct {
 
 	Routes      []Route       `json:"routes,omitempty"`
 	Remotes     []RemoteMount `json:"remotes,omitempty"`
-	ExecDefault string  `json:"exec_default,omitempty"`
-	ShimAll     bool    `json:"shim_all,omitempty"`
+	ExecDefault string        `json:"exec_default,omitempty"`
+	ShimAll     bool          `json:"shim_all,omitempty"`
 
 	Pods []PodInfo `json:"pods,omitempty"`
 }

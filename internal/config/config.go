@@ -15,13 +15,13 @@ import (
 )
 
 type Config struct {
-	Pod        string            `yaml:"pod"`
-	Agents     []string          `yaml:"agents"`
-	Hosts      map[string]Host   `yaml:"hosts"`
-	Mounts     []Mount           `yaml:"mounts"`
-	HostAccess []string          `yaml:"host_access"`
-	Ports      []string          `yaml:"ports"`
-	Exec       Exec              `yaml:"exec"`
+	Pod        string          `yaml:"pod"`
+	Agents     []string        `yaml:"agents"`
+	Hosts      map[string]Host `yaml:"hosts"`
+	Mounts     []Mount         `yaml:"mounts"`
+	HostAccess []string        `yaml:"host_access"`
+	Ports      []string        `yaml:"ports"`
+	Exec       Exec            `yaml:"exec"`
 }
 
 type Host struct {
