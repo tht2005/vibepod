@@ -766,5 +766,46 @@ replays the buffer. Killing the pod kills everything inside it.
   First genuinely useful version.
 - **M2 — lifecycle. [v1 ships here — done]** `vpinit`, detach/attach, PTY buffer, the
   event stream, `log`, `tree`, the console, multiple sessions, `ps`/`down`.
-- **M3 — real work.** Credential proxy, toolbin prompts, port forwards, reverse mounts.
-- **M4 — polish.** `expose_to` to several targets, `doctor`, `sync` mode.
+- **M3 — real work.** Not started. Credential proxy for a routed `git push`,
+  `toolbin` pushes, port forwards, reverse mounts (`expose_to:`).
+  **`exec_on:` depends on M3 and is a trap until then**: the config accepts it,
+  but without the reverse mount the target cannot see the directory, so it fails
+  at run time rather than at `up`. Either implement `expose_to:` or refuse
+  `exec_on:` at `up` — the current middle is the one thing §9 says not to do.
+- **M4 — polish.** Not started. `expose_to` to several targets, `sync` mode,
+  and the rest of the tree's views from §9: `-x` to expand a remote subtree,
+  `--running`, `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
+  (`doctor` shipped in v1 and has moved out of here.)
+
+### Gaps inside v1's own surface
+
+Things this document specifies and v1 does not do. Each is small; listing them
+is cheaper than rediscovering them.
+
+- **The generated `CLAUDE.md` fragment** (§9, and a locked decision in §11).
+  Half of "knowing where things ran" — the half aimed at the agent — was never
+  built. The log serves a human; nothing currently tells the agent, in its own
+  language, that its directories map to machines.
+- **`VIBEPOD_TARGET`** (§9). `VIBEPOD_POD` and `VIBEPOD_SESSION` are exported;
+  the target never was, so a prompt snippet cannot show it without asking.
+- **The `@host cmd` per-command override** (§5, open question 6). `@` ended up
+  naming machines for navigation instead. A one-off override still has no
+  spelling, and `vpctl exec @prod -- cmd` from the §9 command surface does not
+  exist.
+
+### Built after the plan
+
+Not in any milestone above, because the work found them rather than the other
+way round. Recorded so the document is not behind the code:
+
+- **`remote_tools:`** — a shim needs a binary to shadow, so a tool that exists
+  only on a remote had no way to be routed at all.
+- **`exec.forward_env`** — routed commands were losing the caller's
+  environment silently (§3).
+- **Navigation by machine** — `vpctl hosts`, `vpctl where`, `vpctl cd @host`,
+  because path identity makes paths too long to type.
+- **Setup progress and explained ssh failures** (§9) — a silent ten-second
+  wait on an unreachable host was indistinguishable from a hang.
+- **A daemon build check** — the daemon outlives the binary that spawned it and
+  spawns `vpinit` from its own image, so a rebuild changed nothing until the old
+  one went away.
