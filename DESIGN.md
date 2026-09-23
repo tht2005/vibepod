@@ -161,15 +161,34 @@ Without it, detaching would destroy the pod.
 
 ## 5. Routing
 
-Default: **cwd decides the machine.**
+**cwd decides the machine.** Resolved in precedence order:
 
-| cwd | runs on |
-|---|---|
-| inside a remote mount | that host, at the translated path |
-| inside a local bind mount | in the pod |
-| anywhere else in the pod | in the pod |
+| # | rule | source |
+|---|---|---|
+| 1 | session pin | `vpctl use <host>`, inherited via `VIBEPOD_EXEC` |
+| 2 | mount's `exec_on:` | config — the durable "this directory runs there" |
+| 3 | mount owner | remote mount → its host · local mount → the pod |
+| 4 | `exec.default` | config, for cwd matching no mount |
 
-Overrides: `@prod cmd`, `@local cmd`, `@pod cmd`.
+Per-command override: `@prod cmd`, `@local cmd`, `@pod cmd`.
+
+Rules 2 and 3 are both properties of the *directory*, which is what lets agents inherit
+routing for free — they obey the same cwd rule everything else does, with nothing to
+learn and no session state to track. `exec_on:` covers "my code is local, the machine
+that should run it is not":
+
+```yaml
+  - local: ~/Git/proj
+    expose_to: [gpu-box]     # gpu-box can see this directory
+    exec_on: gpu-box         # commands whose cwd is here run on gpu-box
+```
+
+Rule 1 is the ad-hoc escape hatch for interactive work. It is inherited by child
+processes, so `vpctl use gpu-box` followed by `claude` sends every command that agent
+runs to gpu-box regardless of cwd. That is deliberate — it is the original `set_remote`
+workflow — but it is also the one route the console's status bar cannot really protect
+you from, since agent output scrolls faster than it can be read. Prefer `exec_on:` for
+anything durable.
 
 Pod-internal paths are permanently exempt, so MCP servers and agent-internal helpers
 always run locally and never get shipped to a remote.
@@ -268,6 +287,24 @@ network FS can justify, and it exists only because of the routing layer.
 
 This is why the backend needs a `vfs/forget`-style hook. sshfs has none.
 
+### Reverse mounts (`expose_to:`)
+
+Mounts flow both ways. `expose_to: [host]` on a local directory makes it visible **on**
+that host, so a command routed there can see local code. Without it, "edit locally, run
+on the big machine" is impossible — the target has no such path.
+
+```yaml
+  - local: ~/Git/proj
+    expose_to: [gpu-box]
+```
+
+`exec_on:` without a matching `expose_to:` is a misconfiguration and is rejected at `up`.
+
+Transport is undecided (§12): sshfs slave mode over `ssh -R`, rclone serving sftp back
+through the tunnel, or a push-copy. Note the asymmetry — for a reverse mount, the
+*remote's* reads become network reads, so the caching story runs the opposite direction
+from a normal mount.
+
 ### Mount modes
 
 `mode:` is per-mount, so the strategy can change without changing the config shape.
@@ -343,13 +380,16 @@ hosts:
   prod:
     toolbin: true
     forward_credentials: false
-  buildbox:
+  gpu-box:
     forward_credentials: true
 
 mounts:
-  - remote: prod:/srv/api          # → /srv/api in pod
+  - remote: prod:/srv/api          # → /srv/api in pod, commands here → prod
     mode: fuse
-  - local: ~/Git/notes             # → ~/Git/notes in pod
+  - local: ~/Git/proj              # → ~/Git/proj in pod
+    expose_to: [gpu-box]           # ...and visible on gpu-box
+    exec_on: gpu-box               # ...where its commands run
+  - local: ~/Git/notes             # plain local dir, commands run in the pod
   - remote: prod:/var/log/api
     mode: fuse
     readonly: true
@@ -367,24 +407,94 @@ exec:
   default: pod                     # when cwd matches no mount
 ```
 
-## 9. Command surface
+Split `vibepod.yaml` (committed, shareable) from `vibepod.local.yaml` (your paths,
+gitignored).
+
+## 9. Interface
+
+### Command surface
 
 ```
-vpctl up [pod]              create + start; bare form reads ./vibepod.yaml
-vpctl ps                    list pods, mounts, routes, health
-vpctl shell [pod]           interactive shell inside the pod
-vpctl run claude [pod]      launch an agent inside the pod
-vpctl attach [pod]          reattach to a detached session
+vpctl new [name]            create pod + open the console
+vpctl up [name]             create pod, detached, no console     (scripts, CI)
+vpctl run claude [target]   create/attach and launch an agent
+vpctl shell [pod]           another independent terminal into a running pod
+vpctl attach [pod]          reattach to a detached console or agent session
+vpctl use <host|auto>       set this session's executor
 vpctl exec @prod -- cmd     one-off, explicit target
+vpctl ps                    list pods, routes, health
 vpctl mounts [pod]          show the route table
-vpctl logs [-f] [pod]       audit log / session output
+vpctl log [-f] [pod]        every exec and where it ran
 vpctl down [pod]            stop, unmount, disconnect
-vpctl doctor                check bwrap, sshfs, ssh reachability, remote toolchains
+vpctl doctor                check bwrap, seccomp, mounts, ssh reachability, toolchains
 ```
 
-Pods are **named** and globally listable, but a bare `vpctl up` in a project directory
-takes its name from `./vibepod.yaml`. Explicit when you want it, zero-argument when
-you're in a project.
+Pods are **named** and globally listable, but a bare `vpctl new`/`up` in a project
+directory takes its name from `./vibepod.yaml`.
+
+### The console
+
+`vpctl new` opens a cockpit — not a shell replacement. Competing with zsh and tmux means
+rebuilding completion, history, job control and a terminal emulator, and losing anyway.
+
+```
+┌─ vibepod · work ───────────────────────────────────────────────┐
+│ exec: auto            /srv/api → prod       8ms    2 mounts ✓  │
+├────────────────────────────────────────────────────────────────┤
+│ 14:22:31  prod    cargo test                          ✓ 12.4s  │
+│ 14:22:48  local   git commit -m "fix parser"          ✓  0.1s  │
+│ 14:23:02  prod    rm -rf target                       ✓  0.3s  │
+│                                                                │
+│ /srv/api ❯ _                                                   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+Header: pod, executor mode, routes, health. Body: the live exec log. Bottom: a command
+input. Anything needing a real TTY (`vim`, `htop`, `claude` itself) takes over the full
+screen and hands it back on exit.
+
+A pod supports **many concurrent sessions** — `vpctl shell` attaches another independent
+terminal to a running pod, `docker exec -it` style. Each session has its own cwd and its
+own executor pin.
+
+### Knowing where things ran
+
+Two audiences, two mechanisms.
+
+**You:** `vpctl log -f` is the trust surface. Since the daemon mediates every exec, it can
+show the one thing nothing else can — what the agent is doing *and where*. It is a primary
+surface, not a debugging afterthought.
+
+**The agent:** vibepod writes a `CLAUDE.md` fragment into the pod, in the agent's own
+language. No MCP server, no new tool to learn.
+
+```
+You are in a vibepod. Commands run on the machine that owns their directory:
+  /srv/api      → prod     (remote)
+  ~/Git/proj    → gpu-box  (local files, remote execution)
+  ~/Git/notes   → local
+```
+
+### Prompts
+
+Everything vibepod needs to ask — toolbin pushes, credential forwarding, host trust — is
+asked at **`up` time**, while a human is certainly watching. Mid-run, a question only
+appears if a terminal is attached; otherwise the command fails fast and actionably:
+
+```
+vibepod: rg not available on prod
+         run `vpctl allow toolbin prod` to push it
+```
+
+### Guardrails
+
+There are none, by choice. vibepod routes and records; it does not judge. The agent's own
+permission system already gates commands, and pattern-matching shell strings for `rm -rf`
+is leaky in both directions — false positives block real work, and evasion is trivial.
+The log is the answer.
+
+Non-invasive by default: `VIBEPOD_POD` and `VIBEPOD_TARGET` are exported and a prompt
+snippet is opt-in, rather than rewriting anyone's `PS1`.
 
 ## 10. Detach & reattach
 
@@ -414,6 +524,12 @@ replays the buffer. Killing the pod kills everything inside it.
 | Path identity | mount at the remote's own absolute path | args forward verbatim; remote tool output stays openable. Shadowing guarded by a deny-list at `up` |
 | Host access | explicit allowlist | nothing granted implicitly; the agent cannot read unrelated projects or credentials |
 | Link drops | fail loudly, exit `75` | never silently re-run a partially-applied non-idempotent command |
+| Console | cockpit: status + log + input | a command surface that shows routing, without rebuilding a shell |
+| Sessions | many per pod | `vpctl shell` attaches independent terminals, `docker exec -it` style |
+| Exec target | `exec_on:` on a mount, session pin overrides | keeps "cwd decides" as the one rule; agents inherit routing with nothing to learn |
+| Reverse mounts | `expose_to:` on local mounts | "edit locally, run on the big machine" is impossible without them |
+| Visibility | live exec log + generated `CLAUDE.md` | one mechanism per audience; no output annotation to corrupt parsed streams |
+| Guardrails | none — the log is the answer | pattern-matching shell strings is leaky both ways; the agent already gates commands |
 | Hosts | ssh_config aliases | inherits ProxyJump/keys/ports for free |
 | Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; ~3ms vpsh startup is negligible against RTT |
 
@@ -429,7 +545,9 @@ replays the buffer. Killing the pod kills everything inside it.
 5. **`sync` mode implementation** — rsync loop, or a mutagen-style watcher?
 6. **`@host` prefix parsing** — with the shell now local, where does the override live?
 7. **`host_access` defaults** — ship per-agent presets so the first run is not empty?
-8. **Bind-shim accumulation** — one mount per distinct binary. Is there a ceiling worth
+8. **Reverse-mount transport** — sshfs slave over `ssh -R`, rclone serving sftp back
+   through the tunnel, or a push-copy? Caching runs the opposite direction here.
+9. **Bind-shim accumulation** — one mount per distinct binary. Is there a ceiling worth
    caring about, and do shims need eviction?
 
 ## 13. Milestones
@@ -441,6 +559,6 @@ replays the buffer. Killing the pod kills everything inside it.
   with cwd tracking intact. This is the riskiest assumption in the design.
 - **M1 — one remote.** Daemon, sshfs mount, cwd routing to a single host, warm
   ControlMaster. This is the first genuinely useful version.
-- **M2 — lifecycle. [v1 ships here]** `vpinit`, detach/attach, PTY buffer, `ps`/`down`.
-- **M3 — real work.** Credential proxy, toolbin prompts, port forwards.
+- **M2 — lifecycle. [v1 ships here]** Console, multiple sessions, `vpinit`, detach/attach, PTY buffer, `ps`/`down`.
+- **M3 — real work.** Credential proxy, toolbin prompts, port forwards, reverse mounts.
 - **M4 — polish.** Multi-host, audit log, `doctor`, `sync` mode.
