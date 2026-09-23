@@ -18,6 +18,8 @@ const usage = `vpctl - run your agent here, run its commands where the code live
   vpctl run [name] -- cmd...   run a command in a pod, creating it if needed
   vpctl shell [name]           an interactive shell in a pod
   vpctl ps                     running pods
+  vpctl log [-f] [pod]         every command and the machine it ran on
+  vpctl tree [pod]             mounts and live execs, in one view
   vpctl down [name]            stop a pod and release its mounts
   vpctl doctor                 check this machine can host a pod
 
@@ -39,6 +41,10 @@ func runCtl(args []string) int {
 		return cmdRun(append([]string{"--"}, shellArgs(args[1:])...))
 	case "ps":
 		err = cmdPs()
+	case "log":
+		err = cmdLog(args[1:])
+	case "tree":
+		err = cmdTree(args[1:])
 	case "down":
 		err = cmdDown(args[1:])
 	case "doctor":

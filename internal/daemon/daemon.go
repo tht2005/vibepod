@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"vibepod/internal/event"
 	"vibepod/internal/fs"
 	"vibepod/internal/pod"
 	"vibepod/internal/proto"
@@ -27,6 +28,7 @@ type Daemon struct {
 	runDir string
 	logger *log.Logger
 	pool   *remote.Pool
+	bus    *event.Bus
 
 	mu   sync.Mutex
 	pods map[string]*podState
@@ -52,7 +54,7 @@ func New(runDir string, logger *log.Logger) (*Daemon, error) {
 		return nil, err
 	}
 	return &Daemon{runDir: runDir, logger: logger, pool: pool,
-		pods: map[string]*podState{}}, nil
+		bus: event.NewBus(4000), pods: map[string]*podState{}}, nil
 }
 
 func (d *Daemon) logf(format string, a ...any) {
@@ -110,6 +112,15 @@ func (d *Daemon) handle(c *proto.Conn, host bool) {
 			_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Pods: d.ps()})
 		case proto.OpDown:
 			d.reply(c, m, d.down(m.Pod))
+		case proto.OpLog:
+			d.streamLog(c, m)
+		case proto.OpTree:
+			t, err := d.treeOf(m)
+			if err != nil {
+				_ = c.Errorf(m.ID, "%v", err)
+			} else {
+				_ = c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Tree: t})
+			}
 		case proto.OpSession:
 			code, err := d.session(m, fds)
 			closeAll(fds)
@@ -125,8 +136,16 @@ func (d *Daemon) handle(c *proto.Conn, host bool) {
 	}
 }
 
+// readOnlyOp is the capability split of DESIGN.md §9, enforced by which
+// socket the connection arrived on. An agent inside a pod may look at
+// anything; it may not steer. In particular it may not re-route itself,
+// which would grant it a machine its directory would never have chosen.
 func readOnlyOp(op string) bool {
-	return op == proto.OpPs
+	switch op {
+	case proto.OpPs, proto.OpLog, proto.OpTree:
+		return true
+	}
+	return false
 }
 
 func (d *Daemon) reply(c *proto.Conn, m *proto.Msg, err error) {
@@ -204,6 +223,9 @@ func (d *Daemon) up(m *proto.Msg) error {
 	go s.readLoop()
 	go d.runGate(s)
 	go d.servePodSocket(s)
+	go s.watchExits()
+	d.bus.Publish(event.Event{Kind: event.KindPod, Pod: name, Detail: "up",
+		PID: p.Pid})
 	d.logf("pod %s up (vpinit pid %d)", name, p.Pid)
 	return nil
 }

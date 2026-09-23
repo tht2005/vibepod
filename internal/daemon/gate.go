@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"vibepod/internal/pod"
 	"vibepod/internal/route"
@@ -19,6 +20,8 @@ const (
 	nrExecveat   = 322
 	atEmptyPath  = 0x1000
 	maxPathBytes = 4096
+	maxArgs      = 64
+	maxArgBytes  = 8192
 )
 
 // shellNames never get a shim. An agent wraps its commands in a generated
@@ -68,12 +71,46 @@ func (d *Daemon) handleExec(s *podState, n *sys.Notif) {
 	if !sys.NotifIDValid(s.p.GateFD, n.ID) {
 		return
 	}
-	if !d.shouldShim(s, path, cwd, n.PID) {
+	// Record every exec, not only the routed ones: the log exists to show what
+	// ran and where, and "here" is an answer.
+	argv, _ := execArgv(n)
+	if len(argv) == 0 {
+		argv = []string{path}
+	}
+	session := sessionOf(n.PID)
+	shim := d.shouldShim(s, path, cwd, n.PID)
+
+	// Report where this command will actually run, which is not always where
+	// the route says. A shell is never shimmed, so it runs in the pod however
+	// its directory is routed — recording the route here would be a lie, and
+	// this log is the trust surface.
+	target := route.Pod
+	if shim {
+		target = route.Resolve(s.table, cwd, s.pinOf(session)).Target
+	}
+	s.recordExec(&execRec{
+		PID: int(n.PID), PPID: sys.PPID(n.PID), Argv: argv, Cwd: cwd,
+		Target: target, Session: session, Start: time.Now(),
+	})
+
+	if !shim {
 		return
 	}
 	if _, err := s.ensureShim(path); err != nil {
 		d.logf("pod %s: %v", s.name, err)
 	}
+}
+
+// execArgv recovers the command line of a frozen process, which is what makes
+// the tree readable: a path alone does not tell you what was asked for.
+func execArgv(n *sys.Notif) ([]string, error) {
+	switch n.NR {
+	case nrExecve:
+		return sys.ReadStringArray(n.PID, n.Args[1], maxArgs, maxArgBytes)
+	case nrExecveat:
+		return sys.ReadStringArray(n.PID, n.Args[2], maxArgs, maxArgBytes)
+	}
+	return nil, fmt.Errorf("unexpected syscall %d", n.NR)
 }
 
 // shouldShim decides whether this binary needs to be redirected. It is

@@ -21,7 +21,9 @@ func (d *Daemon) servePodSocket(s *podState) {
 		if err != nil {
 			return
 		}
-		go (&podConn{d: d, s: s, c: proto.NewConn(c)}).serve()
+		pc := &podConn{d: d, s: s, c: proto.NewConn(c)}
+		pc.pid = pc.c.PeerPID()
+		go pc.serve()
 	}
 }
 
@@ -32,6 +34,8 @@ type podConn struct {
 	d *Daemon
 	s *podState
 	c *proto.Conn
+
+	pid int // the shim's pid, as the daemon's namespace sees it
 
 	mu      sync.Mutex
 	host    *remote.Host
@@ -80,6 +84,15 @@ func (pc *podConn) serve() {
 			pc.forwardSignal(m.Sig)
 		case proto.OpPs:
 			pc.send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Pods: pc.d.ps()})
+		case proto.OpTree:
+			t, err := pc.d.treeOf(m)
+			if err != nil {
+				pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
+			} else {
+				pc.send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Tree: t})
+			}
+		case proto.OpLog:
+			pc.d.streamLog(pc.c, m)
 		default:
 			closeAll(fds)
 			pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID,
@@ -102,6 +115,11 @@ func (pc *podConn) routeExec(m *proto.Msg, files []*os.File) {
 	s := pc.s
 	dec := route.Resolve(s.table, m.Cwd, s.pinOf(m.Session))
 	pc.d.logf("pod %s: exec %v cwd=%s -> %s", s.name, m.Argv, m.Cwd, dec.Target)
+	// vpsh knows its session, and therefore any pin, so its decision is the
+	// authoritative one. Correct the record the gate made a moment ago.
+	if pc.pid != 0 {
+		s.retarget(pc.pid, dec.Target)
+	}
 
 	if dec.Target == route.Pod {
 		stash, ok := s.stashOf(m.Path)
@@ -117,6 +135,9 @@ func (pc *podConn) routeExec(m *proto.Msg, files []*os.File) {
 		return
 	}
 	code, err := pc.runRemote(dec, m, files)
+	if pc.pid != 0 && err == nil {
+		s.setExitCode(pc.pid, code)
+	}
 	if err != nil {
 		pc.send(&proto.Msg{Op: proto.OpErr, ID: m.ID, Err: err.Error()})
 		return

@@ -37,6 +37,11 @@ const (
 	OpRunLocal = "run-local" // exec Path yourself; the fds are already right
 
 	// vpctl -> daemon
+	OpLog     = "log"
+	OpTree    = "tree"
+	OpEvent   = "event"
+	OpEnd     = "end"
+	OpUse     = "use"
 	OpUp      = "up"
 	OpPs      = "ps"
 	OpDown    = "down"
@@ -118,7 +123,47 @@ type Msg struct {
 	ExecDefault string        `json:"exec_default,omitempty"`
 	ShimAll     bool          `json:"shim_all,omitempty"`
 
+	Follow bool            `json:"follow,omitempty"`
+	All    bool            `json:"all,omitempty"`
+	Tree   *Tree           `json:"tree,omitempty"`
+	Event  json.RawMessage `json:"event,omitempty"`
+
 	Pods []PodInfo `json:"pods,omitempty"`
+}
+
+// Tree is the pod's structure: mounts and live execs, in one view.
+type Tree struct {
+	Pod         string        `json:"pod"`
+	Uptime      string        `json:"uptime"`
+	ExecDefault string        `json:"exec_default"`
+	Mounts      []TreeMount   `json:"mounts"`
+	Sessions    []TreeSession `json:"sessions"`
+	Completed   int           `json:"completed"`
+}
+
+type TreeMount struct {
+	At       string `json:"at"`
+	Source   string `json:"source"`
+	Kind     string `json:"kind"`
+	Target   string `json:"target"`
+	ReadOnly bool   `json:"ro,omitempty"`
+}
+
+type TreeSession struct {
+	ID    string     `json:"id"`
+	Kind  string     `json:"kind,omitempty"`
+	Nodes []TreeNode `json:"nodes,omitempty"`
+}
+
+type TreeNode struct {
+	PID       int        `json:"pid"`
+	Argv      []string   `json:"argv"`
+	Target    string     `json:"target"`
+	State     string     `json:"state"`
+	ElapsedMS int64      `json:"elapsed_ms"`
+	Code      *int       `json:"code,omitempty"`
+	Session   string     `json:"session,omitempty"`
+	Children  []TreeNode `json:"children,omitempty"`
 }
 
 // PodInfo is one row of vpctl ps.
@@ -213,6 +258,27 @@ func (k *Conn) Recv() (*Msg, []int, error) {
 }
 
 func (k *Conn) Close() error { return k.c.Close() }
+
+// PeerPID is the pid of the process at the other end, translated into this
+// process's pid namespace by the kernel.
+//
+// A pod has its own pid namespace, so a process inside it cannot report a
+// number the daemon could use. Asking the kernel also means the pid is not
+// self-reported, which matters for anything the agent can reach.
+func (k *Conn) PeerPID() int {
+	raw, err := k.c.SyscallConn()
+	if err != nil {
+		return 0
+	}
+	var pid int
+	_ = raw.Control(func(fd uintptr) {
+		if cred, err := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET,
+			syscall.SO_PEERCRED); err == nil {
+			pid = int(cred.Pid)
+		}
+	})
+	return pid
+}
 
 // Errorf replies with an error carrying the request id.
 func (k *Conn) Errorf(id uint64, format string, a ...any) error {

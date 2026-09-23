@@ -31,6 +31,9 @@ type podState struct {
 	sessions map[string]*session
 	pins     map[string]string // session id -> pinned target
 	used     map[string]bool   // hosts this pod has routed to
+	execs    map[int]*execRec  // every program launch the gate has seen
+
+	stopped chan struct{}
 
 	rpcMu   sync.Mutex
 	nextID  uint64
@@ -51,7 +54,9 @@ func newPodState(d *Daemon, name string, p *pod.Pod, t *route.Table, shimAll boo
 		shims:    map[string]string{},
 		sessions: map[string]*session{},
 		pins:     map[string]string{},
+		execs:    map[int]*execRec{},
 		pending:  map[uint64]chan *proto.Msg{},
+		stopped:  make(chan struct{}),
 	}
 }
 
@@ -164,6 +169,11 @@ func (s *podState) pinOf(sessionID string) string {
 }
 
 func (s *podState) close() {
+	select {
+	case <-s.stopped:
+	default:
+		close(s.stopped)
+	}
 	if s.podLn != nil {
 		_ = s.podLn.Close()
 	}
