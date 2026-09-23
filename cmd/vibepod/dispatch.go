@@ -335,6 +335,12 @@ func cmdNode(args []string) error {
 			fmt.Printf("@%s  %s\n", n.Host, state)
 			for _, h := range n.Mounts {
 				how := "cached from " + h.Host
+				switch {
+				case h.Relayed && h.Host == "":
+					how = "this machine's, relayed"
+				case h.Relayed:
+					how = "from " + h.Host + ", relayed through this machine"
+				}
 				if h.Native {
 					// Its own disk: no FUSE, no cache, no round trip. Running work
 					// where the data lives is full speed with nothing to configure.
@@ -350,9 +356,9 @@ func cmdNode(args []string) error {
 				fmt.Printf("  %-40s %s\n", short(h.At), how)
 			}
 		}
-		fmt.Println("\nThis machine's own directories are not replicated: that needs " +
-			"reverse mounts,\nwhich are not built. A command sent from one runs in the " +
-			"node's home.")
+		fmt.Println("\nThis machine's own directories reach a node only if the mount " +
+			"lists it in\nexpose_to:. A command sent from one that does not runs in " +
+			"the node's home.")
 		return nil
 	}
 	switch args[0] {

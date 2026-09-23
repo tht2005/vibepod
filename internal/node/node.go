@@ -416,6 +416,9 @@ func (s *server) sshCmd() string {
 // time and an hour later, which is what lets a pod here converge to a mount list
 // that changed on the machine that owns the agent.
 func (s *server) addMount(m proto.MountSpec) error {
+	if m.Relay != nil {
+		return s.addRelayed(m)
+	}
 	if m.Host == s.spec.Node {
 		return s.addOwn(m)
 	}
@@ -457,6 +460,38 @@ func (s *server) addMount(m proto.MountSpec) error {
 		fmt.Printf("prefetch %s: %s cannot, so the first pass reads over the "+
 			"network\n", m.At, s.fsm.Backend())
 	}
+	return nil
+}
+
+// addRelayed mounts a directory that reaches this machine through the one that owns
+// the agent: a port on this loopback, and a key made for that one tunnel.
+func (s *server) addRelayed(m proto.MountSpec) error {
+	if s.fsm == nil {
+		backend, err := fs.Pick()
+		if err != nil {
+			return fmt.Errorf("on %s: %w", s.spec.Node, err)
+		}
+		s.fsm = fs.NewManager(backend)
+	}
+	s.mu.Lock()
+	s.seq++
+	point := filepath.Join(s.spec.RunDir, "mnt", fmt.Sprintf("%d", s.seq))
+	s.mu.Unlock()
+	mount := &fs.Mount{Host: "127.0.0.1", RemotePath: "/", MountPoint: point,
+		At: m.At, ReadOnly: m.ReadOnly, Cache: cacheOf(m, s.spec),
+		Endpoint: &fs.Endpoint{Host: "127.0.0.1", Port: m.Relay.Port,
+			User: m.Relay.User, KeyFile: m.Relay.KeyFile}}
+	if err := s.fsm.Add(mount, ""); err != nil {
+		return fmt.Errorf("%s: mount %s through the relay: %w", s.spec.Node, m.At, err)
+	}
+	if _, err := s.call(&proto.Msg{Op: proto.OpBind,
+		Src: pod.StagedPath(point), Dst: m.At, ReadOnly: m.ReadOnly}); err != nil {
+		s.fsm.Remove(mount)
+		return fmt.Errorf("bind %s into the node pod: %w", m.At, err)
+	}
+	s.remember(proto.Held{At: m.At, Host: m.Host, Path: m.Path, ReadOnly: m.ReadOnly,
+		Relayed: true, Generation: m.Generation})
+	fmt.Printf("%s is relayed through the machine that owns this pod\n", m.At)
 	return nil
 }
 

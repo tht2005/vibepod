@@ -57,6 +57,13 @@ type podState struct {
 	// nodePods are the pods this pod has on other machines: the same composed
 	// zone, at the same paths, on each backend that runs one.
 	nodePods nodePods
+	// relays serve this machine's directories to nodes, keyed by where they are in
+	// the pod; relayLinks are each node's reverse forward to one of them; reach
+	// remembers whether a node can reach an owner by itself.
+	relays     map[string]*relayServer
+	relayLinks map[string]*relayLink
+	relaySeq   int
+	reach      map[string]string
 	// ports are the forwards this pod opened, closed when it goes down.
 	ports []proto.PortSpec
 	// lease is how long a node pod outlives silence from this daemon. It is the only
@@ -295,6 +302,7 @@ func (s *podState) close() {
 	for _, np := range s.nodePods.list() {
 		s.stopNodePod(np.host)
 	}
+	s.stopRelays()
 	// Then the pod: its processes hold the mounts open.
 	s.p.Kill()
 	if s.fs != nil {

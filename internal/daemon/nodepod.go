@@ -140,11 +140,14 @@ func (s *podState) nodeSpecFor(host, home string) (*proto.NodeSpec, error) {
 	// where the agent's own code is local. So a node holds everything it can, and a
 	// command sent to it from one of those directories runs in its own home, which
 	// is said rather than assumed (see dispatch).
-	spec.Mounts = s.desired(host)
-	if len(spec.Mounts) == 0 {
-		return nil, fmt.Errorf("a pod on %s would hold nothing: every mount in this "+
-			"pod is local to this machine", host)
+	// Relayed mounts need the node's pod to exist before their tunnel does, so the
+	// reconciler adds them straight after the pod is built.
+	for _, m := range s.desired(host) {
+		if m.Via != "relay" {
+			spec.Mounts = append(spec.Mounts, m)
+		}
 	}
+
 	return spec, nil
 }
 
@@ -370,8 +373,9 @@ func (s *podState) stopNodePod(host string) {
 	}
 	s.nodePods.drop(host)
 	// Its claim on writing to anything goes with it, so the next machine to take
-	// one of those mounts can have it writable.
+	// one of those mounts can have it writable; and so do its tunnels.
 	s.releaseWriter(host)
+	s.dropRelays(host)
 	h := s.d.pool.Host(host)
 	if _, err := h.Capture(fmt.Sprintf("%s/.vp/bin/vibepod nodedown --pod %s",
 		np.home, s.nodeName(host))); err != nil {

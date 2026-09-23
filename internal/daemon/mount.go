@@ -48,7 +48,11 @@ type mountRec struct {
 	// ManyWriters means the config accepted several machines writing into this
 	// mount, and with it that the last flush of any one file wins.
 	ManyWriters bool
-	Runtime     bool // added with `vp mount`, after the pod was up
+	// Via and ExposeTo travel to node pods: how one reaches this mount, and — for a
+	// directory of this machine's own — which machines may see it at all.
+	Via      string
+	ExposeTo []string
+	Runtime  bool // added with `vp mount`, after the pod was up
 	// Identity marks the agent's own configuration and credentials. They are
 	// the one plane that never leaves this machine.
 	Identity bool
@@ -120,7 +124,7 @@ func (s *podState) addMount(rm proto.MountSpec, pr *Progress, runtime bool) (*mo
 	rec := &mountRec{At: at, Src: point, Owner: rm.Host, RemotePath: rm.Path,
 		ExecOn: rm.ExecOn, Kind: s.fs.Backend(), ReadOnly: rm.ReadOnly,
 		Requires: rm.Requires, Cache: rm.Cache, Prefetch: rm.Prefetch,
-		ManyWriters: rm.ManyWriters, Gen: s.bumpGeneration(),
+		ManyWriters: rm.ManyWriters, Via: rm.Via, Gen: s.bumpGeneration(),
 		Runtime: runtime, fsMount: m}
 	if rm.ManyWriters {
 		s.mu.Lock()
@@ -278,6 +282,7 @@ func (s *podState) removeMount(what string) error {
 		if _, err := s.call(&proto.Msg{Op: proto.OpUnbind, Dst: m.At}); err != nil {
 			return fmt.Errorf("unbind %s in the pod: %w", m.At, err)
 		}
+		s.stopRelay(m.At)
 		if m.fsMount != nil && s.fs != nil {
 			s.fs.Remove(m.fsMount)
 		}

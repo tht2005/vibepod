@@ -71,6 +71,10 @@ type Mount struct {
 	// copies of the same file. Many lifts that, and with it accepts that the last
 	// flush of any one file wins.
 	Writers string `yaml:"writers"`
+	// Via is how a node pod reaches this mount: auto (default: direct if the node
+	// can reach the owner itself, else through this machine, and it says which),
+	// direct, or relay.
+	Via string `yaml:"via"`
 }
 
 type Exec struct {
@@ -298,7 +302,7 @@ func (c *Config) Resolve() (*Resolved, error) {
 					"exposed to it; add `expose_to: [%s]`", m.Local, m.ExecOn, m.ExecOn)
 			}
 			r.Mounts = append(r.Mounts, proto.MountSpec{At: at, Src: src,
-				ReadOnly: m.ReadOnly, ExecOn: m.ExecOn})
+				ReadOnly: m.ReadOnly, ExecOn: m.ExecOn, ExposeTo: m.ExposeTo})
 
 		case m.Remote != "":
 			host, path, inline, err := ParseRemote(m.Remote)
@@ -337,6 +341,12 @@ func (c *Config) Resolve() (*Resolved, error) {
 			if mode == "" {
 				mode = "fuse"
 			}
+			switch m.Via {
+			case "", "auto", "direct", "relay":
+			default:
+				return nil, fmt.Errorf("mount %s: via must be auto, direct or relay, "+
+					"not %q", m.Remote, m.Via)
+			}
 			switch m.Writers {
 			case "", "one", "many":
 			default:
@@ -346,7 +356,7 @@ func (c *Config) Resolve() (*Resolved, error) {
 			r.Mounts = append(r.Mounts, proto.MountSpec{At: at, Host: host,
 				Path: path, ReadOnly: m.ReadOnly, Mode: mode, ExecOn: m.ExecOn,
 				Requires: m.Requires, Cache: m.Cache, Prefetch: m.Prefetch,
-				ManyWriters: m.Writers == "many"})
+				ManyWriters: m.Writers == "many", Via: m.Via})
 
 		default:
 			return nil, fmt.Errorf("a mount needs local: or remote:")

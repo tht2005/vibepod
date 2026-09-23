@@ -207,10 +207,10 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 		}
 	}
 	switch {
-	case np != nil && owner == route.Pod:
-		// One of this machine's own directories, which no node pod holds until
-		// reverse mounts exist. Same answer as with no pod at all: run in that
-		// machine's home, and say so once.
+	case np != nil && owner == route.Pod && !np.holds(dir):
+		// One of this machine's own directories that was not exposed to this node.
+		// Same answer as with no pod at all: run in that machine's home, and say so
+		// once.
 		dir = ""
 		s.noteHomeDir(r.session, backend, r.cwd)
 	case np != nil:

@@ -160,6 +160,24 @@ type MountSpec struct {
 	// that the last flush of any one file wins. Off by default: one write-back
 	// cache per mount is the only coherence vibepod can enforce (see isWriter).
 	ManyWriters bool `json:"many_writers,omitempty"`
+	// Via is how a node pod reaches this mount's bytes: "direct" (its own ssh to
+	// the owner), "relay" (through this machine), or "auto" (try direct, fall back,
+	// say which). Empty means auto.
+	Via string `json:"via,omitempty"`
+	// ExposeTo is, for a directory on this machine, the machines allowed to see it.
+	// Sending local files to a remote machine is a decision about where data goes,
+	// so it is opt-in per mount and per machine.
+	ExposeTo []string `json:"expose_to,omitempty"`
+	// Relay, set in what a node is sent, says where the relayed copy is: a port on
+	// that node's loopback and a key made for that one tunnel.
+	Relay *RelaySpec `json:"relay,omitempty"`
+}
+
+// RelaySpec is one relayed mount as a node sees it.
+type RelaySpec struct {
+	Port    int    `json:"port"`
+	KeyFile string `json:"key_file"` // on the node, mode 0600
+	User    string `json:"user"`
 }
 
 // PortSpec is one forwarded port: Local on this machine reaches Remote on Host's
@@ -394,6 +412,9 @@ type Held struct {
 	ReadOnly bool `json:"ro,omitempty"`
 	// Generation this mount entered the desired list at.
 	Generation int64 `json:"gen,omitempty"`
+	// Relayed is set when the bytes come through this machine rather than from the
+	// owner directly.
+	Relayed bool `json:"relayed,omitempty"`
 	// Hop marks a node's own directory that arrived after the pod was built, and
 	// so goes through a local FUSE hop instead of a bind: nothing unprivileged can
 	// place a bind into a namespace that already exists. A rebuild makes it native.

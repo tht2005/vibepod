@@ -52,19 +52,47 @@ func (s *podState) bumpGeneration() int64 {
 }
 
 // desired is the mount list a node pod should hold: the composed zone, in order,
-// minus the identity plane and minus this machine's own directories, which a node
-// cannot reach without a reverse mount.
+// minus the identity plane, and minus this machine's own directories unless the
+// config exposed them to that node — sending local files to a remote machine is a
+// decision about where data goes, so it is never the default.
+//
+// Via is decided here, per node: direct, or relayed through this machine.
 func (s *podState) desired(host string) []proto.MountSpec {
 	var out []proto.MountSpec
 	for _, m := range s.mountList() {
-		if m.Identity || m.Owner == route.Pod {
+		if m.Identity {
 			continue
 		}
-		out = append(out, proto.MountSpec{At: m.At, Host: m.Owner, Path: m.RemotePath,
+		if m.Owner == route.Pod && !contains(m.ExposeTo, host) {
+			continue
+		}
+		spec := proto.MountSpec{At: m.At, Host: m.Owner, Path: m.RemotePath,
 			ReadOnly: m.ReadOnly || !s.isWriter(host, m.At), Cache: m.Cache,
-			Prefetch: m.Prefetch, Generation: m.Gen})
+			Prefetch: m.Prefetch, Generation: m.Gen, Via: s.via(host, m)}
+		if m.Owner == route.Pod {
+			spec.Host, spec.Path = "", m.Src
+		}
+		out = append(out, spec)
 	}
 	return out
+}
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *podState) mountAt(at string) *mountRec {
+	for _, m := range s.mountList() {
+		if m.At == at {
+			return m
+		}
+	}
+	return nil
 }
 
 // isWriter reports whether this machine is the one allowed to write to a mount.
@@ -136,6 +164,17 @@ func (s *podState) reconcile(np *nodePod) error {
 			if err := s.nodeCall(np, &proto.Msg{Op: proto.OpUnmount, Path: m.At}); err != nil {
 				return fmt.Errorf("%s: release the old %s: %w", np.host, m.At, err)
 			}
+		}
+		if m.Via == "relay" {
+			rec := s.mountAt(m.At)
+			if rec == nil {
+				continue
+			}
+			relay, err := s.relayFor(np, rec)
+			if err != nil {
+				return fmt.Errorf("%s: relay %s: %w", np.host, m.At, err)
+			}
+			m.Relay = relay
 		}
 		if err := s.nodeCall(np, &proto.Msg{Op: proto.OpMount,
 			Mounts: []proto.MountSpec{m}}); err != nil {
@@ -296,15 +335,12 @@ func (s *podState) renewEvery() time.Duration {
 // staleness is the per-mount answer for `vp ps`, the cockpit and a refused
 // dispatch: which machines are behind, and on what.
 func (s *podState) staleness() map[string][]string {
-	want := map[string]bool{}
-	for _, m := range s.mountList() {
-		if m.Identity || m.Owner == route.Pod {
-			continue
-		}
-		want[m.At] = true
-	}
 	out := map[string][]string{}
 	for _, np := range s.nodePods.list() {
+		want := map[string]bool{}
+		for _, m := range s.desired(np.host) {
+			want[m.At] = true
+		}
 		have := map[string]bool{}
 		for _, h := range np.heldList() {
 			have[h.At] = true

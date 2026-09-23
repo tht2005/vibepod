@@ -231,13 +231,14 @@ type daemonRun struct {
 	cmd    *exec.Cmd
 }
 
-func startDaemon(t *testing.T) *daemonRun {
+func startDaemon(t *testing.T, extra ...string) *daemonRun {
 	t.Helper()
 	d := &daemonRun{t: t, runDir: t.TempDir()}
 	d.cmd = exec.Command(filepath.Join(binDir, "vibepod"), "daemon", "-f")
 	d.cmd.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+d.runDir,
 		"VIBEPOD_SSH_CONFIG="+ssh.configFile,
 		"VIBEPOD_NODE_SSH_CONFIG="+ssh.configFile)
+	d.cmd.Env = append(d.cmd.Env, extra...)
 	if err := d.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

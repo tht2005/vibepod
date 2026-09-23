@@ -136,7 +136,9 @@ func (h *Host) Push(localPath, name string) error {
 
 // WriteFile puts a small file on a machine, for a node pod's spec.
 func (h *Host) WriteFile(remotePath string, content []byte) error {
-	script := fmt.Sprintf(`mkdir -p "$(dirname %s)" && cat > %s`,
+	// umask 077: a relay's key goes through here, and it must be readable by this
+	// user alone on a machine other people share.
+	script := fmt.Sprintf(`umask 077 && mkdir -p "$(dirname %s)" && cat > %s`,
 		quote(remotePath), quote(remotePath))
 	args := append(h.Opts(), h.Alias, "sh -c "+quote(script))
 	cmd := exec.Command("ssh", args...)

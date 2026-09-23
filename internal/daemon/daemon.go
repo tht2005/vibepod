@@ -591,7 +591,7 @@ func (s *podState) planLocal(m *proto.Msg) {
 		}
 		rec := &mountRec{At: ms.At, Src: ms.Src, Owner: route.Pod,
 			ExecOn: ms.ExecOn, Kind: "bind", ReadOnly: ms.ReadOnly,
-			Identity: ms.Identity, Gen: s.bumpGeneration()}
+			Identity: ms.Identity, ExposeTo: ms.ExposeTo, Gen: s.bumpGeneration()}
 		s.mu.Lock()
 		s.mounts = append(s.mounts, rec)
 		s.mu.Unlock()
