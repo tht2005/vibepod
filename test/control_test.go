@@ -44,6 +44,12 @@ func TestAMountAddedLaterReachesTheNodePods(t *testing.T) {
 	if out, errOut, code := vpIn(t, dir, "mount", "vptest3:"+remoteAlt); code != 0 {
 		t.Fatalf("mount: %s %s", out, errOut)
 	}
+	// Straight away, not on the next dispatch: `vp node` must not report the node
+	// behind once the mount command has returned.
+	if out, _, _ := vpIn(t, dir, "node"); strings.Contains(out, "behind") ||
+		!strings.Contains(out, remoteAlt) {
+		t.Errorf("the node pod did not converge when the mount was made:\n%s", out)
+	}
 	// The node pod holds it now, at the same path, and a command there can use it.
 	out, errOut, code := vpIn(t, dir, "run", "--", "/bin/sh", "-c",
 		"cd "+remoteAlt+" && vp @vptest2 /usr/bin/cat second.txt")
@@ -275,5 +281,32 @@ func (d *daemonRun) kill() {
 			_ = exec.Command("fusermount3", "-u", "-z", f[4]).Run()
 			_ = exec.Command("umount", f[4]).Run()
 		}
+	}
+}
+
+// A node's own directory mounted after its pod was built cannot be bound in — the
+// kernel refuses a bind from another mount namespace — so it arrives through a
+// local FUSE hop, works, and says it is one. Found by running the demo: before
+// this, the node reported itself behind forever.
+func TestANodesOwnDirectoryAddedLaterStillArrives(t *testing.T) {
+	dir := controlProject(t, "e2e-ctl-own", "")
+	if _, errOut, code := vpIn(t, dir, "up", "--push"); code != 0 {
+		t.Fatalf("up: %s", errOut)
+	}
+	if _, errOut, code := vpIn(t, dir, "node", "add", "vptest2"); code != 0 {
+		t.Fatalf("node add: %s", errOut)
+	}
+	if _, errOut, code := vpIn(t, dir, "mount", "vptest2:"+remoteAlt); code != 0 {
+		t.Fatalf("mount: %s", errOut)
+	}
+	out, _, _ := vpIn(t, dir, "node")
+	if strings.Contains(out, "behind") || !strings.Contains(out, "local FUSE hop") {
+		t.Errorf("the node's own directory did not arrive, or did not say how:\n%s", out)
+	}
+	out, errOut, code := vpIn(t, dir, "run", "--", "/bin/sh", "-c",
+		"cd "+remoteAlt+" && vp @vptest2 /usr/bin/cat second.txt")
+	if code != 0 || !strings.Contains(out, "from the second machine") {
+		t.Errorf("the node cannot read its own directory (exit %d): %q %q", code, out,
+			errOut)
 	}
 }

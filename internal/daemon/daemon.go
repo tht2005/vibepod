@@ -639,7 +639,12 @@ func (d *Daemon) mount(m *proto.Msg, pr *Progress, fromHost bool) error {
 	s.rebuildRoutes()
 	d.bus.Publish(event.Event{Kind: event.KindPod, Pod: s.name, Target: rec.Owner,
 		Detail: "mounted " + rec.At})
-	d.logf("pod %s: mounted %s at %s (runtime)", s.name, rec.source(), rec.At)
+	d.logf("pod %s: mounted %s at %s (runtime, generation %d)", s.name, rec.source(),
+		rec.At, rec.Gen)
+	// Every machine with a pod holds the whole composed zone, so a mount added here
+	// is one they are now missing. A machine that cannot be reached is left behind
+	// rather than blocking this; the lease loop catches it up when it answers.
+	s.reconcileAll("a new mount")
 	return nil
 }
 

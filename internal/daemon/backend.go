@@ -207,6 +207,12 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 		}
 	}
 	switch {
+	case np != nil && owner == route.Pod:
+		// One of this machine's own directories, which no node pod holds until
+		// reverse mounts exist. Same answer as with no pod at all: run in that
+		// machine's home, and say so once.
+		dir = ""
+		s.noteHomeDir(r.session, backend, r.cwd)
 	case np != nil:
 		// The composed zone is over there at the same paths, so the directory is
 		// carried as it is. If this particular mount is missing from that pod, say

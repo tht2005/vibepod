@@ -339,6 +339,10 @@ func cmdNode(args []string) error {
 					// Its own disk: no FUSE, no cache, no round trip. Running work
 					// where the data lives is full speed with nothing to configure.
 					how = "its own"
+					if h.Hop {
+						how += " · through a local FUSE hop until rebuilt " +
+							"(`vp node drop`, then `add`)"
+					}
 				}
 				if h.ReadOnly {
 					how += " · read-only"
@@ -346,6 +350,9 @@ func cmdNode(args []string) error {
 				fmt.Printf("  %-40s %s\n", short(h.At), how)
 			}
 		}
+		fmt.Println("\nThis machine's own directories are not replicated: that needs " +
+			"reverse mounts,\nwhich are not built. A command sent from one runs in the " +
+			"node's home.")
 		return nil
 	}
 	switch args[0] {

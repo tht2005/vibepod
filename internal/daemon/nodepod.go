@@ -131,19 +131,15 @@ func (s *podState) nodeSpecFor(host, home string) (*proto.NodeSpec, error) {
 		Version:  Version,
 		Lease:    s.lease,
 	}
-	for _, m := range s.mountList() {
-		if m.Identity || m.Owner != route.Pod {
-			continue
-		}
-		// A directory on *this* machine. Reaching it from a node means serving it
-		// back out — the reverse mount, which is not built. Refuse here, where a
-		// person is watching, rather than build a pod missing part of the tree.
-		return nil, fmt.Errorf("%s is a directory on this machine, and a pod on "+
-			"%s cannot reach it yet; mount it from a machine %s can see, or run "+
-			"that session on `pod`", m.At, host, host)
-	}
 	// The same list the reconciler converges to, writer election included, so a
 	// freshly built pod and a reconciled one cannot disagree.
+	//
+	// This machine's own directories are not in it. Reaching them from a node means
+	// serving them back out — the reverse mount, which is not built — and refusing
+	// the whole pod for that would make node pods useless for the ordinary case,
+	// where the agent's own code is local. So a node holds everything it can, and a
+	// command sent to it from one of those directories runs in its own home, which
+	// is said rather than assumed (see dispatch).
 	spec.Mounts = s.desired(host)
 	if len(spec.Mounts) == 0 {
 		return nil, fmt.Errorf("a pod on %s would hold nothing: every mount in this "+

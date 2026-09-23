@@ -267,6 +267,9 @@ func serve(specPath string) error {
 		if m.Host == spec.Node {
 			podSpec.Binds = append(podSpec.Binds,
 				proto.Bind{Src: m.Path, Dst: m.At, ReadOnly: m.ReadOnly})
+			// Recorded, or the reconciler sees it missing and tries to add it again.
+			s.remember(proto.Held{At: m.At, Host: m.Host, Path: m.Path, Native: true,
+				ReadOnly: m.ReadOnly, Generation: m.Generation})
 			continue
 		}
 		remote = append(remote, m)
@@ -399,16 +402,7 @@ func (s *server) sshCmd() string {
 // that changed on the machine that owns the agent.
 func (s *server) addMount(m proto.MountSpec) error {
 	if m.Host == s.spec.Node {
-		// This machine's own directory: a native bind, no FUSE and no cache. At
-		// build time these travel in the spec; arriving later they come here.
-		if _, err := s.call(&proto.Msg{Op: proto.OpBind, Src: m.Path, Dst: m.At,
-			ReadOnly: m.ReadOnly}); err != nil {
-			return fmt.Errorf("bind %s into the node pod: %w", m.At, err)
-		}
-		s.remember(proto.Held{At: m.At, Host: m.Host, Path: m.Path, Native: true,
-			ReadOnly: m.ReadOnly, Generation: m.Generation})
-		fmt.Printf("%s is this machine's own, bound at %s\n", m.Path, m.At)
-		return nil
+		return s.addOwn(m)
 	}
 	if s.fsm == nil {
 		backend, err := fs.Pick()
@@ -449,6 +443,63 @@ func (s *server) addMount(m proto.MountSpec) error {
 			"network\n", m.At, s.fsm.Backend())
 	}
 	return nil
+}
+
+// addOwn brings one of this machine's own directories into a pod that already
+// exists.
+//
+// At build time these are plain binds, made before pivot_root while the node's
+// filesystem is still in view. Afterwards there is no way to bind one in: the
+// kernel refuses a bind whose source is in another mount namespace, and this
+// process has no privilege to place one in the staging area the way a FUSE mount
+// arrives. So it goes through a FUSE hop to the node's own sftp-server — no ssh,
+// no network, no credentials — and arrives by propagation like any other mount.
+// Slower than a bind, and said so; `vp node drop` and `add` makes it native.
+func (s *server) addOwn(m proto.MountSpec) error {
+	if s.fsm == nil {
+		backend, err := fs.Pick()
+		if err != nil {
+			return fmt.Errorf("on %s: %w", s.spec.Node, err)
+		}
+		s.fsm = fs.NewManager(backend)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.seq++
+	point := filepath.Join(s.spec.RunDir, "mnt", fmt.Sprintf("%d", s.seq))
+	s.mu.Unlock()
+	mount := &fs.Mount{Host: "localhost", RemotePath: m.Path, MountPoint: point,
+		At: m.At, ReadOnly: m.ReadOnly}
+	if err := s.fsm.Add(mount, self+" sftp-local"); err != nil {
+		return fmt.Errorf("%s: mount its own %s: %w", s.spec.Node, m.Path, err)
+	}
+	if _, err := s.call(&proto.Msg{Op: proto.OpBind,
+		Src: pod.StagedPath(point), Dst: m.At, ReadOnly: m.ReadOnly}); err != nil {
+		s.fsm.Remove(mount)
+		return fmt.Errorf("bind %s into the node pod: %w", m.At, err)
+	}
+	s.remember(proto.Held{At: m.At, Host: m.Host, Path: m.Path, Native: true,
+		Hop: true, ReadOnly: m.ReadOnly, Generation: m.Generation})
+	fmt.Printf("%s is this machine's own; added after the pod was built, so it goes "+
+		"through a local FUSE hop until the pod is rebuilt\n", m.Path)
+	return nil
+}
+
+// SFTPLocal is `vibepod sftp-local`: the far end of that hop. sshfs and rclone run
+// their "ssh command" with ssh's arguments and then speak sftp on its stdio; this
+// ignores the arguments and becomes the machine's own sftp-server. Nothing leaves
+// the machine and nothing authenticates, because nothing needs to.
+func SFTPLocal() error {
+	for _, c := range []string{"/usr/lib/ssh/sftp-server", "/usr/libexec/sftp-server",
+		"/usr/lib/openssh/sftp-server", "/usr/libexec/openssh/sftp-server"} {
+		if _, err := os.Stat(c); err == nil {
+			return syscall.Exec(c, []string{c}, os.Environ())
+		}
+	}
+	return fmt.Errorf("no sftp-server on this machine")
 }
 
 // removeMount takes one mount out of this pod.

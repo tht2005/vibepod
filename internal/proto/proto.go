@@ -382,6 +382,10 @@ type Held struct {
 	ReadOnly bool `json:"ro,omitempty"`
 	// Generation this mount entered the desired list at.
 	Generation int64 `json:"gen,omitempty"`
+	// Hop marks a node's own directory that arrived after the pod was built, and
+	// so goes through a local FUSE hop instead of a bind: nothing unprivileged can
+	// place a bind into a namespace that already exists. A rebuild makes it native.
+	Hop bool `json:"hop,omitempty"`
 }
 
 // SessionInfo is one session and the machine it is on — the fact `ps` exists to

@@ -43,6 +43,12 @@ func main() {
 				os.Exit(exitUnavailable)
 			}
 			return
+		case "sftp-local":
+			if err := node.SFTPLocal(); err != nil {
+				fmt.Fprintln(os.Stderr, "sftp-local:", err)
+				os.Exit(1)
+			}
+			return
 		case "nodectl":
 			if err := node.Ctl(args[1:]); err != nil {
 				fmt.Fprintln(os.Stderr, "nodectl:", err)
