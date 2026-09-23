@@ -745,7 +745,15 @@ func (s *server) spawn(c *proto.Conn, m *proto.Msg, fds []int) (int, error) {
 		return 0, fmt.Errorf("a command needs stdin, stdout and stderr")
 	}
 	wait := make(chan int, 1)
-	req := &proto.Msg{Op: proto.OpSpawn, Argv: m.Argv, Env: m.Env, Cwd: m.Cwd,
+	// The caller's directory is the node's own home when the command came from a
+	// directory no pod holds, and a node pod holds only the composed zone — so that
+	// home is not in here. Its root is: a command that does not care where it runs
+	// starts there rather than failing to start at all.
+	cwd := m.Cwd
+	if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(s.p.Pid), "root", cwd)); err != nil {
+		cwd = "/"
+	}
+	req := &proto.Msg{Op: proto.OpSpawn, Argv: m.Argv, Env: m.Env, Cwd: cwd,
 		TTY: m.TTY, Session: m.Session}
 	var reply rpcReply
 	var err error

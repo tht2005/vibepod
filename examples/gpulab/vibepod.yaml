@@ -1,0 +1,50 @@
+# Two real GPU machines in one pod: gpu03 (AMD MI250, ROCm) and
+# aiotlab_3gpus_aiotlab (3x NVIDIA A30). Your agent stays on this machine with
+# its credentials; each machine keeps its own toolchain.
+#
+# Mounts are lazy sshfs/rclone mounts: nothing is copied until something reads
+# it. Each appears in the pod at the path the machine itself uses, so a path in
+# a traceback from either machine is a path you can open here.
+#
+# See README.md next to this file for a walkthrough.
+pod: gpulab
+
+mounts:
+  # --- gpu03 -------------------------------------------------------------
+  # /remote/vast0/duongnguyen rather than /home/duongnguyen: `readlink -f $HOME`
+  # on gpu03 says that is the canonical path, so it is what gpu03's own
+  # compilers and tracebacks print.
+  - remote: gpu03:/remote/vast0/duongnguyen/gpu-intern-26
+  - remote: gpu03:/remote/vast0/duongnguyen/models
+    readonly: true
+
+  # --- aiotlab_3gpus_aiotlab ---------------------------------------------
+  - remote: aiotlab_3gpus_aiotlab:/home/aiotlab/apps
+  - remote: aiotlab_3gpus_aiotlab:/home/aiotlab/data
+    readonly: true              # a dataset: nothing here should write to it
+
+  # Any number of mounts per machine; `at:` puts one somewhere else in the pod:
+  # - remote: gpu03:/remote/vast0/duongnguyen/pairs
+  #   at: /work/pairs
+
+# Tools that exist on one machine and not here. Each gets a wrapper in /vp/bin,
+# so typing the name anywhere in the pod runs it on the right machine.
+remote_tools:
+  gpu03: [rocm-smi, rocminfo, hipcc]
+  aiotlab_3gpus_aiotlab: [nvidia-smi]
+
+# The agent's own config and credentials: bound in from this machine, never
+# sent to either server.
+host_access:
+  - ~/.claude
+  - ~/.claude.json
+
+# What an agent inside the pod may `vp mount` by itself.
+can_mount: [gpu03, aiotlab_3gpus_aiotlab]
+
+# How long a node pod (`vp node add`) survives if this laptop disappears —
+# long enough for a closed lid, short enough not to squat on a shared server.
+lease: 12h
+
+exec:
+  default: pod                  # new sessions start on this machine

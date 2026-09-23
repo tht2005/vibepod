@@ -178,7 +178,13 @@ func configHosts() []string {
 }
 
 // podCwd keeps the caller's directory when the pod can see it, which is the
-// common case in a project, and falls back to the first mount.
+// common case in a project. Otherwise a directory of this machine's own, and
+// failing that the pod's root.
+//
+// Not "the first mount": that used to be the fallback, and in a pod whose first
+// mount is gpu03's, every command sent to another machine then looked like it was
+// standing in gpu03's files and was refused. The fallback has to be a directory
+// that belongs to nobody else.
 func podCwd(mounts []proto.MountSpec) string {
 	cwd, err := os.Getwd()
 	if err == nil {
@@ -189,12 +195,10 @@ func podCwd(mounts []proto.MountSpec) string {
 		}
 	}
 	for _, m := range mounts {
-		if !m.Identity {
+		if m.Host == "" && !m.Identity {
 			return m.At
 		}
 	}
-	// No config to consult: the pod is already running and was opened from
-	// somewhere else. Its own root is the one directory certain to exist.
 	return "/"
 }
 

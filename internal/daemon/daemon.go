@@ -773,7 +773,17 @@ func (d *Daemon) hostList(m *proto.Msg) ([]proto.HostInfo, error) {
 			dirs[name] = nil
 		}
 	}
+	identity := map[string]bool{}
+	for _, m := range s.mountList() {
+		if m.Identity {
+			identity[m.At] = true
+		}
+	}
 	for _, r := range s.table().Rules() {
+		// The agent's own config is bound in, but it is not a place you go.
+		if identity[r.Prefix] {
+			continue
+		}
 		dirs[r.Owner] = append(dirs[r.Owner], r.Prefix)
 		mounted[r.Owner] = true
 		if r.ExecOn != "" {

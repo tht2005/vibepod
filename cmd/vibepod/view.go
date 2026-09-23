@@ -216,6 +216,14 @@ func cmdHosts(args []string) error {
 // bare `cd`: the question "where can I go" has one answer wherever it is asked.
 func renderHosts(hosts []proto.HostInfo) string {
 	var b strings.Builder
+	// As wide as the longest name: ssh aliases like aiotlab_3gpus_aiotlab are
+	// ordinary, and a fixed column turns the list into a mess.
+	w := 6
+	for _, h := range hosts {
+		if len(h.Name) > w {
+			w = len(h.Name)
+		}
+	}
 	for _, h := range hosts {
 		status := "connected"
 		switch {
@@ -239,12 +247,12 @@ func renderHosts(hosts []proto.HostInfo) string {
 		case !h.Mounted:
 			dir = "vp mount " + h.Name + ":/path"
 		}
-		fmt.Fprintf(&b, "  @%-10s %-20s %s\n", h.Name, status, dir)
+		fmt.Fprintf(&b, "  @%-*s  %-19s %s\n", w, h.Name, status, dir)
 		// A machine this pod has not mounted owns no directories at all, which
 		// the old code could not represent: it always had at least one.
 		if len(h.Dirs) > 1 {
 			for _, extra := range h.Dirs[1:] {
-				fmt.Fprintf(&b, "  %-10s %-20s %s\n", "", "", short(extra))
+				fmt.Fprintf(&b, "   %-*s  %-19s %s\n", w, "", "", short(extra))
 			}
 		}
 	}
