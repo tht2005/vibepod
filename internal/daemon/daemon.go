@@ -314,17 +314,24 @@ func (d *Daemon) up(m *proto.Msg) error {
 	}()
 
 	podRun := filepath.Join(d.runDir, "pods", name)
-	if err := os.MkdirAll(podRun, 0o700); err != nil {
+	// The pod needs exactly one thing from its runtime directory: the socket.
+	// Give that its own subdirectory, because the bind that carries it into
+	// the pod is recursive — binding the whole directory would also carry in
+	// the FUSE mounts under mnt/ and the pod's own root, and a remote
+	// directory reachable at a second, unrouted path is a command silently
+	// running on the wrong machine.
+	ctlDir := filepath.Join(podRun, "ctl")
+	if err := os.MkdirAll(ctlDir, 0o700); err != nil {
 		return err
 	}
-	sock := filepath.Join(podRun, "pod.sock")
+	sock := filepath.Join(ctlDir, "pod.sock")
 	_ = os.Remove(sock)
 	ln, err := proto.Listen(sock)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", sock, err)
 	}
 
-	m.Spec.RunDir = podRun
+	m.Spec.RunDir = ctlDir
 	m.Spec.Root = filepath.Join(podRun, "root")
 	if m.Spec.ShimBin == "" {
 		m.Spec.ShimBin, err = shimBinary()

@@ -424,3 +424,33 @@ func TestRemoteOnlyToolIsRoutedAndExplainsItself(t *testing.T) {
 		t.Errorf("the error does not explain itself: %q", errOut)
 	}
 }
+
+// A remote directory must be reachable at exactly one path.
+//
+// The socket that carries vpsh's questions is bound in from the pod's runtime
+// directory, and that bind is recursive — so binding the directory itself also
+// carried in the FUSE mounts beneath it, and the pod's own root. A second path
+// to the same files is not a cosmetic problem: /vp is forced to run locally,
+// so commands there read the remote's files over FUSE while executing on the
+// wrong machine, silently.
+func TestARemoteMountHasExactlyOnePathInThePod(t *testing.T) {
+	if ssh == nil {
+		t.Skip("no sshd fixture on this machine")
+	}
+	out, _, code := onRemote(t, "cd "+workDir+
+		" && /usr/bin/grep -c fuse /proc/self/mountinfo; /usr/bin/ls /vp/run")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if lines[0] != "1" {
+		t.Errorf("the pod has %s FUSE mounts, want 1:\n%s", lines[0], out)
+	}
+	rest := strings.Join(lines[1:], " ")
+	if strings.Contains(rest, "mnt") || strings.Contains(rest, "root") {
+		t.Errorf("/vp/run exposes more than the socket: %q", rest)
+	}
+	if !strings.Contains(rest, "pod.sock") {
+		t.Errorf("/vp/run is missing the socket: %q", rest)
+	}
+}
