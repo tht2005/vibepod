@@ -4,8 +4,9 @@
 > which is what this document now describes. v1 routed commands by working
 > directory through a seccomp exec gate; using it showed that the mechanism
 > cannot be made trustworthy, so v2 replaces it with an explicit per-session
-> **backend** and a live shell on it (§3), adds runtime mounting (§9), and makes
-> the TUI the primary surface. PLAN.md records what was measured before building
+> **backend** and a live shell on it (§3), adds runtime mounting (§9), makes the
+> TUI the primary surface, and solves compute-on-one-machine/data-on-another by
+> reproducing paths on the compute node rather than translating them (§6). PLAN.md records what was measured before building
 > v1 and the six bugs verification found. §13 has the v2 milestones; §12 the
 > remaining unknowns.
 
@@ -235,7 +236,7 @@ interactive programs. This is the same line that separates the two dispatch path
      prod · staging · build-box
 ```
 
-### Components (one Go binary, four names via argv[0])
+### Components (one Go binary, five names via argv[0])
 
 | Name | Role |
 |---|---|
@@ -243,6 +244,7 @@ interactive programs. This is the same line that separates the two dispatch path
 | `vibepod` | rootless user daemon, auto-spawned on first use. Owns everything long-lived |
 | `vpinit` | PID 1 inside each pod. Holds the mount namespace open, performs every pod mount on its one capable thread — including mounts added long after `up` — reaps zombies, forwards signals |
 | `vpsh` | the pod's `$SHELL`. Records the command line, then runs it locally or writes it into the session backend's live shell |
+| `vpnode` | the same binary on a *compute node*, pushed on consent. Builds a session-private userns so the pod's paths exist there verbatim (§6), and supervises that node's rclone cache |
 
 `vpinit` exists because **a mount namespace only survives while a process is inside it.**
 Without it, detaching would destroy the pod.
@@ -387,6 +389,13 @@ the agent to dispatch its searches.
 The deciding factor is the invalidation hook — see below. `rclone` is **not** installed on
 this machine, so it is a real dependency to vendor or require.
 
+It is also the one component that must run in **two places**. On this machine it composes the
+pod's filesystem view; on a compute node it caches another machine's data to local disk and
+writes back on close (§6, *Compute on one machine, data on another*). Nothing about
+local-disk caching or write-back can be done from here, because the disk being cached to is
+not here — which is what makes a remote footprint unavoidable rather than a convenience
+(§7).
+
 ### Execution-aware cache invalidation
 
 A general-purpose network filesystem must guess: it caches for a second because it has no
@@ -420,42 +429,132 @@ That removes the v1 trap where a config with `exec_on:` and no `expose_to:` was 
 `up` and could only fail at run time. What remains true: without a reverse mount, the target
 cannot see the path, and **the dispatch is refused with both sides named**.
 
-Transport is undecided (§12): sshfs slave mode over `ssh -R`, rclone serving sftp back
-through the tunnel, or a push-copy. Note the asymmetry — for a reverse mount, the
-*remote's* reads become network reads, so the caching story runs the opposite direction
-from a normal mount.
+A reverse mount is **the same problem as the next section with the origin changed**: some
+machine must see a directory it does not own, at the path the pod uses. So it uses the same
+mechanism — `vpnode` reproduces the path in a session-private userns and rclone serves the
+bytes with a local-disk cache — and the only difference is that the origin is this machine
+rather than another remote, which means the served side is the one behind a home uplink.
+That asymmetry is why the cache matters more here: the *remote's* reads are the network
+reads, and `prefetch:` is usually the right answer for anything larger than source.
 
-### Cross-mounts: one machine's compute on another's data
+### Compute on one machine, data on another
 
-The case that motivated this: gpu03 has the GPUs, gpu05 has the dataset. Both are mounted in
-the pod, so *you* can see both — but gpu03 cannot see gpu05, and that is the whole problem.
+The case that forced this section: gpu05 has the GPUs, gpu03 has the data. Both are mounted
+in the pod, so *you* see both — and gpu05 does not see gpu03 at all. Dispatch a command to
+gpu05 with a cwd of `/remote/vast0/duongnguyen/proj` and one of two things happens.
 
-Three transports, and none of them is always available:
+The good outcome is that the path does not exist and the command fails.
 
-| `via:` | path | cost | requires |
-|---|---|---|---|
-| `direct` | gpu03 mounts gpu05 itself | one hop, full speed | gpu03→gpu05 reachable, FUSE + sshfs on gpu03, agent forwarding permitted |
-| `host` | gpu05 → this machine → gpu03 | **every read crosses your uplink twice** | nothing beyond `expose_to:` |
-| `copy` | stage it with rsync, then run | fastest on re-read; two copies to keep straight | disk on the target |
+**The bad outcome is that it does exist and holds different bytes.** Same string, different
+filesystem — so `--out ./checkpoints` succeeds, writes somewhere real, and you learn about it
+days later. On a cluster where `/remote/...` is a naming convention rather than one shared
+volume, this is likely rather than exotic. Path identity is what makes single-machine
+dispatch work and is exactly what makes cross-machine dispatch dangerous.
 
-`direct` is the one worth wanting, and it is also the one that keeps §7's promise: gpu03
-authenticates to gpu05 through your **forwarded agent socket**, so no key is ever stored
-there and the authority dies with the connection. That is the credential proxy of §7 with a
-better justification than `git push` gave it.
+Shared storage is the happy case — CephFS, NFS, Lustre and GPFS homes are the normal state
+of a real cluster, and then gpu05 already has the bytes at the path, and the right amount of
+vibepod machinery is none. But it cannot be assumed, so the general mechanism has to work
+when the mount path and the compute node's own paths have nothing to do with each other.
 
-But it cannot be the assumption. Node-to-node ssh is firewalled on many clusters; compute
-nodes frequently have no `/dev/fuse` or no sshfs installed; `AllowAgentForwarding no` is
-common on shared machines. So `via:` is **configurable, and defaults to `auto`**: at mount
-time vibepod probes reachability, FUSE, sshfs and agent forwarding, picks the best available,
-and **reports which it chose and why the others were ruled out**. A failure reads
+#### Do not translate paths at run time
+
+The tempting answer is to mount gpu03's data on gpu05 under a private prefix and rewrite
+paths in flight. It rewrites `cwd` exactly and absolute paths in `argv` reliably. Then it
+misses paths inside a YAML config, paths built at run time in Python, and paths written into
+a file for a later job to read.
+
+**That is an unbounded leak list — the precise shape of the thing §3 deleted the exec gate
+for.** Introducing a second one would be indefensible. It also breaks the property path
+identity was bought for: if gpu05's traceback prints `/tmp/vp-abc/gpu03/remote/vast0/...`,
+you cannot paste it into an editor.
+
+#### Reproduce the path instead: the remote gets a pod too
+
+vibepod already knows how to build a user namespace with arbitrary paths arranged at
+arbitrary locations. That is what a pod *is*. Running the same construction on the compute
+node makes the problem disappear. Once per session, on gpu05:
 
 ```
-gpu03 → gpu05  direct: no sshfs on gpu03
-               falling back to host relay (2 hops, ~31ms + ~12ms)
+rclone mount --vfs-cache-mode full   ~/.vp/raw/<id>     # gpu05's root ns, unprivileged
+unshare(CLONE_NEWUSER|CLONE_NEWNS)                      # a session-private namespace
+bind  ~/.vp/raw/<id> → /remote/vast0/duongnguyen/proj   # the exact path the pod uses
+exec the session's shell inside it
 ```
 
-rather than timing out with nothing to go on. The probe result is cached for the mount's
-life; `via:` set explicitly skips probing and fails loudly if that transport is unavailable.
+The FUSE placement repeats a lesson §6 already learned locally: mount rclone in the node's
+**root** namespace, where `fusermount3` is setuid and works, then bind it into the namespace.
+A bind mount inside a userns needs no privilege — it is what the pod does today — and it may
+land on a path that already exists on gpu05 without disturbing it, because the namespace is
+private to that session.
+
+What this buys is worth stating plainly: **the same absolute path in the pod, on gpu03, and
+on gpu05.** No rewriting anywhere, tracebacks from any machine openable in your editor, and
+a Makefile on gpu03 that hardcodes `/remote/vast0/...` keeps working. It is per *session*,
+not per command, so it fits the live-shell model of §3 exactly: arranged once, then every
+command in that session simply runs.
+
+#### Fallback: a uniform prefix, decided at `up`
+
+Unprivileged user namespaces are usually available and sometimes administratively disabled.
+Where they are, the fallback is **not** translation. It is to mount everything — in the pod
+*and* on every machine — at a prefix any user can create anywhere:
+
+```
+~/.vp/<pod>/<name>/...
+```
+
+Identical everywhere by construction, no privilege, no rewriting. The honest cost, and the
+reason this is the fallback rather than the default: absolute paths in existing remote
+scripts and configs stop resolving, including the remote's own. This is chosen at `up`,
+reported at `up`, and never switched underneath a running session.
+
+#### The marker file
+
+Underneath both modes, each mount carries a marker (`.vp/<pod>-<mount-uuid>`). The
+dispatcher stats it on the backend once per mount+backend pair and caches the result.
+Present means these are our bytes; absent means refuse, naming both sides. One round trip
+per pair, and it is what separates "already on shared storage, go ahead" from "gpu05 has a
+same-named directory, stop".
+
+#### Writes: cached on local disk, written back on close
+
+A checkpoint written over a network filesystem stalls the step loop, and a timer that sweeps
+for changes is bloat. Both are avoided by the mount already being there:
+`--vfs-cache-mode full --vfs-write-back` puts writes on gpu05's own NVMe immediately and
+uploads after last use. The trigger is **file close, not a clock**.
+
+Reads cache to the same local disk, which is why this one mechanism ends up doing three jobs
+that would otherwise be three features:
+
+| want | mechanism |
+|---|---|
+| a dataset on fast local disk | the read cache, warmed as the job reads |
+| checkpoints that do not stall training | write-back on close |
+| re-reads that do not hit the network | the same read cache |
+
+This is also why mounts need no `role:` — there is no project/dataset/output distinction
+left to declare, only `readonly:` and the cache's own bounds.
+
+The one case the lazy cache handles badly is many small files: a first epoch over 1.28M
+JPEGs is latency-bound while the GPUs idle, even though every epoch after is local NVMe. So
+`prefetch: true` on a mount does an upfront `rclone copy` for exactly that shape. Opt-in,
+because a run that touches one percent of a tree should not pay for all of it.
+
+#### Where the bytes come from
+
+Independent of how the path is arranged: gpu05's rclone reaches gpu03 either **directly**
+(one hop, full speed, authenticating through your forwarded agent socket so no key is ever
+stored there) or **relayed through this machine** (two hops, works with no node-to-node
+connectivity at all). Node-to-node ssh is firewalled on many clusters and
+`AllowAgentForwarding no` is common, so `via:` defaults to `auto`, probes at mount time, and
+**reports what it chose and why the alternatives were ruled out**:
+
+```
+gpu05 → gpu03  direct: connection refused (node-to-node ssh filtered)
+               relaying through this machine (2 hops, ~31ms + ~12ms)
+```
+
+rather than timing out with nothing to go on.
 
 ### Mount modes
 
@@ -493,10 +592,20 @@ credential helper back over the existing channel, scoped to that command's lifet
 Nothing is stored remotely — it is proxied, not copied. Honest caveat: while it runs,
 root on that host can use your agent. Hence `forward_credentials` is per-host config.
 
-**Remote footprint.** Nothing is installed speculatively. When a routed command needs a
-missing tool (`rg`, `fd`, `jq`), vibepod prompts before pushing a static binary to
-`~/.vibepod/bin`. `toolbin: true` pre-authorizes a host so agent runs aren't interrupted.
-Removable with one `rm -rf`.
+**Remote footprint.** Nothing is installed speculatively, and nothing system-wide. Two
+kinds of push, both user-owned under `~/.vp/bin` and both removable with `vp clean @host`:
+
+- **Missing tools** (`rg`, `fd`, `jq`) that a dispatched command needs. Prompted; `toolbin:
+  true` pre-authorizes a host so agent runs are not interrupted.
+- **`vpnode` and `rclone`** on a machine used as a *compute* backend for another machine's
+  data. Asked once per host, then remembered.
+
+The second is a genuine change from "nothing but ssh on the remote", so it is worth being
+precise about why it is not optional. Caching a dataset on gpu05's NVMe and writing
+checkpoints back on close require a process **on gpu05**; no amount of cleverness here can
+write to a disk over there. The alternative is not a smaller footprint, it is not having the
+feature. What the rule still guarantees is unchanged and is the part that mattered: no
+credentials, no agent install, no key material, nothing outside a directory you own.
 
 **Audit log.** Every command and the machine it landed on, in one place. For a tool whose
 pitch is "your agent runs commands on prod", provable history is a requirement.
@@ -547,9 +656,12 @@ mounts:
     readonly: true
   - remote: staging:/srv/api       # collides with prod:/srv/api
     at: /staging-api               # explicit override required
-  - remote: gpu05:/data            # gpu03's compute, gpu05's data (§6)
-    reachable_from: [gpu03]        # ...so gpu03 needs to see it too
-    via: auto                      # direct | host | copy; auto probes and reports
+  - remote: gpu03:/remote/vast0/duongnguyen/imagenet
+    readonly: true
+    compute_on: [gpu05]            # gpu05 must see this at the same path (§6)
+    via: auto                      # direct | relay; auto probes and reports
+    cache: 200G                    # on the compute node's local disk
+    prefetch: true                 # many small files: copy up front, do not warm lazily
 
 remote_tools:                      # exist only on a remote; shimmed in /vp/bin
   - rocm-smi                       # ahead of PATH, since nothing here to shadow
@@ -564,6 +676,10 @@ ports:
 can_mount:                         # what `vp mount` may reach from inside the pod
   - "gpu*"                         # default: any host in your ssh config
   - lab-7
+
+paths: identity                    # or `uniform` (~/.vp/<pod>/...) where a compute
+                                   # node has unprivileged userns disabled. Probed at
+                                   # `up` and reported; never switched mid-session.
 
 exec:
   default: pod                     # the backend a new session opens on
@@ -874,7 +990,7 @@ replays the buffer. Killing the pod kills everything inside it.
 | Prompt | full path plus the machine it runs on | the path is the honest cost of path identity; the machine is what you need before pressing return |
 | Sessions | many per pod | `vp shell` attaches independent terminals, `docker exec -it` style |
 | Live config | every `vibepod.yaml` field changeable at runtime; `vp save` snapshots | a config that needs a restart costs you the session and the agent's context to add one machine |
-| Reverse mounts | `expose_to:` on local mounts | "edit locally, run on the big machine" is impossible without them |
+| Reverse mounts | `expose_to:`, sharing the compute-node mechanism | "edit locally, run on the big machine" is impossible without them, and it is the same path-reproduction problem with the origin changed — not a second mechanism |
 | Visibility | live exec log + generated `CLAUDE.md` | one mechanism per audience; no output annotation to corrupt parsed streams. The fragment carries more weight in v2: it is how the agent learns `vp` at all |
 | `vp tree` | mounts and exec structure in one view | the mount half explains the exec half; replaces a separate `mounts` command |
 | Remote depth | leaf by default, `-x` polls `ps` | we see what we dispatched, not what it spawned; do not fake fidelity we lack |
@@ -882,8 +998,14 @@ replays the buffer. Killing the pod kills everything inside it.
 | Routed env | forward the caller's delta; never identity, never credentials | blanket forwarding breaks §7's promise and the remote's toolchain; sending nothing fails silently as a broken install |
 | Guardrails | none — the log is the answer | pattern-matching shell strings is leaky both ways; the agent already gates commands |
 | Hosts | ssh_config aliases | inherits ProxyJump/keys/ports for free |
-| Cross-machine data | `via: auto \| direct \| host \| copy`, probed at mount time | node-to-node ssh is often firewalled, compute nodes often lack FUSE or sshfs, and `AllowAgentForwarding no` is common — so direct cannot be assumed, and a fallback must be explained rather than time out |
-| Remote credentials | forwarded ssh-agent socket, never a key | lets gpu03 mount gpu05 as you, with nothing stored there and authority that dies with the connection |
+| Cross-machine paths | reproduce the path in a session-private userns on the compute node | translating paths at run time misses config files, run-time-built paths and paths handed to later jobs — the same unbounded leak list §3 deleted the gate for. Reproducing costs one `unshare` per session and nothing after |
+| Path fallback | uniform `~/.vp/<pod>/...` prefix everywhere, chosen at `up` | where userns is disabled the answer is still not translation. Cost stated: the remote's own absolute paths stop resolving |
+| Same-name safety | a marker file per mount, checked once per mount+backend pair | a compute node holding a *same-named different* directory is the failure that loses work silently; one cached stat rules it out |
+| Local-disk cache | rclone VFS on the **compute node**, write-back on close | a checkpoint over a network FS stalls the step loop, and a timer sweep is bloat. File close is the event. One mount then serves dataset caching, checkpoint write-back and re-reads |
+| Dataset warming | lazy cache, `prefetch: true` opt-in | a run touching one percent of a tree should not copy all of it; a first epoch over a million small files is latency-bound and wants the copy |
+| Transport | `via: auto` — direct, else relayed through this machine | node-to-node ssh is firewalled on many clusters and `AllowAgentForwarding no` is common, so direct cannot be assumed and a fallback must be *explained* rather than time out |
+| Remote credentials | forwarded ssh-agent socket, never a key | lets gpu05 read gpu03 as you, with nothing stored there and authority that dies with the connection |
+| Compute-node footprint | `vpnode` + `rclone` in `~/.vp/bin`, asked once per host | caching to a node's local disk needs a process on that node; the alternative is not a smaller footprint but no feature. Still no credentials, no agent, nothing system-wide |
 | Names | `vibepod` for the TUI, `vp` for verbs | one is opened, the other is typed constantly; `vpctl` was a mouthful for the common case |
 | Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; process startup is negligible against RTT |
 
@@ -898,9 +1020,13 @@ replays the buffer. Killing the pod kills everything inside it.
    logging — have to make up the difference?
 3. **rclone as a dependency** — vendor the binary, require it, or reconsider a custom
    Go FUSE once access patterns are known?
-4. **Reverse mounts to several targets** — `expose_to: [a, b]` needs one transport per
-   target. Worth supporting, or is one target per local mount enough?
-5. **`sync` mode implementation** — rsync loop, or a mutagen-style watcher?
+4. **Unprivileged userns on compute nodes** — how common is it actually disabled on the
+   clusters this is for? `doctor` can report it, but the answer decides whether the uniform-
+   prefix fallback is a corner case or the path most people are on.
+5. **Cache eviction on a compute node** — `cache:` bounds the size, but a shared node's
+   local disk is contended and a job that fills it hurts other people. Evict LRU, refuse to
+   start when the bound cannot be met, or write to a node-specific scratch that is already
+   quota'd?
 6. **Backend switch mid-command** — a session's live remote shell may be busy when `vp use`
    or `b` arrives. Queue the switch, refuse it, or open a second shell and leave the first
    running?
@@ -949,12 +1075,16 @@ ordered so that each one is usable on its own.
 - **M5 — the TUI.** Not started. The cockpit of §9: machines, sessions, activity, and
   handoff on `⏎`. `console.go` is the rough draft; the new work is the handoff and the
   keymap.
-- **M6 — cross-machine.** Not started. `via: auto|direct|host|copy` with the mount-time
-  probe, the forwarded-agent credential proxy, reverse mounts (`expose_to:`), `toolbin`
-  pushes, port forwards. This is where "gpu03's compute on gpu05's data" lands, and the
-  credential proxy finally has a use case worth its complexity.
-- **M7 — polish.** Not started. `expose_to` to several targets, `sync` mode, and the rest
-  of the tree's views from §9: `-x` to expand a remote subtree, `--running`,
+- **M6 — compute on one machine, data on another.** Not started, and the largest of these.
+  `vpnode` pushed on consent, the session-private userns that reproduces the pod's paths on a
+  compute node, the marker-file check, rclone on the node with a local-disk cache and
+  write-back on close, `prefetch:`, `via: auto` with the probe and its explanation, the
+  forwarded-agent credential proxy, and the uniform-prefix fallback for nodes without
+  userns. Also `toolbin` pushes and port forwards, which share the consent path.
+  Success is a training run whose data lives on gpu03, whose GPUs are gpu05's, and whose
+  every path is the same string on all three machines.
+- **M7 — polish.** Not started. Reverse mounts (`expose_to:`) for "edit here, run there",
+  `sync` mode, and the rest of the tree's views from §9: `-x` to expand a remote subtree, `--running`,
   `--failed --since`, one subtree by pid, `--mounts`/`--exec`.
 
 ### Gaps inside v1's own surface
