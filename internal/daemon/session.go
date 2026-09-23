@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	"vibepod/internal/event"
 	"vibepod/internal/pod"
@@ -34,7 +33,7 @@ func (a *attachment) done() { a.closed.Do(func() { close(a.stop) }) }
 func (s *podState) startSession(m *proto.Msg, kind string) (*session, error) {
 	id := m.Session
 	if id == "" {
-		id = fmt.Sprintf("s%d", time.Now().UnixNano()%100000)
+		id = s.nextSessionID()
 	}
 	env := append([]string{}, m.Env...)
 	env = append(env,
@@ -155,6 +154,16 @@ func (sess *session) close() {
 	if sess.master != nil {
 		_ = sess.master.Close()
 	}
+}
+
+// nextSessionID counts within the pod. Short and stable, so that
+// `vpctl attach work 2` is something a person can type from what they saw in
+// the tree — and so that two sessions starting at once cannot collide.
+func (s *podState) nextSessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionSeq++
+	return fmt.Sprintf("%d", s.sessionSeq)
 }
 
 // findSession locates a running session by id, or the only one if unnamed.

@@ -33,6 +33,11 @@ type Daemon struct {
 
 	mu   sync.Mutex
 	pods map[string]*podState
+	// creating holds, per name, a channel closed when that pod's creation
+	// finishes. Creating a pod takes long enough — namespaces, and possibly a
+	// remote mount — that two clients racing on the same name would otherwise
+	// both pass the existence check and one whole pod would be orphaned.
+	creating map[string]chan struct{}
 }
 
 // RunDir is where the daemon keeps its sockets and per-pod state.
@@ -55,7 +60,8 @@ func New(runDir string, logger *log.Logger) (*Daemon, error) {
 		return nil, err
 	}
 	return &Daemon{runDir: runDir, logger: logger, pool: pool,
-		bus: event.NewBus(4000), pods: map[string]*podState{}}, nil
+		bus: event.NewBus(4000), pods: map[string]*podState{},
+		creating: map[string]chan struct{}{}}, nil
 }
 
 func (d *Daemon) logf(format string, a ...any) {
@@ -258,11 +264,37 @@ func (d *Daemon) up(m *proto.Msg) error {
 	}
 	name := m.Spec.Name
 	d.mu.Lock()
-	_, exists := d.pods[name]
-	d.mu.Unlock()
-	if exists {
-		return fmt.Errorf("pod %q is already running", name)
+	if _, exists := d.pods[name]; exists {
+		d.mu.Unlock()
+		return errAlreadyRunning(name)
 	}
+	// Someone else is already building it: wait for them rather than making
+	// the caller deal with a race it did not cause. Two terminals opening the
+	// same project at once is ordinary.
+	if ch, busy := d.creating[name]; busy {
+		d.mu.Unlock()
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Minute):
+			return fmt.Errorf("pod %q is taking too long to start", name)
+		}
+		d.mu.Lock()
+		_, ok := d.pods[name]
+		d.mu.Unlock()
+		if ok {
+			return errAlreadyRunning(name)
+		}
+		return fmt.Errorf("pod %q failed to start; see the daemon log", name)
+	}
+	done := make(chan struct{})
+	d.creating[name] = done
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.creating, name)
+		d.mu.Unlock()
+		close(done)
+	}()
 
 	podRun := filepath.Join(d.runDir, "pods", name)
 	if err := os.MkdirAll(podRun, 0o700); err != nil {
@@ -424,6 +456,12 @@ func (d *Daemon) lookup(name string) (*podState, error) {
 	return s, nil
 }
 
+// errAlreadyRunning is the one error clients treat as success: asking for a
+// pod that exists is what `vpctl run` does every time after the first.
+func errAlreadyRunning(name string) error {
+	return fmt.Errorf("pod %q is already running", name)
+}
+
 // use pins a session's executor. This is the sharp edge of the in-pod
 // control plane: an agent that can pin its own executor can send itself to a
 // machine its directory would never have chosen, granting itself a capability
@@ -454,7 +492,7 @@ func (d *Daemon) use(m *proto.Msg) error {
 func (d *Daemon) runDirect(s *podState, m *proto.Msg, fds []int) (int, error) {
 	id := m.Session
 	if id == "" {
-		id = fmt.Sprintf("s%d", time.Now().UnixNano()%100000)
+		id = s.nextSessionID()
 	}
 	sess := &session{id: id, kind: "run", argv: m.Argv, done: make(chan int, 1)}
 	s.mu.Lock()

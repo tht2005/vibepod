@@ -161,12 +161,13 @@ func cmdRun(args []string) int {
 	if err := fs.Parse(head); err != nil {
 		return 2
 	}
-	name := fs.Arg(0)
-	if len(rest) == 0 {
+	// With a "--", anything before it names the pod: `vpctl run work -- make`.
+	// Without one, the whole tail is the command: `vpctl run claude`.
+	name := ""
+	if len(rest) > 0 {
+		name = fs.Arg(0)
+	} else {
 		rest = fs.Args()
-		if len(rest) > 0 {
-			name, rest = "", rest
-		}
 	}
 	if len(rest) == 0 {
 		fmt.Fprintln(os.Stderr, "vpctl run: nothing to run; use -- cmd args")

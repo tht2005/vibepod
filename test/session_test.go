@@ -106,3 +106,46 @@ func TestDetachLeavesTheSessionRunningAndAttachReplaysIt(t *testing.T) {
 	}
 	second.send("exit\n")
 }
+
+// A pod is not one terminal. Each session has its own working directory and
+// its own executor, which is what makes `vpctl shell` useful next to a
+// running agent rather than instead of it.
+func TestSeveralSessionsOnOnePod(t *testing.T) {
+	first := onPTY(t, "shell", "e2e")
+	defer first.stop()
+	second := onPTY(t, "shell", "e2e")
+	defer second.stop()
+
+	for i, r := range []*ptyRun{first, second} {
+		if !r.waitFor(t, "$", 10*time.Second) {
+			t.Fatalf("session %d never got a prompt; got:\n%s", i+1, r.out.String())
+		}
+	}
+	// Distinct shells: a directory change in one must not move the other.
+	first.send("cd /tmp && echo first-is:$PWD\n")
+	if !first.waitFor(t, "first-is:/tmp", 10*time.Second) {
+		t.Fatalf("session 1 did not run; got:\n%s", first.out.String())
+	}
+	second.send("echo second-is:$PWD\n")
+	if !second.waitFor(t, "second-is:", 10*time.Second) {
+		t.Fatalf("session 2 did not run; got:\n%s", second.out.String())
+	}
+	if strings.Contains(second.out.String(), "second-is:/tmp\r") {
+		t.Errorf("the two sessions share a working directory")
+	}
+
+	out, _, code := vpctl(t, "ps")
+	if code != 0 {
+		t.Fatalf("ps exit %d", code)
+	}
+	// ps counts sessions; both shells should be in it.
+	if !strings.Contains(out, "e2e") {
+		t.Fatalf("ps lost the pod:\n%s", out)
+	}
+	tree, _, _ := vpctl(t, "tree", "e2e")
+	if n := strings.Count(tree, "session "); n < 2 {
+		t.Errorf("tree shows %d sessions, want at least 2:\n%s", n, tree)
+	}
+	first.send("exit\n")
+	second.send("exit\n")
+}

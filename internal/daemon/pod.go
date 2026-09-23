@@ -31,11 +31,12 @@ type podState struct {
 
 	shimOnce sync.Mutex
 
-	mu       sync.Mutex
-	shims    map[string]string // shadowed path -> stashed original
-	sessions map[string]*session
-	pins     map[string]string // session id -> pinned target
-	used     map[string]bool   // hosts this pod has routed to
+	mu         sync.Mutex
+	shims      map[string]string // shadowed path -> stashed original
+	sessions   map[string]*session
+	pins       map[string]string // session id -> pinned target
+	used       map[string]bool   // hosts this pod has routed to
+	sessionSeq int
 	// pendingSession names the session whose first process has been asked for
 	// but has not yet reached execve.
 	pendingSession string
