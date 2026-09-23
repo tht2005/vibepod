@@ -68,6 +68,18 @@ func startSSHD(dir string, port int) (*sshFixture, error) {
 	if err := os.MkdirAll(fixBin, 0o755); err != nil {
 		return nil, err
 	}
+	// An rclone on the fixture host's PATH only, so a node pod there uses it while
+	// this side stays on sshfs — the shape of a real server like aiotlab, whose
+	// distribution rclone predates --sftp-ssh.
+	if r := os.Getenv("VIBEPOD_TEST_NODE_RCLONE"); r != "" {
+		b, err := os.ReadFile(r)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(fixBin, "rclone"), b, 0o755); err != nil {
+			return nil, err
+		}
+	}
 	if err := os.WriteFile(filepath.Join(fixBin, "vp-only-tool"),
 		[]byte("#!/bin/sh\necho only-on-the-remote \"$@\"\n"), 0o755); err != nil {
 		return nil, err

@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -309,4 +310,39 @@ func TestANodesOwnDirectoryAddedLaterStillArrives(t *testing.T) {
 		t.Errorf("the node cannot read its own directory (exit %d): %q %q", code, out,
 			errOut)
 	}
+}
+
+// A file written in a node pod reaches the machine that owns the directory even when
+// the pod is dropped straight afterwards. With write-back caching the node holds
+// bytes that exist nowhere else until they upload, and stopping without waiting for
+// that would lose them silently.
+func TestWritesInANodePodSurviveDroppingIt(t *testing.T) {
+	dir := controlProject(t, "e2e-ctl-flush", "")
+	if _, errOut, code := vpIn(t, dir, "up", "--push"); code != 0 {
+		t.Fatalf("up: %s", errOut)
+	}
+	if _, errOut, code := vpIn(t, dir, "node", "add", "vptest2"); code != 0 {
+		t.Fatalf("node add: %s", errOut)
+	}
+	name := "checkpoint-" + fmt.Sprint(time.Now().UnixNano()%100000) + ".bin"
+	// Big enough that the upload is still going when the command returns.
+	if _, errOut, code := vpIn(t, dir, "run", "--", "/bin/sh", "-c",
+		"cd "+remoteSrv+" && vp @vptest2 /bin/sh -c 'head -c 20000000 /dev/zero > "+name+"'"); code != 0 {
+		t.Fatalf("write: %s", errOut)
+	}
+	if _, errOut, code := vpIn(t, dir, "node", "drop", "vptest2"); code != 0 {
+		t.Fatalf("node drop: %s", errOut)
+	}
+	fi, err := os.Stat(filepath.Join(remoteSrv, name))
+	if err != nil || fi.Size() != 20000000 {
+		t.Errorf("the checkpoint did not survive dropping the node pod: %v, size %v",
+			err, sizeOf(fi))
+	}
+}
+
+func sizeOf(fi os.FileInfo) int64 {
+	if fi == nil {
+		return -1
+	}
+	return fi.Size()
 }

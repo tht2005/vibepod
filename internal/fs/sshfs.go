@@ -29,7 +29,22 @@ func (*Sshfs) Mount(m *Mount, sshCommand string) error {
 	if m.ReadOnly {
 		opts = append(opts, "ro")
 	}
-	cmd := exec.Command("sshfs", hostSpec(m), m.MountPoint, "-o", combine(opts))
+	target := hostSpec(m)
+	if e := m.Endpoint; e != nil {
+		// A relay: a loopback port tunnelled to a server this pod started, with a
+		// key made for that one tunnel. The host key is the server's own, reached
+		// through an authenticated ssh connection vibepod already holds, so there is
+		// nothing a known_hosts entry would add.
+		target = fmt.Sprintf("%s@%s:%s", e.User, e.Host, m.RemotePath)
+		for i, o := range opts {
+			if strings.HasPrefix(o, "ssh_command=") {
+				opts[i] = "ssh_command=ssh -p " + fmt.Sprint(e.Port) + " -i " + e.KeyFile +
+					" -o BatchMode=yes -o LogLevel=ERROR -o IdentitiesOnly=yes" +
+					" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+			}
+		}
+	}
+	cmd := exec.Command("sshfs", target, m.MountPoint, "-o", combine(opts))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))

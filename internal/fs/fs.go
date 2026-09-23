@@ -31,6 +31,14 @@ type Mount struct {
 	// shape a lazy cache handles badly: a first epoch over a million small files
 	// is latency-bound while the GPUs idle.
 	Prefetch bool
+	// Endpoint, when set, is where to connect instead of resolving Host through
+	// ssh config: a port on this machine's loopback that a relay tunnels through,
+	// with a key made for that one tunnel.
+	Endpoint *Endpoint
+	// LocalHop means RemotePath is a directory on *this* machine, mounted through
+	// FUSE only so that it can reach a namespace that already exists. rclone mounts
+	// a local path directly; sshfs goes through this machine's own sftp-server.
+	LocalHop bool
 	backend  Backend
 	// rcAddr is this mount's own control address. Per mount, not per backend: a
 	// pod with three mounts runs three rclone processes, and one shared field
@@ -52,6 +60,14 @@ type Backend interface {
 }
 
 var ErrNoInvalidate = fmt.Errorf("backend cannot be told to forget cached state")
+
+// Endpoint is an sftp server reached directly rather than by ssh alias.
+type Endpoint struct {
+	Host    string
+	Port    int
+	User    string
+	KeyFile string
+}
 
 // Flusher is a backend with a write-back cache that can be asked whether it has
 // finished writing. Only rclone has one.
@@ -130,6 +146,13 @@ func (mg *Manager) Add(m *Mount, sshCommand string) error {
 	if err := mg.backend.Mount(m, sshCommand); err != nil {
 		return fmt.Errorf("mount %s:%s: %w", m.Host, m.RemotePath, err)
 	}
+	// `rclone mount --daemon` returns before the mount exists. Binding the point in
+	// that window binds an empty directory, which then looks exactly like a remote
+	// directory that happens to be empty — so wait for the mount itself.
+	if err := waitMounted(m.MountPoint, 20*time.Second); err != nil {
+		unmountPoint(m.MountPoint)
+		return fmt.Errorf("mount %s:%s: %w", m.Host, m.RemotePath, err)
+	}
 	mg.mu.Lock()
 	mg.mounts = append(mg.mounts, m)
 	mg.mu.Unlock()
@@ -200,6 +223,33 @@ func (mg *Manager) Unmount() {
 	for _, m := range mounts {
 		unmountPoint(m.MountPoint)
 	}
+}
+
+// waitMounted polls until something is mounted at point.
+func waitMounted(point string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if isMountPoint(point) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("nothing appeared at %s within %s", point, timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func isMountPoint(point string) bool {
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return true // cannot tell; do not block a mount on it
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) > 4 && f[4] == point {
+			return true
+		}
+	}
+	return false
 }
 
 // UnmountUnder releases every FUSE mount beneath a directory, for the case where

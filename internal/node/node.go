@@ -312,8 +312,23 @@ func serve(specPath string) error {
 
 	defer func() {
 		ln.Close()
+		// The pod's processes go first, so nothing is still writing; closing their
+		// files is also what starts write-back's last uploads.
 		p.Kill()
 		if s.fsm != nil {
+			// Then wait for those uploads, whatever the reason for stopping — `down`,
+			// `node drop`, or an expired lease. Unmounting first would discard a
+			// checkpoint that exists nowhere else, which is the worst thing this
+			// program could do; if a flush fails the mount is still released, but
+			// the log says what was lost rather than nothing.
+			for _, m := range s.fsm.Mounts() {
+				if m.ReadOnly {
+					continue
+				}
+				if err := s.fsm.Flush(m, 5*time.Minute); err != nil {
+					fmt.Printf("flush %s before stopping: %v\n", m.At, err)
+				}
+			}
 			s.fsm.Unmount()
 		}
 		// An expired lease means the daemon is gone, so nothing will run `nodedown`
@@ -472,7 +487,7 @@ func (s *server) addOwn(m proto.MountSpec) error {
 	point := filepath.Join(s.spec.RunDir, "mnt", fmt.Sprintf("%d", s.seq))
 	s.mu.Unlock()
 	mount := &fs.Mount{Host: "localhost", RemotePath: m.Path, MountPoint: point,
-		At: m.At, ReadOnly: m.ReadOnly}
+		At: m.At, ReadOnly: m.ReadOnly, LocalHop: true}
 	if err := s.fsm.Add(mount, self+" sftp-local"); err != nil {
 		return fmt.Errorf("%s: mount its own %s: %w", s.spec.Node, m.Path, err)
 	}

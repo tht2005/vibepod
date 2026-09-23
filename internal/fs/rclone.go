@@ -32,10 +32,17 @@ func (r *Rclone) Mount(m *Mount, sshCommand string) error {
 	}
 	m.rcAddr = fmt.Sprintf("127.0.0.1:%d", port)
 
-	args := []string{
-		"mount", ":sftp:" + m.RemotePath, m.MountPoint,
-		"--sftp-host", m.Host,
-		"--sftp-ssh", sshCommand,
+	var args []string
+	if m.LocalHop {
+		args = []string{"mount", m.RemotePath, m.MountPoint}
+	} else {
+		conn, err := sftpArgs(m, sshCommand)
+		if err != nil {
+			return err
+		}
+		args = append([]string{"mount", ":sftp:" + m.RemotePath, m.MountPoint}, conn...)
+	}
+	args = append(args,
 		"--vfs-cache-mode", "full",
 		// vibepod is the only thing that touches the remote tree, so the
 		// cache can be trusted until a command says otherwise.
@@ -43,7 +50,7 @@ func (r *Rclone) Mount(m *Mount, sshCommand string) error {
 		"--poll-interval", "0",
 		"--rc", "--rc-addr", m.rcAddr, "--rc-no-auth",
 		"--daemon",
-	}
+	)
 	if m.ReadOnly {
 		args = append(args, "--read-only")
 	} else {
@@ -77,14 +84,13 @@ func (r *Rclone) Flush(m *Mount, timeout time.Duration) error {
 	}
 	deadline := time.Now().Add(timeout)
 	for {
-		stats, err := r.rc(m, "vfs/stats", nil)
+		queued, err := r.pending(m)
 		if err != nil {
 			// Cannot ask. Saying "flushed" would be a guess about somebody's
 			// checkpoint, so it is a refusal instead.
 			return fmt.Errorf("cannot ask %s whether it has finished writing: %w",
 				m.MountPoint, err)
 		}
-		queued := vfsQueued(stats)
 		if queued == 0 {
 			return nil
 		}
@@ -94,6 +100,28 @@ func (r *Rclone) Flush(m *Mount, timeout time.Duration) error {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+}
+
+// pending is how many writes this mount's rclone has not finished.
+//
+// vfs/stats says so directly, and arrived in rclone 1.54. Older ones — the
+// distribution rclone on a real server is often older — have only core/stats,
+// whose "transferring" list is the uploads in flight. Each mount is its own rclone
+// process and write-back uploads as soon as a file is closed, so for one mount
+// that list is the same answer.
+func (r *Rclone) pending(m *Mount) (int, error) {
+	if stats, err := r.rc(m, "vfs/stats", nil); err == nil {
+		return vfsQueued(stats), nil
+	}
+	stats, err := r.rc(m, "core/stats", nil)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	if list, ok := stats["transferring"].([]any); ok {
+		n += len(list)
+	}
+	return n, nil
 }
 
 // vfsQueued digs the outstanding-write count out of rclone's reply. The shape of
@@ -145,11 +173,13 @@ func (r *Rclone) rc(m *Mount, path string, body map[string]string) (map[string]a
 // the first pass while the machine that asked for the data sits idle. Opt-in,
 // because a run that touches one percent of a tree should not pay for all of it.
 func (r *Rclone) Prefetch(m *Mount, sshCommand string) error {
-	args := []string{"copy", ":sftp:" + m.RemotePath,
-		filepath.Join(cacheRoot(m), "prefetch"),
-		"--sftp-host", m.Host, "--sftp-ssh", sshCommand,
-		"--transfers", "16", "--checkers", "16",
+	conn, err := sftpArgs(m, sshCommand)
+	if err != nil {
+		return err
 	}
+	args := append([]string{"copy", ":sftp:" + m.RemotePath,
+		filepath.Join(cacheRoot(m), "prefetch"), "--transfers", "16",
+		"--checkers", "16"}, conn...)
 	out, err := exec.Command("rclone", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("prefetch %s:%s: %v: %s", m.Host, m.RemotePath, err,
