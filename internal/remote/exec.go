@@ -8,6 +8,19 @@ import (
 	"syscall"
 )
 
+// InPod returns a view of this machine whose commands run inside its node pod
+// rather than on the machine itself. Everything else — the multiplexed
+// connection, the descriptors, the pid file, the signal path — is unchanged: a
+// node pod is a namespace, not a different transport.
+func (h *Host) InPod(home, pod string) *Host {
+	c := *h
+	c.enter = fmt.Sprintf("%s/.vp/bin/vibepod nodeexec --pod %s --", home, pod)
+	return &c
+}
+
+// InPod reports whether this view enters a node pod.
+func (h *Host) IsInPod() bool { return h.enter != "" }
+
 // Req is one command to run on a remote machine.
 type Req struct {
 	Dir  string   // working directory, as it exists on that machine
@@ -35,8 +48,22 @@ func (h *Host) Run(r Req) (int, error) {
 	// shell look for a program called "VAR=v". Before it, they are exported to
 	// the exec'd process, and the pid is still the shell's — so the pid file
 	// above still names the command, and signals still reach it.
-	script := fmt.Sprintf(`d=%s; mkdir -p "$d"; echo $$ > "$d/%s"; cd %s || exit 1; %sexec %s`,
-		runDirExpr, r.ID, quote(r.Dir), assignments(r.Env), joinArgs(r.Argv))
+	// Inside a node pod the command is handed to `nodeexec`, which passes these
+	// same descriptors on to the pod and waits. The pid file still names the
+	// shell, so the signal path below is unchanged.
+	command := joinArgs(r.Argv)
+	if h.enter != "" {
+		command = h.enter + " " + command
+	}
+	// An empty Dir means "this machine's own home": the caller's directory was one
+	// this machine does not have, and a command that does not care where it runs
+	// should run rather than be refused. Which it was is reported; see the daemon.
+	cd := "cd " + quote(r.Dir) + " || exit 1"
+	if r.Dir == "" {
+		cd = "cd || exit 1"
+	}
+	script := fmt.Sprintf(`d=%s; mkdir -p "$d"; echo $$ > "$d/%s"; %s; %sexec %s`,
+		runDirExpr, r.ID, cd, assignments(r.Env), command)
 
 	args := h.Opts()
 	if r.TTY {

@@ -296,3 +296,71 @@ func cmdBrief(args []string) error {
 	fmt.Print(reply.Detail)
 	return nil
 }
+
+// cmdNode is the surface for pods on other machines.
+//
+// Building one copies the vibepod binary into ~/.vp/bin there and nothing else —
+// no credentials, no agent, no install outside that directory. Typing the command
+// is the consent: it is the cheapest form that is still explicit, and `vibepod up
+// --push` is the same grant for every machine the config names.
+func cmdNode(args []string) error {
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	pod := podArg("")
+	if len(args) == 0 {
+		reply, err := call(c, &proto.Msg{Op: proto.OpNodeList, Pod: pod})
+		if err != nil {
+			return err
+		}
+		if len(reply.NodeInfos) == 0 {
+			fmt.Println("no machine in this pod is running a pod of its own")
+			fmt.Println("  `vp node add <machine>` builds one: the composed tree, at " +
+				"the same paths, on that machine")
+			return nil
+		}
+		for _, n := range reply.NodeInfos {
+			fmt.Printf("@%s\n", n.Host)
+			native := map[string]bool{}
+			for _, at := range n.Native {
+				native[at] = true
+			}
+			for _, at := range n.Mounts {
+				how := "cached from its owner"
+				if native[at] {
+					// Its own disk: no FUSE, no cache, no round trip. Running work
+					// where the data lives is full speed with nothing to configure.
+					how = "its own"
+				}
+				fmt.Printf("  %-40s %s\n", short(at), how)
+			}
+		}
+		return nil
+	}
+	switch args[0] {
+	case "add":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: vp node add <machine>")
+		}
+		if _, err := call(c, &proto.Msg{Op: proto.OpNodeAdd, Pod: pod,
+			Target: args[1]}); err != nil {
+			return err
+		}
+		fmt.Printf("%s is running a pod with this pod's mounts — `vp use %s`\n",
+			args[1], args[1])
+		return nil
+	case "drop":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: vp node drop <machine>")
+		}
+		if _, err := call(c, &proto.Msg{Op: proto.OpNodeDrop, Pod: pod,
+			Target: args[1]}); err != nil {
+			return err
+		}
+		fmt.Printf("the pod on %s is stopped\n", args[1])
+		return nil
+	}
+	return fmt.Errorf("usage: vp node [add|drop <machine>]")
+}

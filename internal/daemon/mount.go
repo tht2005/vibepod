@@ -36,7 +36,13 @@ type mountRec struct {
 	ExecOn     string // a suggestion, surfaced and never applied
 	Kind       string // "bind" or the FUSE backend's name
 	ReadOnly   bool
-	Runtime    bool // added with `vp mount`, after the pod was up
+	// Requires, Cache and Prefetch travel to a node pod, which is where they
+	// mean something: what the machine must have, how much of its disk the cache
+	// may take, and whether to fill it up front.
+	Requires []string
+	Cache    string
+	Prefetch bool
+	Runtime  bool // added with `vp mount`, after the pod was up
 	// Identity marks the agent's own configuration and credentials. They are
 	// the one plane that never leaves this machine.
 	Identity bool
@@ -97,7 +103,7 @@ func (s *podState) addMount(rm proto.MountSpec, pr *Progress, runtime bool) (*mo
 
 	point := filepath.Join(s.runDir(), "mnt", fmt.Sprintf("%d", s.mountSeq()))
 	m := &fs.Mount{Host: rm.Host, RemotePath: rm.Path, MountPoint: point,
-		At: at, ReadOnly: rm.ReadOnly}
+		At: at, ReadOnly: rm.ReadOnly, Cache: rm.Cache, Prefetch: rm.Prefetch}
 	pr.step("mounting %s:%s via %s… ", rm.Host, rm.Path, s.fs.Backend())
 	if err := s.fs.Add(m, host.SSHCommand()); err != nil {
 		pr.failed()
@@ -107,6 +113,7 @@ func (s *podState) addMount(rm proto.MountSpec, pr *Progress, runtime bool) (*mo
 
 	rec := &mountRec{At: at, Src: point, Owner: rm.Host, RemotePath: rm.Path,
 		ExecOn: rm.ExecOn, Kind: s.fs.Backend(), ReadOnly: rm.ReadOnly,
+		Requires: rm.Requires, Cache: rm.Cache, Prefetch: rm.Prefetch,
 		Runtime: runtime, fsMount: m}
 	s.mu.Lock()
 	s.mounts = append(s.mounts, rec)

@@ -22,7 +22,15 @@ type Mount struct {
 	MountPoint string // host path where it is mounted
 	At         string // where it appears in the pod
 	ReadOnly   bool
-	backend    Backend
+	// Cache bounds the on-disk cache, as rclone spells a size ("200G"). Empty
+	// leaves rclone's own default, which is unbounded — fine on your own machine,
+	// not fine on a shared node's scratch disk.
+	Cache string
+	// Prefetch copies the tree up front instead of warming it lazily. For the one
+	// shape a lazy cache handles badly: a first epoch over a million small files
+	// is latency-bound while the GPUs idle.
+	Prefetch bool
+	backend  Backend
 	// rcAddr is this mount's own control address. Per mount, not per backend: a
 	// pod with three mounts runs three rclone processes, and one shared field
 	// would leave every invalidation going to whichever mounted last.
@@ -43,6 +51,24 @@ type Backend interface {
 }
 
 var ErrNoInvalidate = fmt.Errorf("backend cannot be told to forget cached state")
+
+// Prefetcher is a backend that can fill its cache up front. Only rclone can, and
+// only the one shape needs it: many small files, where a lazy cache is
+// latency-bound on the first pass while the machine that asked for the data idles.
+type Prefetcher interface {
+	Prefetch(m *Mount, sshCommand string) error
+}
+
+// Prefetch fills the cache for a mount that asked for it, and reports whether the
+// backend could. A backend that cannot is not a failure: the mount works, the
+// first pass is merely slower, and saying so belongs to the caller.
+func (mg *Manager) Prefetch(m *Mount, sshCommand string) (bool, error) {
+	p, ok := mg.backend.(Prefetcher)
+	if !ok || !m.Prefetch {
+		return false, nil
+	}
+	return true, p.Prefetch(m, sshCommand)
+}
 
 // Pick chooses the best backend available on this machine. rclone is
 // preferred because it alone supports execution-aware invalidation; sshfs is
@@ -134,6 +160,33 @@ func (mg *Manager) Unmount() {
 	}
 }
 
+// UnmountUnder releases every FUSE mount beneath a directory, for the case where
+// the process that made them is gone and there is nobody left who knows what they
+// were. A mountpoint whose server has died fails every access until it is
+// detached, so this is cleanup rather than tidiness.
+func UnmountUnder(dir string) {
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return
+	}
+	var points []string
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		p := f[4]
+		if p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/") {
+			points = append(points, p)
+		}
+	}
+	// Deepest first, so a nested mount never blocks its parent.
+	sort.Slice(points, func(i, j int) bool { return len(points[i]) > len(points[j]) })
+	for _, p := range points {
+		unmountPoint(p)
+	}
+}
+
 // unmountPoint detaches a FUSE mount lazily, so a dead link cannot wedge
 // shutdown. fusermount3 is the setuid helper on the host; the pod has no
 // access to it, which is exactly why mounts live out here.
@@ -146,6 +199,11 @@ func unmountPoint(point string) {
 			return
 		}
 	}
+	// A mount whose server has already died is not in the helper's table any more,
+	// and fusermount then refuses to touch it — leaving a directory that fails
+	// every access and cannot even be removed. plain umount still detaches it, and
+	// this is the one case that needs it.
+	_ = exec.Command("umount", point).Run()
 }
 
 // Mounts lists what is mounted, for vpctl tree.

@@ -111,7 +111,13 @@ func setup(m *testing.M) (int, error) {
 	daemonP = exec.Command(filepath.Join(binDir, "vibepod"), "daemon", "-f")
 	daemonP.Env = append(os.Environ(), "VIBEPOD_RUNDIR="+runDir)
 	if ssh != nil {
-		daemonP.Env = append(daemonP.Env, "VIBEPOD_SSH_CONFIG="+ssh.configFile)
+		daemonP.Env = append(daemonP.Env, "VIBEPOD_SSH_CONFIG="+ssh.configFile,
+			// What a node uses for its *own* outbound ssh, when it has to reach a
+			// third machine for a mount it does not own. On a real cluster that is
+			// the node's own config plus the agent socket forwarded for the mount;
+			// here the fixture's config is on the same machine, which is what makes
+			// this testable at all.
+			"VIBEPOD_NODE_SSH_CONFIG="+ssh.configFile)
 	}
 	daemonP.Stderr = os.Stderr
 	if err := daemonP.Start(); err != nil {
@@ -198,6 +204,16 @@ func inRemotePod(t *testing.T, script string) (string, string, int) {
 	t.Helper()
 	requireSSH(t)
 	return vpIn(t, remoteDir, "run", "--", "/bin/sh", "-c", script)
+}
+
+// sshCapture runs one command on a fixture host, for the assertions that are
+// about what vibepod left on a machine rather than about what it did.
+func sshCapture(t *testing.T, host, command string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("ssh", "-F", ssh.configFile, "-o", "BatchMode=yes",
+		"-o", "LogLevel=ERROR", host, command)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func requireSSH(t *testing.T) {

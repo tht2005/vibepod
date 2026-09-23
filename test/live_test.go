@@ -56,9 +56,12 @@ func TestMountIntoARunningPod(t *testing.T) {
 	if !strings.Contains(out, "from the second machine") {
 		t.Errorf("the new mount does not serve its files: %q", out)
 	}
-	// And the machine is a backend now, which is the point of mounting it.
+	// And the machine is a backend now, which is the point of mounting it. From a
+	// directory that is nobody else's: a command whose cwd belongs to a *third*
+	// machine is refused rather than run somewhere of the same name, which the node
+	// tests cover.
 	out, _, _ = vpIn(t, dir, "run", "--", "/bin/sh", "-c",
-		"vp @vptest2 /usr/bin/env | /usr/bin/grep -c SSH_CONNECTION")
+		"cd / && vp @vptest2 /usr/bin/env | /usr/bin/grep -c SSH_CONNECTION")
 	if strings.TrimSpace(out) != "1" {
 		t.Errorf("the machine mounted at runtime is not usable as a backend: %q", out)
 	}

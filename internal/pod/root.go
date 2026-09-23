@@ -38,6 +38,12 @@ const (
 	BriefPath = "/vp/run/brief.md"
 )
 
+// StagedPath is where a host mountpoint appears inside a pod, once the daemon
+// has made it and propagation has carried it into the staging area.
+func StagedPath(hostMountPoint string) string {
+	return filepath.Join(StageDir, filepath.Base(hostMountPoint))
+}
+
 // briefLinks are where an agent will actually look. All three read a project
 // instruction file from the working directory upwards, so a copy at the root of
 // the pod's filesystem is found without anyone editing a repository — which is
@@ -209,9 +215,14 @@ func buildVp(vp string, spec *proto.Spec) error {
 			return err
 		}
 	}
-	// The pod's $SHELL, which records a command line and then runs it.
-	if err := sys.BindOver(spec.ShellBin, filepath.Join(vp, "bin", "vpsh"), true); err != nil {
-		return err
+	// The pod's $SHELL, which records a command line and then runs it. A node pod
+	// has neither: there is no agent on a node to record, and the recording
+	// belongs to the machine that dispatched the command.
+	if spec.ShellBin != "" {
+		if err := sys.BindOver(spec.ShellBin, filepath.Join(vp, "bin", "vpsh"),
+			true); err != nil {
+			return err
+		}
 	}
 	// The agent's own view of vibepod: read-only, and limited by which socket
 	// it can reach rather than by what the binary can do.

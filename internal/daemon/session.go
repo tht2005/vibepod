@@ -167,6 +167,17 @@ func (s *podState) openShell(sess *session, backend string, argv []string,
 		}
 		dir := route.Dir(s.table(), cwd, backend)
 		host := s.d.pool.Host(backend)
+		// In that machine's pod when it has one, so the shell opens in a directory
+		// that means what it says. Without one the shell is on the bare machine,
+		// which is right when the directory is that machine's own and is what the
+		// prompt then shows.
+		if np := s.nodePods.get(backend); np != nil {
+			host = host.InPod(np.home, s.name)
+		} else if err := s.ensureNodePod(backend); err == nil {
+			if np := s.nodePods.get(backend); np != nil {
+				host = host.InPod(np.home, s.name)
+			}
+		}
 		cmd, err := host.Shell(dir, slave)
 		if err != nil {
 			master.Close()

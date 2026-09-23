@@ -52,6 +52,7 @@ func loadSpec(name string) (*proto.Msg, error) {
 		EnvPolicy: &proto.EnvPolicy{Mode: res.ForwardEnv.Mode,
 			Names: res.ForwardEnv.Names},
 		Mounts:    res.Mounts,
+		Machines:  res.Machines,
 		ToolHosts: res.ToolHosts,
 		CanMount:  res.CanMount,
 		Config:    path,
@@ -63,12 +64,17 @@ func loadSpec(name string) (*proto.Msg, error) {
 
 func cmdUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
+	push := fs.Bool("push", false,
+		"allow vibepod to put one binary in ~/.vp/bin on the machines this pod uses")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	m, err := loadSpec(fs.Arg(0))
 	if err != nil {
 		return err
+	}
+	if *push {
+		m.Nodes = configHosts()
 	}
 	c, err := connect()
 	if err != nil {
@@ -149,6 +155,25 @@ func cmdRun(args []string) int {
 		return 1
 	}
 	return reply.Code
+}
+
+// configHosts is every machine this project's config mentions, which is the scope
+// `--push` consents to. It is deliberately the config's list and not "any machine
+// vibepod ends up talking to".
+func configHosts() []string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil
+	}
+	path, found := config.Find(cwd)
+	if !found {
+		return nil
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil
+	}
+	return cfg.HostList()
 }
 
 // podCwd keeps the caller's directory when the pod can see it, which is the

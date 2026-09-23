@@ -48,6 +48,18 @@ type Mount struct {
 	ReadOnly bool     `yaml:"readonly"`
 	ExecOn   string   `yaml:"exec_on"`
 	ExposeTo []string `yaml:"expose_to"`
+	// Requires are paths a machine must have before a pod on it may hold this
+	// mount: `[/opt/rocm, /dev/kfd]`. It converts "is this node actually
+	// equivalent?" from something a failed job tells you into something `up`
+	// answers.
+	Requires []string `yaml:"requires"`
+	// Cache bounds the disk a node may use for this mount, as rclone spells a
+	// size ("200G"). A shared node's scratch disk is not yours to fill.
+	Cache string `yaml:"cache"`
+	// Prefetch copies the tree onto that disk up front, for the one shape a lazy
+	// cache handles badly: many small files, where the first pass is
+	// latency-bound while the machine that asked for the data sits idle.
+	Prefetch bool `yaml:"prefetch"`
 }
 
 type Exec struct {
@@ -146,7 +158,10 @@ func (t *RemoteTools) UnmarshalYAML(n *yaml.Node) error {
 
 // Resolved is a config checked against the filesystem and flattened.
 type Resolved struct {
-	Name       string
+	Name string
+	// Machines is every machine this config names, mount or no mount. A compute
+	// node with no data of its own is still a machine this pod runs commands on.
+	Machines   []string
 	Tools      []string
 	ToolHosts  map[string]string
 	CanMount   []string
@@ -213,7 +228,7 @@ func Find(dir string) (string, bool) {
 // Resolve expands paths and applies the placement guard. Every refusal happens
 // here, at up time, while a human is watching — never mid-run.
 func (c *Config) Resolve() (*Resolved, error) {
-	r := &Resolved{Name: c.Pod, Default: c.Exec.Default,
+	r := &Resolved{Name: c.Pod, Default: c.Exec.Default, Machines: c.HostList(),
 		Tools: c.RemoteTools.Names, ToolHosts: c.RemoteTools.Hosts,
 		CanMount: c.CanMount, ForwardEnv: c.Exec.ForwardEnv}
 	if r.ForwardEnv.Mode == "" {
@@ -298,7 +313,8 @@ func (c *Config) Resolve() (*Resolved, error) {
 				mode = "fuse"
 			}
 			r.Mounts = append(r.Mounts, proto.MountSpec{At: at, Host: host,
-				Path: path, ReadOnly: m.ReadOnly, Mode: mode, ExecOn: m.ExecOn})
+				Path: path, ReadOnly: m.ReadOnly, Mode: mode, ExecOn: m.ExecOn,
+				Requires: m.Requires, Cache: m.Cache, Prefetch: m.Prefetch})
 
 		default:
 			return nil, fmt.Errorf("a mount needs local: or remote:")

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -45,6 +46,17 @@ func (r *Rclone) Mount(m *Mount, sshCommand string) error {
 	}
 	if m.ReadOnly {
 		args = append(args, "--read-only")
+	} else {
+		// Writes land on local disk and upload when the file is closed — not on a
+		// timer. That is what keeps a checkpoint from stalling a training step,
+		// and it is why this one mount also serves as the dataset cache and the
+		// re-read cache: three features that would otherwise be three features.
+		args = append(args, "--vfs-write-back", "0s")
+	}
+	if m.Cache != "" {
+		// A shared node's scratch disk is not yours to fill. rclone's own default
+		// is unbounded, which is fine on your own machine and not fine there.
+		args = append(args, "--vfs-cache-max-size", m.Cache)
 	}
 	out, err := exec.Command("rclone", args...).CombinedOutput()
 	if err != nil {
@@ -54,6 +66,27 @@ func (r *Rclone) Mount(m *Mount, sshCommand string) error {
 }
 
 // Invalidate is the hook the whole backend choice turns on.
+// Prefetch copies a tree onto local disk up front.
+//
+// For exactly one shape: many small files, where a lazy cache is latency-bound on
+// the first pass while the machine that asked for the data sits idle. Opt-in,
+// because a run that touches one percent of a tree should not pay for all of it.
+func (r *Rclone) Prefetch(m *Mount, sshCommand string) error {
+	args := []string{"copy", ":sftp:" + m.RemotePath,
+		filepath.Join(cacheRoot(m), "prefetch"),
+		"--sftp-host", m.Host, "--sftp-ssh", sshCommand,
+		"--transfers", "16", "--checkers", "16",
+	}
+	out, err := exec.Command("rclone", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("prefetch %s:%s: %v: %s", m.Host, m.RemotePath, err,
+			strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func cacheRoot(m *Mount) string { return m.MountPoint + ".cache" }
+
 func (r *Rclone) Invalidate(m *Mount, path string) error {
 	if m.rcAddr == "" {
 		return ErrNoInvalidate

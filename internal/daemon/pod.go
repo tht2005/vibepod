@@ -46,8 +46,17 @@ type podState struct {
 	// toolHosts maps a name in /vp/bin to the machine the config said has it.
 	toolHosts map[string]string
 	canMount  []string
+	// machines are the backends the config named, whether or not they own a
+	// mount.
+	machines []string
+	// consented is the machines allowed to hold one pushed binary. Nothing is
+	// copied anywhere without an entry here.
+	consented map[string]bool
 	envMode   EnvPolicy
 	used      map[string]bool // machines this pod has reached
+	// nodePods are the pods this pod has on other machines: the same composed
+	// zone, at the same paths, on each backend that runs one.
+	nodePods nodePods
 	// waits is how a pod process's exit code gets back to whoever started it.
 	// vpinit reports exits by pid, and a session can hold several processes —
 	// one shell per backend it has visited — so the pid is the only key that
@@ -264,6 +273,11 @@ func (s *podState) close() {
 	s.mu.Unlock()
 	for _, sess := range sessions {
 		sess.close()
+	}
+	// Node pods next: each is a namespace on another machine holding mounts of its
+	// own, and killing this pod does not reach them.
+	for _, np := range s.nodePods.list() {
+		s.stopNodePod(np.host)
 	}
 	// Then the pod: its processes hold the mounts open.
 	s.p.Kill()

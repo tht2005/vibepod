@@ -33,6 +33,9 @@ type Pool struct {
 type Host struct {
 	Alias   string
 	ctlPath string
+	// enter, when set, is the command that puts what follows inside this
+	// machine's node pod. See InPod.
+	enter string
 }
 
 func NewPool(ctlDir string) (*Pool, error) {
@@ -77,9 +80,20 @@ func (p *Pool) Close() {
 	}
 }
 
-// Opts are the ssh options every invocation shares. BatchMode means a host
-// that needs a passphrase fails immediately instead of hanging the exec gate
-// on a prompt no one can see.
+// BaseOpts are the options every vibepod ssh uses, wherever it runs — including
+// the ones a *node* makes for itself, which is why they are exported.
+//
+// BatchMode means a machine that wants a passphrase fails immediately instead of
+// waiting on a prompt nobody can see; on a node there is nobody at all, so a
+// prompt there is a hang with no symptom. LogLevel=ERROR keeps ssh from talking
+// about itself in the middle of someone's output — without it every command that
+// takes a terminal ends with "Shared connection to host closed.", and a mount
+// helper reading that stream treats it as damage.
+func BaseOpts() []string {
+	return []string{"-o", "BatchMode=yes", "-o", "LogLevel=ERROR"}
+}
+
+// Opts are the ssh options every invocation from this machine shares.
 func (h *Host) Opts() []string {
 	opts := []string{}
 	// Hosts are ssh_config aliases. VIBEPOD_SSH_CONFIG points at a different
@@ -87,16 +101,12 @@ func (h *Host) Opts() []string {
 	if f := os.Getenv("VIBEPOD_SSH_CONFIG"); f != "" {
 		opts = append(opts, "-F", f)
 	}
-	return append(opts,
+	opts = append(opts,
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath="+h.ctlPath,
 		"-o", "ControlPersist=300",
-		"-o", "BatchMode=yes",
-		// Without this, every routed command that takes a terminal ends with
-		// "Shared connection to host closed." — ssh talking about itself in
-		// the middle of someone's output.
-		"-o", "LogLevel=ERROR",
 	)
+	return append(opts, BaseOpts()...)
 }
 
 // SSHCommand is the ssh invocation sshfs and rclone should reuse, so mounts

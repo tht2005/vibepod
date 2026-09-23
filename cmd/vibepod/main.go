@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"vibepod/internal/daemon"
+	"vibepod/internal/node"
 	"vibepod/internal/pod"
 )
 
@@ -26,6 +28,29 @@ func main() {
 				fmt.Fprintln(os.Stderr, "vpinit:", err)
 				os.Exit(1)
 			}
+			return
+		// The three names a node answers to. They are reached over ssh by the
+		// daemon on your machine, never typed.
+		case "vpnode":
+			if err := node.Run(args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, "vpnode:", err)
+				os.Exit(1)
+			}
+			return
+		case "nodeexec":
+			if err := node.Exec(args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, "nodeexec:", err)
+				os.Exit(exitUnavailable)
+			}
+			return
+		case "nodedown":
+			if err := node.Down(args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, "nodedown:", err)
+				os.Exit(1)
+			}
+			return
+		case "version":
+			fmt.Println(daemon.Version)
 			return
 		case "daemon":
 			if err := runDaemon(args[1:]); err != nil {

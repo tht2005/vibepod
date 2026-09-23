@@ -44,7 +44,20 @@ func (s *podState) knownBackend(name string) bool {
 			return true
 		}
 	}
+	// A machine with no mount of its own is still a backend: gpu05 has the GPUs
+	// and none of the data, which is the case §6 is about.
+	for _, m := range s.declaredMachines() {
+		if m == name {
+			return true
+		}
+	}
 	return false
+}
+
+func (s *podState) declaredMachines() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.machines...)
 }
 
 // setBackend moves a session. If that session has a terminal, the shell its
@@ -93,7 +106,7 @@ func (s *podState) resolveTool(session, tool string) (string, error) {
 	if host != "" {
 		return host, nil
 	}
-	machines := s.machines()
+	machines := s.reachable()
 	switch len(machines) {
 	case 0:
 		return "", fmt.Errorf("%s is not on this machine, and this pod has no "+
@@ -106,10 +119,16 @@ func (s *podState) resolveTool(session, tool string) (string, error) {
 		tool, strings.Join(machines, " or "), tool)
 }
 
-// machines lists the remote machines this pod knows about.
-func (s *podState) machines() []string {
+// reachable lists the remote machines this pod knows about.
+func (s *podState) reachable() []string {
 	seen := map[string]bool{}
 	var out []string
+	for _, name := range s.declaredMachines() {
+		if name != route.Pod && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
 	for _, r := range s.table().Rules() {
 		for _, name := range []string{r.Owner, r.ExecOn} {
 			if name == "" || name == route.Pod || seen[name] {
@@ -169,11 +188,60 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 	}
 
 	dir := route.Dir(s.table(), r.cwd, backend)
+	// Which pod, if any, this command runs in on the far side.
+	//
+	// If the directory belongs to the machine we are sending it to, it is that
+	// machine's own path and a plain ssh is both correct and the fastest thing
+	// available. If it belongs to somebody else — or to no mount at all — then
+	// the same string over there means something different, or nothing, and the
+	// only safe answer is the pod that reproduces it. DESIGN.md §6: the bad
+	// outcome is not the path missing, it is the path existing and holding other
+	// bytes.
+	owner := route.Owner(s.table(), r.cwd)
+	np := s.nodePods.get(backend)
+	if np == nil && owner != backend {
+		// Consent given earlier means "and keep doing that": build the pod now
+		// rather than making the caller ask for something they already allowed.
+		if err := s.ensureNodePod(backend); err == nil {
+			np = s.nodePods.get(backend)
+		}
+	}
+	switch {
+	case np != nil:
+		// The composed zone is over there at the same paths, so the directory is
+		// carried as it is. If this particular mount is missing from that pod, say
+		// so — a stale node costs a visible refusal, never a wrong path.
+		if !np.holds(dir) && owner != backend {
+			return 0, fmt.Errorf("%s is not in the pod on %s, so a command there "+
+				"would be in a directory of the same name on a different "+
+				"filesystem; `vibepod down` and `up` replicates the current mounts",
+				dir, backend)
+		}
+	case owner == backend:
+		// The directory is that machine's own: the path means there what it says,
+		// and a plain ssh is both correct and the fastest thing available.
+	case owner != route.Pod:
+		// It belongs to a *third* machine. This is the case §6 is about: the same
+		// string over there is either missing or holds other bytes, and the second
+		// outcome succeeds, writes somewhere real, and is found days later.
+		return 0, s.needNodePod(backend, r.cwd)
+	default:
+		// A directory of this machine's own, or none at all. The command is
+		// something like `rocm-smi` that does not care where it runs, so it runs in
+		// that machine's own home rather than being refused — and the fact that the
+		// directory did not travel is said once, not assumed.
+		dir = ""
+		s.noteHomeDir(r.session, backend, r.cwd)
+	}
+
 	rec := &execRec{PID: r.pid, PPID: parentOf(r.pid), Argv: r.argv, Cwd: r.cwd,
 		Target: backend, Session: r.session, Start: now()}
 	s.recordExec(rec)
 
 	host := s.d.pool.Host(backend)
+	if np != nil {
+		host = host.InPod(np.home, s.name)
+	}
 	s.markUsed(backend)
 	id := fmt.Sprintf("%s-%d", s.name, execSeq.Add(1))
 	if r.onStart != nil {
@@ -232,6 +300,25 @@ func (s *podState) dispatchLocal(r dispatchReq) (int, error) {
 	}
 	s.finishExec(rec, code)
 	return code, nil
+}
+
+// noteHomeDir says, once per session and machine, that a dispatched command ran in
+// the target's home rather than in the directory it was called from. Once is
+// information; every command would be noise, and saying nothing at all is how a
+// surprise becomes a bug report.
+func (s *podState) noteHomeDir(session, backend, cwd string) {
+	key := session + "\x00" + backend
+	s.mu.Lock()
+	told := s.toldLocal[key]
+	s.toldLocal[key] = true
+	s.mu.Unlock()
+	if told {
+		return
+	}
+	s.d.bus.Publish(event.Event{Kind: event.KindNotice, Pod: s.name, Target: backend,
+		Session: session, Detail: fmt.Sprintf("%s is not on %s, so commands there "+
+			"start in its own home; `vp node add %s` reproduces the tree instead",
+			cwd, backend, backend)})
 }
 
 // now is a seam for nothing in particular; it keeps the record construction

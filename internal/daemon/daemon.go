@@ -196,6 +196,18 @@ func (k *ctlConn) serve() {
 			d.reply(k.c, m, d.unmount(m))
 		case proto.OpSave:
 			d.saveReply(k.c, m)
+		case proto.OpNodeAdd:
+			d.reply(k.c, m, d.nodeAdd(m, k.progress(m.ID)))
+		case proto.OpNodeDrop:
+			d.reply(k.c, m, d.nodeDrop(m))
+		case proto.OpNodeList:
+			s, err := d.lookup(m.Pod)
+			if err != nil {
+				_ = k.c.Errorf(m.ID, "%v", err)
+			} else {
+				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID,
+					NodeInfos: s.nodeList()})
+			}
 		case proto.OpDispatch:
 			files := adopt(fds)
 			go func() {
@@ -386,7 +398,8 @@ func podOp(op string) bool {
 	switch op {
 	case proto.OpPs, proto.OpLog, proto.OpTree, proto.OpHosts, proto.OpStat,
 		proto.OpBackend, proto.OpBrief, proto.OpUse, proto.OpDispatch,
-		proto.OpExec, proto.OpMount, proto.OpUnmount, proto.OpSignal:
+		proto.OpExec, proto.OpMount, proto.OpUnmount, proto.OpSignal,
+		proto.OpNodeList:
 		return true
 	}
 	return false
@@ -491,7 +504,15 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 	s.envMode = policy
 	s.configPath = m.Config
 	s.canMount = m.CanMount
+	s.machines = m.Machines
 	s.toolHosts = m.ToolHosts
+	// Consent to put one binary in ~/.vp/bin on these machines, given at `up`
+	// where a person is watching. Without it a machine that needs a pod says so
+	// and says how to allow it; it is never assumed.
+	s.consented = map[string]bool{}
+	for _, h := range m.Nodes {
+		s.consented[h] = true
+	}
 	if s.toolHosts == nil {
 		s.toolHosts = map[string]string{}
 	}
@@ -735,6 +756,13 @@ func (d *Daemon) hostList(m *proto.Msg) ([]proto.HostInfo, error) {
 	}
 	dirs := map[string][]string{}
 	mounted := map[string]bool{}
+	// A machine named in the config with no mount of its own is still part of this
+	// pod, and has to be listed: it is what you dispatch compute to.
+	for _, name := range s.declaredMachines() {
+		if _, seen := dirs[name]; !seen {
+			dirs[name] = nil
+		}
+	}
 	for _, r := range s.table().Rules() {
 		dirs[r.Owner] = append(dirs[r.Owner], r.Prefix)
 		mounted[r.Owner] = true

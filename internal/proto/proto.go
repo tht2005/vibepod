@@ -41,13 +41,16 @@ const (
 	OpTree     = "tree"
 	OpEvent    = "event"
 	OpEnd      = "end"
-	OpUse      = "use"     // move a session's backend
-	OpHosts    = "hosts"   // the machines this pod knows, mounted or not
-	OpStat     = "stat"    // does this path exist in the pod, and is it a directory?
-	OpMount    = "mount"   // connect and mount into a running pod
-	OpUnmount  = "unmount" // unmount and disconnect
-	OpSave     = "save"    // hand back the live state, for vibepod.yaml
-	OpBrief    = "brief"   // the generated agent brief, as the pod sees it
+	OpUse      = "use"       // move a session's backend
+	OpHosts    = "hosts"     // the machines this pod knows, mounted or not
+	OpStat     = "stat"      // does this path exist in the pod, and is it a directory?
+	OpMount    = "mount"     // connect and mount into a running pod
+	OpUnmount  = "unmount"   // unmount and disconnect
+	OpSave     = "save"      // hand back the live state, for vibepod.yaml
+	OpNodeAdd  = "node-add"  // build a pod on a machine
+	OpNodeDrop = "node-drop" // stop one and remove its state
+	OpNodeList = "node-list" // the machines with pods, and what they hold
+	OpBrief    = "brief"     // the generated agent brief, as the pod sees it
 	OpUp       = "up"
 	OpPs       = "ps"
 	OpDown     = "down"
@@ -134,6 +137,41 @@ type MountSpec struct {
 	// they are never offered to another node and never listed as a mount a
 	// remote could have.
 	Identity bool `json:"identity,omitempty"`
+	// Requires are paths a machine must have before it may run this mount's work
+	// — `/opt/rocm`, `/dev/kfd`. Checked at `up`, which turns "is this node
+	// actually equivalent?" from something a failed job tells you into something
+	// a question answers.
+	Requires []string `json:"requires,omitempty"`
+	// Cache bounds the on-disk cache a node keeps for this mount.
+	Cache string `json:"cache,omitempty"`
+	// Prefetch copies the tree up front rather than warming it lazily.
+	Prefetch bool `json:"prefetch,omitempty"`
+}
+
+// NodeSpec is what a node needs to build its own pod: the composed zone, and
+// nothing else.
+//
+// The identity plane is absent by construction — there is no field for it. A node
+// pod is filesystem-uniform and credential-free, which is the whole reason it is
+// safe to run one on a machine you do not control.
+type NodeSpec struct {
+	Pod    string `json:"pod"`
+	Node   string `json:"node"`    // this machine's alias, so it knows what it owns
+	Root   string `json:"root"`    // becomes the node pod's root
+	RunDir string `json:"run_dir"` // holds the socket, the stage and the state
+	// Mounts is the composed zone in config order. A mount this node owns is a
+	// native bind — no FUSE, no cache, no round trip; the rest are mounted from
+	// the machines that own them.
+	Mounts []MountSpec `json:"mounts"`
+	// SSHExtra are options for this node's *own* outbound ssh, when it has to
+	// reach a third machine for a mount it does not own.
+	SSHExtra []string `json:"ssh_extra,omitempty"`
+	Hostname string   `json:"hostname,omitempty"`
+	// Cache bounds the on-node disk cache, as rclone spells it (e.g. "200G").
+	Cache string `json:"cache,omitempty"`
+	// Version is the build that wrote this spec, so a node running an older
+	// pushed binary is noticed rather than debugged.
+	Version string `json:"version,omitempty"`
 }
 
 // Msg is the single envelope for every link. Fields are shared rather than
@@ -189,6 +227,14 @@ type Msg struct {
 	// Config is the path the pod was created from, so `vp save` writes back to
 	// the file it came from rather than guessing.
 	Config string `json:"config,omitempty"`
+	// Node carries a node pod's spec, and Nodes the machines a client has
+	// consented to push vibepod to.
+	Node  *NodeSpec `json:"node,omitempty"`
+	Nodes []string  `json:"nodes,omitempty"`
+	// Machines are the backends this pod knows about whether or not they own a
+	// mount. A compute node with no data of its own is the case that needs this:
+	// it is named under `hosts:` and is a machine you dispatch to.
+	Machines []string `json:"machines,omitempty"`
 
 	// Detail is human-facing text: what a slow request is waiting for, or why
 	// it stopped waiting.
@@ -209,6 +255,8 @@ type Msg struct {
 
 	Pods  []PodInfo  `json:"pods,omitempty"`
 	Hosts []HostInfo `json:"hosts,omitempty"`
+	// NodeInfos are the pods this pod has on other machines.
+	NodeInfos []NodeInfo `json:"node_pods,omitempty"`
 }
 
 // Tree is the pod's structure: mounts and live execs, in one view.
@@ -269,6 +317,14 @@ type PodInfo struct {
 	Uptime   string        `json:"uptime"`
 	Default  string        `json:"default,omitempty"`
 	Live     []SessionInfo `json:"live,omitempty"`
+}
+
+// NodeInfo is one machine with a pod on it: what it holds, and which of those it
+// owns outright rather than caching.
+type NodeInfo struct {
+	Host   string   `json:"host"`
+	Mounts []string `json:"mounts"`
+	Native []string `json:"native,omitempty"`
 }
 
 // SessionInfo is one session and the machine it is on — the fact `ps` exists to

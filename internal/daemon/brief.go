@@ -65,7 +65,7 @@ func (s *podState) brief() string {
 	b.WriteString("vp backend                 # which machine is this session on?\n")
 	b.WriteString("vp hosts                   # what machines does this pod know?\n")
 	machine := "gpu03"
-	if ms := s.machines(); len(ms) > 0 {
+	if ms := s.reachable(); len(ms) > 0 {
 		machine = ms[0]
 	}
 	fmt.Fprintf(&b, "vp @%s <cmd>...          # run one command there; the session does not move\n", machine)
