@@ -57,6 +57,8 @@ type podState struct {
 	// nodePods are the pods this pod has on other machines: the same composed
 	// zone, at the same paths, on each backend that runs one.
 	nodePods nodePods
+	// ports are the forwards this pod opened, closed when it goes down.
+	ports []proto.PortSpec
 	// lease is how long a node pod outlives silence from this daemon. It is the only
 	// thing that keeps one alive, and the only thing that cleans one up.
 	lease string
@@ -285,6 +287,9 @@ func (s *podState) close() {
 	for _, sess := range sessions {
 		sess.close()
 	}
+	// Forwards ride the multiplexed connections, so they go before anything tears
+	// those down.
+	s.closePorts()
 	// Node pods next: each is a namespace on another machine holding mounts of its
 	// own, and killing this pod does not reach them.
 	for _, np := range s.nodePods.list() {

@@ -47,6 +47,7 @@ const usageVp = `vp - the machine is chosen, not guessed
     vp mount <host>:<path> [at]  connect and mount, without losing a session
     vp unmount <path|@machine>   unmount and disconnect
     vp node [add|drop <host>]     the machines running a pod of their own
+    vp forward [host:port[:local]] a remote port on localhost here; no args lists them
     vp save                      write the live state back to vibepod.yaml
 
   terminals
@@ -101,6 +102,8 @@ func runCli(args []string, asVibepod bool) int {
 		err = cmdWhere(args[1:])
 	case "cd":
 		err = cmdCd(args[1:])
+	case "forward", "ports":
+		err = cmdForward(args[1:])
 	case "node", "nodes":
 		err = cmdNode(args[1:])
 	case "mount":

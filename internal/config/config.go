@@ -171,6 +171,7 @@ func (t *RemoteTools) UnmarshalYAML(n *yaml.Node) error {
 type Resolved struct {
 	Name  string
 	Lease string
+	Ports []proto.PortSpec
 	// Machines is every machine this config names, mount or no mount. A compute
 	// node with no data of its own is still a machine this pod runs commands on.
 	Machines   []string
@@ -367,6 +368,13 @@ func (c *Config) Resolve() (*Resolved, error) {
 		}
 		r.Mounts = append(r.Mounts, proto.MountSpec{At: src, Src: src, Identity: true})
 	}
+	for _, s := range c.Ports {
+		p, err := ParsePort(s)
+		if err != nil {
+			return nil, err
+		}
+		r.Ports = append(r.Ports, p)
+	}
 	// A tool named for a machine that this config never mentions is a typo, and
 	// it is cheaper to say so now than when the wrapper is first invoked.
 	known := map[string]bool{}
@@ -411,6 +419,11 @@ func (c *Config) HostList() []string {
 	}
 	for _, h := range c.RemoteTools.Hosts {
 		add(h)
+	}
+	for _, s := range c.Ports {
+		if host, _, ok := strings.Cut(s, ":"); ok {
+			add(host)
+		}
 	}
 	add(c.Exec.Default)
 	sort.Strings(out)
@@ -476,4 +489,26 @@ func ParseRemote(s string) (host, path, at string, err error) {
 		path, at = rest[:i], rest[i+1:]
 	}
 	return host, filepath.Clean(path), at, nil
+}
+
+// ParsePort reads a port forward: `gpu03:8888` (the same port here) or
+// `gpu03:8888:18888` (remote 8888 on local 18888).
+func ParsePort(s string) (proto.PortSpec, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" {
+		return proto.PortSpec{}, fmt.Errorf("port %q must be host:port or "+
+			"host:remote-port:local-port", s)
+	}
+	var p proto.PortSpec
+	p.Host = parts[0]
+	if _, err := fmt.Sscan(parts[1], &p.Remote); err != nil || p.Remote <= 0 || p.Remote > 65535 {
+		return proto.PortSpec{}, fmt.Errorf("port %q: %q is not a port", s, parts[1])
+	}
+	p.Local = p.Remote
+	if len(parts) == 3 {
+		if _, err := fmt.Sscan(parts[2], &p.Local); err != nil || p.Local <= 0 || p.Local > 65535 {
+			return proto.PortSpec{}, fmt.Errorf("port %q: %q is not a port", s, parts[2])
+		}
+	}
+	return p, nil
 }

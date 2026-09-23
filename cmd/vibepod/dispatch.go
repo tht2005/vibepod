@@ -380,3 +380,34 @@ func cmdNode(args []string) error {
 	}
 	return fmt.Errorf("usage: vp node [add|drop <machine>]")
 }
+
+// cmdForward opens a port forward, or lists the open ones. An agent may open one
+// from inside the pod: it reaches only the loopback of a machine this pod already
+// talks to, which is less than `vp @host` already gives it.
+func cmdForward(args []string) error {
+	c, err := connect()
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	m := &proto.Msg{Op: proto.OpForward, Pod: podArg("")}
+	for _, a := range args {
+		p, err := config.ParsePort(a)
+		if err != nil {
+			return err
+		}
+		m.Ports = append(m.Ports, p)
+	}
+	reply, err := call(c, m)
+	if err != nil {
+		return err
+	}
+	if len(reply.Ports) == 0 {
+		fmt.Println("no ports forwarded — `vp forward gpu03:8888`")
+		return nil
+	}
+	for _, p := range reply.Ports {
+		fmt.Printf("  localhost:%-6d → %s:%d\n", p.Local, p.Host, p.Remote)
+	}
+	return nil
+}

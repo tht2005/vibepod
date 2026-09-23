@@ -196,6 +196,22 @@ func (k *ctlConn) serve() {
 			d.reply(k.c, m, d.unmount(m))
 		case proto.OpSave:
 			d.saveReply(k.c, m)
+		case proto.OpForward:
+			s, err := k.podOf(m)
+			if err != nil {
+				_ = k.c.Errorf(m.ID, "%v", err)
+				break
+			}
+			for _, p := range m.Ports {
+				if err = s.forward(p, k.progress(m.ID)); err != nil {
+					break
+				}
+			}
+			if err != nil {
+				_ = k.c.Errorf(m.ID, "%v", err)
+				break
+			}
+			_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Ports: s.portList()})
 		case proto.OpNodeAdd:
 			d.reply(k.c, m, d.nodeAdd(m, k.progress(m.ID)))
 		case proto.OpNodeDrop:
@@ -399,7 +415,7 @@ func podOp(op string) bool {
 	case proto.OpPs, proto.OpLog, proto.OpTree, proto.OpHosts, proto.OpStat,
 		proto.OpBackend, proto.OpBrief, proto.OpUse, proto.OpDispatch,
 		proto.OpExec, proto.OpMount, proto.OpUnmount, proto.OpSignal,
-		proto.OpNodeList:
+		proto.OpNodeList, proto.OpForward:
 		return true
 	}
 	return false
@@ -542,6 +558,14 @@ func (d *Daemon) up(m *proto.Msg, pr *Progress) error {
 		p.Kill()
 		s.closeFailed(ln)
 		return err
+	}
+	for _, port := range m.Ports {
+		if err := s.forward(port, pr); err != nil {
+			s.closePorts()
+			p.Kill()
+			s.closeFailed(ln)
+			return err
+		}
 	}
 
 	d.mu.Lock()

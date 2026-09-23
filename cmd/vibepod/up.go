@@ -52,6 +52,7 @@ func loadSpec(name string) (*proto.Msg, error) {
 		EnvPolicy: &proto.EnvPolicy{Mode: res.ForwardEnv.Mode,
 			Names: res.ForwardEnv.Names},
 		Mounts:    res.Mounts,
+		Ports:     res.Ports,
 		Machines:  res.Machines,
 		Detail:    res.Lease, // the lease, carried in the one free text field
 		ToolHosts: res.ToolHosts,

@@ -47,6 +47,7 @@ const (
 	OpMount    = "mount"     // connect and mount into a running pod
 	OpUnmount  = "unmount"   // unmount and disconnect
 	OpSave     = "save"      // hand back the live state, for vibepod.yaml
+	OpForward  = "forward"   // forward a port, or list the forwards
 	OpNodeAdd  = "node-add"  // build a pod on a machine
 	OpNodeDrop = "node-drop" // stop one and remove its state
 	OpNodeList = "node-list" // the machines with pods, and what they hold
@@ -161,6 +162,14 @@ type MountSpec struct {
 	ManyWriters bool `json:"many_writers,omitempty"`
 }
 
+// PortSpec is one forwarded port: Local on this machine reaches Remote on Host's
+// own loopback.
+type PortSpec struct {
+	Host   string `json:"host"`
+	Remote int    `json:"remote"`
+	Local  int    `json:"local"`
+}
+
 // NodeSpec is what a node needs to build its own pod: the composed zone, and
 // nothing else.
 //
@@ -256,6 +265,9 @@ type Msg struct {
 	// version. Together they are the whole of the reconciler's input.
 	Held       []Held `json:"held,omitempty"`
 	Generation int64  `json:"generation,omitempty"`
+	// Ports are forwarded ports: asked for at `up` or by `vp forward`, and
+	// reported back by it.
+	Ports []PortSpec `json:"ports,omitempty"`
 
 	// Detail is human-facing text: what a slow request is waiting for, or why
 	// it stopped waiting.

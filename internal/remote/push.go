@@ -174,3 +174,32 @@ func (h *Host) Capture(command string) (string, error) {
 	}
 	return string(out), nil
 }
+
+// Forward makes a port on this machine reach a port on that machine's loopback,
+// over the multiplexed connection that is already open — so it costs no new
+// handshake, and it goes away with the connection rather than outliving it.
+//
+// A pod shares this machine's network, so the agent reaches it as localhost too.
+func (h *Host) Forward(local, remote int) error {
+	spec := fmt.Sprintf("%d:localhost:%d", local, remote)
+	args := append(h.Opts(), "-O", "forward", "-L", spec, h.Alias)
+	out, err := exec.Command("ssh", args...).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if strings.Contains(msg, "in use") || strings.Contains(msg, "bind") {
+			return fmt.Errorf("port %d is already in use here; forward %s:%d to "+
+				"another local port with %s:%d:<local>", local, h.Alias, remote,
+				h.Alias, remote)
+		}
+		return fmt.Errorf("forward %d to %s:%d: %s", local, h.Alias, remote, msg)
+	}
+	return nil
+}
+
+// Unforward cancels one. Best effort: a connection that is already gone took the
+// forward with it.
+func (h *Host) Unforward(local, remote int) {
+	spec := fmt.Sprintf("%d:localhost:%d", local, remote)
+	args := append(h.Opts(), "-O", "cancel", "-L", spec, h.Alias)
+	_ = exec.Command("ssh", args...).Run()
+}
