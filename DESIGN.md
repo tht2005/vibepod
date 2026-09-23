@@ -66,10 +66,12 @@ passes the listener fd to `vibepod` over `SCM_RIGHTS`, then drops its capabiliti
 filter is inherited by every descendant, so the daemon observes **every exec in the pod** —
 including statically-linked and agent-bundled binaries that no `$PATH` shim could catch.
 
-This requires `CAP_SYS_ADMIN` in the pod's user namespace, which
-`bwrap --unshare-user --cap-add ALL` grants (verified: `CapEff` goes from `0` to
-`0x1ffffffffff`, including `cap_sys_admin`). The capability is scoped to the pod's userns,
-never the host, and `vpinit` drops it immediately after installing the filter.
+This requires `CAP_SYS_ADMIN` in the pod's user namespace. `vpinit` receives it through
+the **ambient** capability set when the daemon clones it, scoped to the pod's userns and
+never the host. It keeps the capability — lazy bind-shims need it for the pod's whole life
+— but clears the *ambient* set immediately, so every process it spawns, the agent
+included, has an empty capability set and cannot mount, unmount, or unshim anything
+(verified: `CapEff: 0`, child `mount()` → `EPERM`).
 
 ### Lazy bind-shims
 
@@ -81,7 +83,7 @@ does provide: it freezes the syscall while the daemon decides.
 agent execs /usr/bin/cargo
   → notify fires; the process is frozen mid-syscall
   → daemon: cargo, cwd /srv/api → prod. No shim at that path yet.
-  → daemon nsenters the pod mount ns, bind-mounts vpsh over /usr/bin/cargo
+  → daemon asks vpinit to stash the original, then bind vpsh over /usr/bin/cargo
   → reply CONTINUE
   → the kernel resolves the path now, and finds the shim
 ```
@@ -250,16 +252,17 @@ collide with local system paths, so the guard rarely fires.
 
 ### FUSE cannot be mounted inside the pod
 
-bwrap forces `NoNewPrivs=1` (verified), which disables setuid. `fusermount3` is setuid
-root. Therefore **all mounts are made on the host by the daemon and bound into the pod.**
+The pod sets `NoNewPrivs=1`, and only one uid is mapped into its user namespace, so
+setuid binaries are inert. `fusermount3` is setuid root. Therefore **all mounts are made
+on the host by the daemon and bound into the pod.**
 
 Forced, but it yields a security property for free: the agent cannot unmount, remount, or
 tamper with any mount. There is no `fusermount -u` available to it.
 
-Getting a mount into an already-running pod: `/` has `shared` propagation here and bwrap
-makes the pod root `rslave`, so host mounts should propagate inward. The fallback that
-always works is `nsenter` into the pod's mount+user namespace — same uid, so permitted —
-and binding there. Verify propagation in M1; design for the fallback.
+Getting a mount into an already-running pod is `vpinit`'s job: it is inside the namespace
+and is the only process there holding `CAP_SYS_ADMIN`. The daemon sends it a bind request
+over the pod socket. `nsenter` from the daemon is *not* an option — joining the userns
+grants capabilities, but the `execve` that follows drops them again for a non-root euid.
 
 ### Who actually reads through FUSE
 
@@ -627,13 +630,14 @@ replays the buffer. Killing the pod kills everything inside it.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Pod backend | bubblewrap namespace | ~10ms start, no image, reuses host binaries, and the only way to bind a fake `/bin/sh` without touching the host |
+| Pod backend | own user+mount+pid namespace | ~10ms start, no image, reuses host binaries. bubblewrap cannot host this design — see below |
 | Topology | central `vibepod` daemon + per-pod `vpinit` | one socket, one audit log, shared ssh muxes; `vpinit` covers the namespace-lifetime requirement |
 | Privilege | rootless, auto-spawned | credentials are user-owned; root buys nothing and costs the security story |
 | Exec routing | cwd-inferred + `@host` override | no invisible mode state; agents get it right with zero prompting |
 | Interception | seccomp exec gate + lazy bind-shims | agents wrap commands in generated shell scripts; the shell must stay local. Catches bundled and static binaries that `$PATH` shims cannot |
 | Redirect | bind-mount `vpsh` while notify holds the syscall | notify is a gate, not a rewriter; ptrace would break `strace`/`gdb` inside the pod |
-| Sandbox | bwrap, behind an interface | `--cap-add ALL` in the userns supplies the `CAP_SYS_ADMIN` the exec gate needs |
+| Sandbox | native `clone` + `pivot_root`, behind an interface | bwrap nests a *second* userns after building the root, so nothing inside can mount — fatal to lazy bind-shims. Measured, not assumed |
+| Capabilities | `CAP_SYS_ADMIN` to `vpinit` via the ambient set, ambient then cleared | vpinit needs it for the pod's whole life; nothing it spawns gets any |
 | FUSE placement | mounted on the host, bound in | `NoNewPrivs=1` kills setuid `fusermount3`; the agent also cannot tamper with mounts |
 | FS backend | rclone sftp + VFS cache | local-disk re-reads, and a `vfs/forget` hook for execution-aware invalidation |
 | TTY & signals | piped by default, PTY when stdio is a tty | agents parse stdout/stderr separately; signals forwarded by remote process-group kill |
@@ -659,10 +663,10 @@ replays the buffer. Killing the pod kills everything inside it.
 
 ## 12. Open questions
 
-1. **`--cap-add ALL` portability** — verified on this kernel, but it is documented as
-   requiring a privileged user. Check across distros and kernel versions.
-2. **Mount propagation into a live pod** — does the `shared`/`rslave` path actually work,
-   or is `nsenter` the only reliable route?
+1. **Sandbox hardening parity** — bwrap has years of hardening (`/proc` masking, device
+   allowlists, `--die-with-parent`) that our own root construction must re-derive.
+2. **Seccomp availability** — `TSYNC|TSYNC_ESRCH|NEW_LISTENER` needs Linux 5.7+. What is
+   the floor we support, and does the static-shim fallback carry its weight?
 3. **rclone as a dependency** — vendor the binary, require it, or reconsider a custom
    Go FUSE once access patterns are known?
 4. **Reverse mounts to several targets** — `expose_to: [a, b]` needs one transport per
