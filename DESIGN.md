@@ -418,6 +418,10 @@ crawl.
 
 This is why the backend needs a `vfs/forget`-style hook. sshfs has none.
 
+With node pods there is no longer one cache but one per machine holding the mount, so
+completion **fans out** to every holder, and the unit narrows from the host to the mount.
+§6a, *Many mounts, many caches*, is that part.
+
 ### Reverse mounts (`expose_to:`)
 
 Mounts flow both ways. `expose_to: [host]` on a local directory makes it visible **on**
@@ -628,6 +632,77 @@ under *other* mounts are still correct and keep working; refusal is scoped to th
 actually affected. It is a map lookup, not extra machinery, and it is the difference between
 one missed mount costing a path and costing a machine. `vp ps` and the TUI show which nodes
 are behind and on what.
+
+### Many mounts, many caches
+
+Every pod holds the whole composed zone, so a backend does not have "its" mounts — it has
+all of them. Several mounts from one host is likewise ordinary: `HostList()` dedupes aliases
+and one ssh mux serves every mount from that host.
+
+What follows from replication is that **one mount exists as N mounts**, and their
+relationship needs stating.
+
+#### Native on its owner, cached everywhere else
+
+gpu03's pod binds gpu03's own directories directly — no FUSE, no cache, no round trip — and
+only rclone-mounts the ones owned by other machines. So running work on the machine that owns
+the data is always full speed, with no special case and nothing to configure. It also means a
+node pod is typically a *mixture*: some entries in its composed zone are native binds, others
+are cached mounts, and `vp tree` shows which.
+
+#### Writes: one writer per file
+
+Write-back caching (§6) puts dirty data on the writing node's own disk. With N caches over one
+mount, two nodes can each hold dirty data for the same file, and whichever flushes last wins —
+**silently**. That is the same class of failure as the same-name collision §6a exists to
+eliminate, so it gets the same treatment rather than a caveat.
+
+The control plane tracks **open-for-write per `(mount, path)`**. A second node opening that
+file for writing is refused, naming the holder:
+
+```
+open /remote/vast0/duongnguyen/runs/ckpt-400.pt: gpu05 holds this file open for writing
+```
+
+Per *file*, not per mount, because that is the unit rclone already works in — write-back
+triggers on close — and because two nodes writing different files in one output mount is
+normal, while two writing the same file is the error it appears to be. The token is released
+when the file goes clean, and a node that dies holding one releases it with its lease (§6a).
+
+#### Reads: invalidate by mount, to every holder
+
+§6's invalidation assumed one cache. It now fans out: when a dispatched command completes, the
+control plane tells **every node holding the mounts that command touched** to forget them.
+M6a's reconciler already carries this traffic, so it is a message type rather than a
+mechanism.
+
+This also narrows invalidation from per-host to **per-mount**. `InvalidateAfter(host)` forgets
+every mount belonging to a host, which was harmless with one cache and one or two mounts, and
+is needlessly destructive once a host owns several and each has N copies.
+
+#### Overlapping origins are refused
+
+Mounting `gpu03:/data` and `gpu03:/data/sub` separately produces two caches over the same
+bytes, where a write through one is invisible to the other. There is no way to fix that after
+the fact, so it is refused at `up` and at `vp mount`, naming both mounts.
+
+This extends the existing shadow guard, which checks only that a mount does not shadow a
+`systemPath` — a check on *pod* paths. Origin paths need the same check for a different
+reason: not visibility, but coherence.
+
+#### Connection budget
+
+M mounts × N node pods all pull from one origin. gpu03 serving three mounts to three node pods
+is around nine sftp sessions plus control channels, against sshd's defaults of `MaxSessions
+10` and `MaxStartups 10:30:100`. Exceeding them on a shared login node is antisocial and
+presents as unrelated connection failures for everyone.
+
+So each node pod runs **one `rclone rcd`** with bounded per-host connections, and `up`
+**computes and reports the budget** rather than letting it be discovered:
+
+```
+gpu03: 3 mounts × 3 nodes → 6 sftp connections (cap 8, sshd MaxSessions 10)
+```
 
 ### Disconnection
 
@@ -1116,6 +1191,11 @@ replays the buffer. Killing the pod kills everything inside it.
 | Node root | the node's own system layer, composed zone over it | the local pod is minimal because it holds an agent; a node holds a toolchain and no agent. A minimal root on a GPU box hides the GPUs, and that failure reads as "ROCm is broken" |
 | Tree consistency | per-mount generations, reconcile on reconnect | 2PC lets one dead node block every mount change; best-effort push produces silent divergence. Dispatch refuses a stale mount, so staleness costs a visible refusal, never a wrong path |
 | Staleness grain | per mount, not per node | one missed mount should cost a path, not a machine; unrelated sessions on that node stay correct |
+| Mount locality | native bind on its owner, cached rclone mount elsewhere | running work where the data lives is then always full speed, with nothing to configure |
+| Write coherence | one writer per **file**, tracked by the control plane | N write-back caches over one mount means two nodes can hold dirty copies and the last flush wins silently. Per-file because that is rclone's unit and because two nodes writing *different* files in one mount is normal |
+| Invalidation grain | per mount, broadcast to every holder | one cache became N; forgetting a whole host's mounts was harmless with one copy and wasteful with many |
+| Overlapping origins | refused at `up` and `vp mount` | two caches over the same bytes cannot be made coherent afterwards. The existing shadow guard checks pod paths for visibility; origins need the same check for coherence |
+| Connection budget | one `rclone rcd` per node, budget computed at `up` | M mounts × N nodes against one origin runs into sshd's `MaxSessions`/`MaxStartups`, which presents as unrelated failures for everyone on a shared node |
 | Runtime mount order | append-only; reorder needs `up` | order decides shadowing, so it is part of the state. Inserting mid-list would remount everything above it while work is running in those paths |
 | Backend disconnect | renewable lease, then flush + unmount; adopt on reconnect | dying with the ssh channel kills an 8-hour run on a closed lid; surviving forever leaks caches onto shared nodes. A lease is the only answer that does neither |
 | Unmount | flush, verify clean, then unmount — refuse if dirty and unflushable | write-back caching means a node holds dirty checkpoints; discarding one silently would be the worst bug here |
@@ -1208,6 +1288,7 @@ ordered so that each one is usable on its own.
   rclone on the node with a local-disk cache and write-back on close; `prefetch:`; `via:
   auto` with its probe and explanation; the forwarded-agent credential proxy. Also `toolbin`
   pushes and port forwards, which share the consent path.
+  Native binds for mounts the node owns, cached mounts for the rest.
   Success is a training run whose data lives on gpu03, whose GPUs are gpu05's, and whose
   every path is the same string on all three machines.
   **Deliberately excludes the control plane** — one node, mounts fixed at `up`. §6a's
@@ -1217,7 +1298,9 @@ ordered so that each one is usable on its own.
   Per-mount generations, reconcile-on-reconnect, per-mount staleness surfaced in `vp ps` and
   the TUI, dispatch refusal on a stale mount, append-only runtime ordering with the shadow
   guard, two-phase unmount with the dirty-flush refusal, the lease, and adoption on
-  reconnect. This is what makes `vp mount` safe with more than one backend; until it lands,
+  reconnect. Plus what replication does to the cache: per-file write tokens, invalidation
+  fanned out per mount to every holder, the origin-overlap refusal, and the connection
+  budget — §6a, *Many mounts, many caches*. This is what makes `vp mount` safe with more than one backend; until it lands,
   a second backend means `down` and `up`.
 - **M7 — polish.** Not started. Reverse mounts (`expose_to:`) for "edit here, run there",
   `sync` mode, and the rest of the tree's views from §9: `-x` to expand a remote subtree, `--running`,
