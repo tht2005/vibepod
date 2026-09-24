@@ -113,9 +113,14 @@ func TestAnUntrustedNodeGetsNoAgent(t *testing.T) {
 	if !strings.Contains(errOut, "cannot reach") {
 		t.Errorf("the refusal does not say what failed: %q", errOut)
 	}
-	out, _, _ := d.vp(dir, "run", "--", "/bin/sh", "-c",
+	// A machine that cannot hold the pod's tree is refused rather than used bare,
+	// and nothing ran there to be handed a socket.
+	out, errOut, code := d.vp(dir, "run", "--", "/bin/sh", "-c",
 		"vp @vptest2 /bin/sh -c 'echo sock=${SSH_AUTH_SOCK:-none}'")
-	if !strings.Contains(out, "sock=none") {
-		t.Errorf("an untrusted machine was given an agent socket: %q", out)
+	if code == 0 || strings.Contains(out, "sock=/") {
+		t.Errorf("an untrusted machine ran a command: %q %q", out, errOut)
+	}
+	if !strings.Contains(errOut, "could not be built") {
+		t.Errorf("the refusal does not say why: %q", errOut)
 	}
 }

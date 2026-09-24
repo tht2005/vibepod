@@ -5,7 +5,10 @@
 # command an agent runs, and a shell that linked in the whole client would be a
 # strange thing to put there.
 
-VERSION := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+# The commit, and a hash of uncommitted changes when there are any: two builds of
+# a dirty tree are different builds, and the stale-daemon check has to know.
+VERSION := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)$(shell \
+	git diff --quiet HEAD 2>/dev/null || echo -dirty-$$(git diff HEAD | sha1sum | cut -c1-7))
 LDFLAGS := -X vibepod/internal/daemon.Version=$(VERSION)
 PREFIX  ?= $(HOME)/.local
 

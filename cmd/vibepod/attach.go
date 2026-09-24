@@ -227,7 +227,8 @@ func attachFramed(c *proto.Conn, m *proto.Msg) (code int, ok bool, err error) {
 		return 0, false, fmt.Errorf("unexpected reply %q", reply.Op)
 	}
 	res := ui.RunShell(ui.ShellConfig{Conn: c, Out: r, Pod: m.Pod,
-		Session: reply.Session, History: historyPath(), Rows: rows, Cols: cols})
+		Session: reply.Session, History: historyPath(), Rows: rows, Cols: cols,
+		Dial: dialQuiet})
 	if res.Err != nil {
 		return 0, true, res.Err
 	}

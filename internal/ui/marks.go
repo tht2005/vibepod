@@ -30,6 +30,7 @@ const (
 	Cwd                  // 7717;home=…;cwd=… — where the shell now is
 	Backend              // 7717;backend=… — the session now shows this machine's shell
 	Replayed             // 7717;replayed — the replayed scrollback ends here
+	Fpath                // 7717;fpath=… — where zsh finds its completions
 )
 
 // Event is one piece of the stream.
@@ -41,12 +42,16 @@ type Event struct {
 	// machine now shown and, when a shell went away, the one that did.
 	Cwd, Home      string
 	Backend, Ended string
+	// Fpath is the zsh function path, so Tab completes with the same
+	// completion functions the shell itself would use.
+	Fpath string
 }
 
 // maxOSC bounds how long an unterminated OSC may grow before it is judged not
 // to be one of ours and given back as text: a program printing a stray ESC ]
-// must not make everything after it vanish.
-const maxOSC = 4096
+// must not make everything after it vanish. It is still generous, because a
+// zsh fpath with many plugins is a long marker.
+const maxOSC = 64 << 10
 
 // Parser splits a byte stream into events, carrying a partial escape sequence
 // across reads.
@@ -164,6 +169,8 @@ func parseOSC(body string) (Event, bool) {
 				}
 			}
 			return ev, true
+		case strings.HasPrefix(kv, "fpath="):
+			return Event{Kind: Fpath, Fpath: kv[len("fpath="):]}, true
 		case strings.HasPrefix(kv, "home="):
 			// cwd last and taken whole: a directory name may contain anything.
 			ev := Event{Kind: Cwd}

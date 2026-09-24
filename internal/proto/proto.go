@@ -51,6 +51,7 @@ const (
 	OpNodeAdd  = "node-add"  // build a pod on a machine
 	OpNodeDrop = "node-drop" // stop one and remove its state
 	OpNodeList = "node-list" // the machines with pods, and what they hold
+	OpComplete = "complete"  // Tab: what the session's shell would offer for Data
 
 	// daemon -> vpnode, over ssh
 	OpHeld       = "held"       // what does this node pod hold?
@@ -218,6 +219,15 @@ type NodeSpec struct {
 	// flushes, unmounts and exits. Empty means forever, which is right for a
 	// machine you own and wrong for one you share.
 	Lease string `json:"lease,omitempty"`
+	// Mask are paths in the pod that name something of the pod machine's own —
+	// the agent's identity, a directory not exposed to this node — which this
+	// node may have a same-named copy of in its home. Each is hidden, so the
+	// path is missing over there rather than holding other bytes.
+	Mask []string `json:"mask,omitempty"`
+	// Placed are where the composed tree puts something other than what this
+	// machine already has at that path, now or once the relays are up. The
+	// node's own filesystem is reproduced around them, never under them.
+	Placed []string `json:"placed,omitempty"`
 	// Version is the build that wrote this spec, so a node running an older
 	// pushed binary is noticed rather than debugged.
 	Version string `json:"version,omitempty"`

@@ -261,6 +261,13 @@ func serve(specPath string) error {
 			return fail(err)
 		}
 	}
+	// The machine itself, first, so every mount below shadows it: its devices,
+	// /sys, its home with conda and ~/.local, /tmp, a module tree under /apps —
+	// everything a command sent here found when it was a plain ssh. The composed
+	// tree is placed over it without writing to it, and what names something of
+	// the other machine's is masked.
+	podSpec.Binds = append(podSpec.Binds, ownTree(spec.Placed)...)
+	podSpec.Binds = append(podSpec.Binds, masks(spec.RunDir, spec.Mask)...)
 	// The node's own directories are native binds: no FUSE, no cache, no round
 	// trip. Running work where the data lives is then full speed with nothing to
 	// configure, which is the property that makes "mount both, dispatch to
@@ -844,6 +851,9 @@ func (s *server) spawn(c *proto.Conn, m *proto.Msg, fds []int) (int, error) {
 		return <-wait, nil
 	}
 	closeAll(reply.fds)
+	// Said even without a terminal, so the caller can record the pid: it is in
+	// the pod's namespace, and nothing outside can find it otherwise.
+	_ = c.Send(&proto.Msg{Op: proto.OpSpawned, ID: m.ID, Pid: pid})
 	return <-wait, nil
 }
 
@@ -937,7 +947,7 @@ func closeAll(fds []int) {
 // and the command's stdout and stderr stay separate all the way back — which
 // agents need, and which a PTY would have merged.
 func Exec(args []string) error {
-	podName, tty := "", false
+	podName, tty, cwd, pidfile := "", false, "", ""
 	var argv []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -945,6 +955,19 @@ func Exec(args []string) error {
 			if i+1 < len(args) {
 				i++
 				podName = args[i]
+			}
+		case "--pidfile":
+			// Where to write the command's pid, which is the pod's and so is not
+			// this process's child.
+			if i+1 < len(args) {
+				i++
+				pidfile = args[i]
+			}
+		case "--cwd":
+			// A path in the pod, which this side of it may not have at all.
+			if i+1 < len(args) {
+				i++
+				cwd = args[i]
 			}
 		case "--tty":
 			tty = true
@@ -968,7 +991,9 @@ func Exec(args []string) error {
 		return fmt.Errorf("no node pod %q on this machine: %w", podName, err)
 	}
 	defer c.Close()
-	cwd, _ := os.Getwd()
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
 	req := &proto.Msg{Op: proto.OpSpawn, Argv: argv, Env: os.Environ(), Cwd: cwd,
 		TTY: tty}
 	if tty {
@@ -985,6 +1010,13 @@ func Exec(args []string) error {
 		}
 		switch reply.Op {
 		case proto.OpSpawned:
+			if pidfile != "" {
+				_ = os.WriteFile(pidfile, []byte(fmt.Sprintf("%d\n", reply.Pid)), 0o600)
+			}
+			if !tty {
+				closeAll(fds)
+				continue
+			}
 			if len(fds) != 1 {
 				closeAll(fds)
 				return fmt.Errorf("the node pod did not return a terminal")
@@ -1137,4 +1169,131 @@ func Ctl(args []string) error {
 		os.Exit(1)
 	}
 	return nil
+}
+
+// ownSkip are the top-level directories the pod builds itself (/proc, /dev),
+// binds already (/usr, /etc, /opt), or links (/bin and the libs), and its own.
+var ownSkip = map[string]bool{"proc": true, "dev": true, "usr": true, "etc": true,
+	"opt": true, "bin": true, "sbin": true, "lib": true, "lib32": true, "lib64": true,
+	"libx32": true, "vp": true, "lost+found": true}
+
+// ownTree binds this machine's own filesystem into its pod, around the paths the
+// composed tree places. A directory with nothing placed under it is bound whole;
+// one with something placed under it is rebuilt from its entries, so the
+// mountpoint is made in the pod's own tmpfs and never on this machine's disk —
+// where it might not be allowed, and would be left behind if it were. A placed
+// path itself is left out entirely: over there it is the composed tree's, never
+// this machine's same-named directory.
+func ownTree(placed []string) []proto.Bind {
+	var out []proto.Bind
+	var walk func(dir string)
+	walk = func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if dir == "/" && ownSkip[e.Name()] {
+				continue
+			}
+			p := filepath.Join(dir, e.Name())
+			switch placedAt(p, placed) {
+			case 0:
+				if st, err := os.Stat(p); err == nil && (st.IsDir() || st.Mode().IsRegular()) {
+					out = append(out, proto.Bind{Src: p, Dst: p})
+				}
+			case 1:
+				if st, err := os.Stat(p); err == nil && st.IsDir() {
+					walk(p)
+				}
+			}
+		}
+	}
+	walk("/")
+	return append(out, ownDev()...)
+}
+
+// placedAt is 2 when p is placed, 1 when something under it is, and 0 when p
+// is this machine's all the way down.
+func placedAt(p string, placed []string) int {
+	at := 0
+	for _, q := range placed {
+		q = filepath.Clean(q)
+		switch {
+		case q == p:
+			return 2
+		case strings.HasPrefix(q, strings.TrimSuffix(p, "/")+"/"):
+			at = 1
+		}
+	}
+	return at
+}
+
+// ownDev adds this machine's devices to the pod's /dev: the GPUs (/dev/kfd,
+// /dev/dri, /dev/nvidia*) are the reason to send work here at all. Terminals
+// are left out; the pod has its own.
+func ownDev() []proto.Bind {
+	entries, err := os.ReadDir("/dev")
+	if err != nil {
+		return nil
+	}
+	skip := map[string]bool{"pts": true, "ptmx": true, "shm": true, "mqueue": true,
+		"console": true, "tty": true, "null": true, "zero": true, "full": true,
+		"random": true, "urandom": true, "hugepages": true}
+	var out []proto.Bind
+	for _, e := range entries {
+		n := e.Name()
+		if skip[n] || e.Type()&os.ModeSymlink != 0 || strings.HasPrefix(n, "tty") ||
+			strings.HasPrefix(n, "vcs") {
+			continue
+		}
+		if e.IsDir() || e.Type()&os.ModeCharDevice != 0 {
+			p := filepath.Join("/dev", n)
+			out = append(out, proto.Bind{Src: p, Dst: p})
+		}
+	}
+	return out
+}
+
+// masks covers each path that names something of the pod machine's own, where
+// this machine has one of the same name, with an empty one: missing over there
+// rather than holding other bytes. ~/.vp/run is vibepod's own machinery —
+// every node pod's root, and the FUSE mounts it stages before placing them —
+// and is hidden too, so a remote directory still has exactly one path in the pod.
+func masks(runDir string, mask []string) []proto.Bind {
+	if home, err := os.UserHomeDir(); err == nil {
+		mask = append(mask, filepath.Join(home, ".vp", "run"))
+		if r := realPath(home); r != "" && r != home {
+			mask = append(mask, filepath.Join(r, ".vp", "run"))
+		}
+	}
+	emptyDir := filepath.Join(runDir, "mask", "dir")
+	emptyFile := filepath.Join(runDir, "mask", "file")
+	var out []proto.Bind
+	for _, p := range mask {
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		src := emptyDir
+		if !st.IsDir() {
+			src = emptyFile
+		}
+		if err := os.MkdirAll(emptyDir, 0o500); err != nil {
+			continue
+		}
+		if f, err := os.OpenFile(emptyFile, os.O_CREATE|os.O_RDONLY, 0o400); err == nil {
+			f.Close()
+		}
+		out = append(out, proto.Bind{Src: src, Dst: p, ReadOnly: true})
+	}
+	return out
+}
+
+func realPath(p string) string {
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return ""
+	}
+	return r
 }

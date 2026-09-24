@@ -6,6 +6,7 @@ require (
 	charm.land/bubbles/v2 v2.2.1
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/lipgloss/v2 v2.0.6
+	github.com/carapace-sh/carapace-bridge v1.6.4
 	github.com/charmbracelet/ultraviolet v0.0.0-20260922123528-4e49372c11f9
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/charmbracelet/x/vt v0.0.0-20260920004010-53e2afe73ae5

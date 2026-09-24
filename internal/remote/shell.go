@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"syscall"
 )
 
@@ -37,8 +36,7 @@ func (h *Host) Shell(dir string, tty *os.File) (*exec.Cmd, error) {
 	if h.enter != "" {
 		// Inside that machine's pod, where the composed zone is at the same paths
 		// as everywhere else. The cd therefore lands where it was asked to.
-		script = `cd ` + quote(dir) + ` 2>/dev/null || cd; exec ` +
-			strings.Replace(h.enter, " --", " --tty --", 1) + ` "${SHELL:-/bin/sh}" -l`
+		script = `cd; exec ` + h.enterAt(dir, true, "") + ` "${SHELL:-/bin/sh}" -l`
 	}
 
 	args := append(h.Opts(), "-tt", h.Alias, "sh -c "+quote(script))

@@ -69,3 +69,29 @@ func spread(left, right string, w int) string {
 	}
 	return left + strings.Repeat(" ", w-lw-rw) + right
 }
+
+// hintLine is a status line: left, then as many key hints as fit on the right,
+// the least needed dropped first. hints are in order of need; order, when
+// given, is the order they are shown in. lead goes before them, and stays.
+func hintLine(left, lead string, hints, order []string, w int) string {
+	if order == nil {
+		order = hints
+	}
+	for n := len(hints); n > 0; n-- {
+		keep := map[string]bool{}
+		for _, h := range hints[:n] {
+			keep[h] = true
+		}
+		var shown []string
+		for _, h := range order {
+			if keep[h] {
+				shown = append(shown, h)
+			}
+		}
+		keys := lead + stDim.Render(strings.Join(shown, " · ")+" ")
+		if lipgloss.Width(left)+lipgloss.Width(keys)+2 <= w {
+			return spread(left, keys, w)
+		}
+	}
+	return fit(left, w)
+}

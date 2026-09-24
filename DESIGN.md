@@ -949,10 +949,26 @@ vp brief [pod]                the instructions the agent in this pod was given
 vp save [file]                write live state back to vibepod.yaml
 ```
 
-`vibepod up --push` grants, for the machines this config names, the one thing a node pod
-needs: a copy of the vibepod binary in `~/.vp/bin`. `vp node add <host>` is the same grant
-for one machine, and typing it *is* the consent — the cheapest form that is still explicit.
-Without it, a machine that needs a pod says so and says which command allows it.
+A node pod needs one thing of a machine: a copy of the vibepod binary in `~/.vp/bin`.
+Naming the machine in `vibepod.yaml`, or mounting from it, is the consent, and the pod is
+built the first time a command is sent there — `vp @host`, `vp use`, a `remote_tools:`
+wrapper. There is no plain-ssh fallback: the promise is the same view on every machine, and
+a command that ran on the bare machine would give every absolute path in its arguments that
+machine's meaning. A machine that cannot hold a pod (user namespaces disabled) refuses, and
+says why. `vibepod up --push` builds them all at `up`, so the first command does not wait;
+`vp node add <host>` builds one; `vp node drop` removes one.
+
+Since every command there now goes through it, a node pod is **the machine itself** — its
+filesystem, `/sys` and devices (the GPUs are the reason to send work there), its home with
+conda and `~/.local`, its `/tmp`, a module tree under `/apps` — with the composed tree placed
+over it. Placing never writes to the machine: a directory with nothing placed under it is
+bound whole, and one with something placed under it is rebuilt from its entries so the
+mountpoint is made in the pod's own tmpfs. A placed path is never the machine's same-named
+directory. A path that names something of the pod machine's own that the node does not get
+(the identity plane, a directory not in `expose_to:`) is covered with an empty one where the
+node has one of the same name, so it is missing over there rather than holding other bytes.
+A mount added to a running pod that lands inside one of the machine's own directories needs
+the node pod rebuilt (`vp node drop`, then the next command) to be placed that way.
 
 `-s N` exists because a session on another machine cannot move itself: nothing is installed
 there, so `vp` is not on that machine's PATH. That is the premise working as intended rather
@@ -1023,10 +1039,48 @@ gets them. A session `vp shell` did not start has no hooks at all, and the
 daemon tells a framed client so up front, so it never types into whatever that
 session is running. `vp attach` then falls back to raw.
 
+**The input box stays on the bottom rows.** The interface is one frame the
+height of the terminal, output above the box; a line that no longer fits leaves
+through the top by scrolling only the rows above the box — a scroll region whose
+top is the first row, which terminals and tmux keep in their history — so the
+scrollback still gets every line once, in order, with its colours. The first row
+is painted outside Bubble Tea's frame, because Bubble Tea redraws by erasing
+from the frame's top to the end of the screen, and an erase of the whole screen
+is one tmux (`scroll-on-clear`, which vp shell also turns off for its pane while
+it runs) copies into the scrollback. A resize moves lines between screen and
+scrollback in the terminal itself; vp shell asks tmux how many, and puts the
+frame back once the size settles.
+
+**It starts on a clean screen** by scrolling what was there into the scrollback
+(newlines at the bottom, which every terminal and tmux keep) rather than erasing
+it. **`clear` clears the terminal**: a command that sends ESC [ 3 J — `clear`,
+`tput clear`, `reset` — has the real screen and scrollback cleared, in order with
+the blocks printed before it, because the block's own emulator is not what
+anyone means.
+
+**Its own commands are `/name`**, and only for registered names with no second
+slash, so every path still reaches the shell; a leading space sends even a
+registered name there. They exist for what the shell cannot do — the shell on
+gpu03 has no `vp` on its PATH, so `/use` is the way back — and typing `/` lists
+them. The alternatives were `:name`, which cannot collide at all but is
+unfamiliar, and a key-driven palette, which cannot be typed or kept in history.
+
+**Tab asks the machine's shell.** A completion is a hidden command on the
+session's backend, in the shell's reported directory: zsh-capture-completion (as
+carapace-bridge ships it) for zsh, with the fpath the live shell reported, or
+bash-completion's loader for bash. Running it here instead — carapace in-process
+— would complete this machine's files and `$PATH`, which is wrong the moment the
+session is on gpu03. It costs a round trip per Tab and is not in `vp log`.
+
+**Scrolling back is the terminal's.** Inside tmux, PgUp and the wheel enter copy
+mode directly (`copy-mode -e`, so reaching the bottom leaves it); vp shell asks
+for mouse events only inside tmux, so elsewhere the terminal scrolls on its own
+and selecting text needs no shift.
+
 Costs: bash and zsh only; fish and others fall back to raw with a note. On a
 bash older than 4.4, which has no PS0 to mark output start, the block shows the
 echoed line. A background job's output printed while you are at the prompt is
-not shown.
+not shown. In tmux, selecting with the mouse needs shift while vp shell has it.
 
 ### The TUI
 
@@ -1324,7 +1378,8 @@ replays the buffer. Killing the pod kills everything inside it.
 | Nesting | legal in a config, refused at runtime | order in a file is something its author chose; inserting into a live pod changes what the mounts above it mean while work is going on in them |
 | A lost terminal | is a detach, not an end | an agent halfway through something must not be killed by the disappearance of the thing that was watching it — which is the whole reason the daemon owns the pty |
 | Pushed binary identity | compared by hash, not version | a version string cannot tell one build of a development tree from another, and the symptom is a node quietly behaving like an older build. Same bad hour as the daemon's own build check, one machine out |
-| Dispatch with an unowned cwd | runs in the target's own home, said once | `vp @gpu05 rocm-smi` from your home directory has to work. A cwd belonging to a *third* machine is the dangerous case and stays refused |
+| Dispatch with an unowned cwd | runs in the target's own home, said once | `vp @gpu05 rocm-smi` from your home directory has to work |
+| Dispatch to a machine with no pod | builds its pod first; never a plain ssh | a plain ssh had the cwd right and every absolute path in argv wrong: `vp @gpu03 ls /home/aiotlab` answered from gpu03's own disk. Naming the machine in the config is the consent |
 | Machines with no mounts | `hosts:` makes one a backend | a compute node with no data of its own is the case §6 is about, and it was unreachable while only mount owners counted |
 | Language | Go | os/exec, PTY, sockets, goroutine stream-plumbing are first-class; process startup is negligible against RTT |
 

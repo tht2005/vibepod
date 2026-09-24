@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 	"os/signal"
@@ -101,6 +102,13 @@ func (h *handover) Run() error {
 				case b := <-h.data:
 					_, _ = out.Write(b)
 				default:
+					// Bubble Tea left the cursor on the bottom row when it stepped
+					// aside and carries on from there, counting relative to it. A
+					// program that did not save and restore it cannot be trusted to
+					// have put it back.
+					if r, _, err := sys.GetWinsize(fd); err == nil && !h.forever {
+						_, _ = fmt.Fprintf(out, "\x1b[%d;1H", r)
+					}
 					return out.Flush()
 				}
 			}

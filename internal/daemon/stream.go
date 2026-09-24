@@ -79,7 +79,11 @@ func (s *podState) expandRemote(t *proto.Tree) {
 			wg.Add(1)
 			go func(n *proto.TreeNode) {
 				defer wg.Done()
-				lines, err := s.d.pool.Host(n.Target).Children(n.ExecID)
+				h := s.d.pool.Host(n.Target)
+				if np := s.nodePods.get(n.Target); np != nil {
+					h = h.InPod(np.home, s.nodeName(n.Target))
+				}
+				lines, err := h.Children(n.ExecID)
 				if err != nil {
 					return
 				}

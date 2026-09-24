@@ -187,70 +187,44 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 		return s.dispatchLocal(r)
 	}
 
-	dir := route.Dir(s.table(), r.cwd, backend)
-	// Which pod, if any, this command runs in on the far side.
-	//
-	// If the directory belongs to the machine we are sending it to, it is that
-	// machine's own path and a plain ssh is both correct and the fastest thing
-	// available. If it belongs to somebody else — or to no mount at all — then
-	// the same string over there means something different, or nothing, and the
-	// only safe answer is the pod that reproduces it. DESIGN.md §6: the bad
-	// outcome is not the path missing, it is the path existing and holding other
-	// bytes.
-	owner := route.Owner(s.table(), r.cwd)
-	np := s.nodePods.get(backend)
-	if np == nil && owner != backend {
-		// Consent given earlier means "and keep doing that": build the pod now
-		// rather than making the caller ask for something they already allowed.
-		if err := s.ensureNodePod(backend); err == nil {
-			np = s.nodePods.get(backend)
-		}
+	// Every backend runs a pod, so every command sent to one runs inside it and
+	// sees the composed tree at the same paths as here — not just its cwd, but
+	// every absolute path in its arguments, its config files and its scripts.
+	// DESIGN.md §6: a plain ssh would give the same strings that machine's own
+	// meaning, and the bad outcome is not a path missing, it is a path existing
+	// and holding other bytes. So there is no plain-ssh fallback: a machine that
+	// cannot hold a pod refuses, and says why.
+	np, err := s.nodePodFor(backend, r.files[2], r.tty)
+	if err != nil {
+		return 0, err
 	}
+	owner := route.Owner(s.table(), r.cwd)
+	dir := r.cwd
 	switch {
-	case np != nil && owner == route.Pod && !np.holds(dir):
+	case np.holds(dir):
+	case owner == route.Pod:
 		// One of this machine's own directories that was not exposed to this node.
-		// Same answer as with no pod at all: run in that machine's home, and say so
-		// once.
+		// The command is something like `rocm-smi` that does not care where it
+		// runs, so it runs in that machine's home rather than being refused — and
+		// the fact that the directory did not travel is said once, not assumed.
 		dir = ""
 		s.noteHomeDir(r.session, backend, r.cwd)
-	case np != nil:
-		// The composed zone is over there at the same paths, so the directory is
-		// carried as it is. If this particular mount is missing from that pod, say
-		// so — a stale node costs a visible refusal, never a wrong path.
-		if !np.holds(dir) && owner != backend {
-			// Behind on this mount. Try once to catch up — it may simply have been
-			// unreachable when the mount was added — and refuse only if that fails.
-			if err := s.reconcile(np); err != nil || !np.holds(dir) {
-				return 0, fmt.Errorf("%s is not in the pod on %s yet, so a command "+
-					"there would be in a directory of the same name on a different "+
-					"filesystem; `vp node` shows what it is behind on", dir, backend)
-			}
-		}
-	case owner == backend:
-		// The directory is that machine's own: the path means there what it says,
-		// and a plain ssh is both correct and the fastest thing available.
-	case owner != route.Pod:
-		// It belongs to a *third* machine. This is the case §6 is about: the same
-		// string over there is either missing or holds other bytes, and the second
-		// outcome succeeds, writes somewhere real, and is found days later.
-		return 0, s.needNodePod(backend, r.cwd)
 	default:
-		// A directory of this machine's own, or none at all. The command is
-		// something like `rocm-smi` that does not care where it runs, so it runs in
-		// that machine's own home rather than being refused — and the fact that the
-		// directory did not travel is said once, not assumed.
-		dir = ""
-		s.noteHomeDir(r.session, backend, r.cwd)
+		// Behind on this mount. Try once to catch up — it may simply have been
+		// unreachable when the mount was added — and refuse only if that fails: a
+		// stale node costs a visible refusal, never a wrong path.
+		if err := s.reconcile(np); err != nil || !np.holds(dir) {
+			return 0, fmt.Errorf("%s is not in the pod on %s yet, so a command "+
+				"there would be in a directory of the same name on a different "+
+				"filesystem; `vp node` shows what it is behind on", dir, backend)
+		}
 	}
 
 	rec := &execRec{PID: r.pid, PPID: parentOf(r.pid), Argv: r.argv, Cwd: r.cwd,
 		Target: backend, Session: r.session, Start: now()}
 	s.recordExec(rec)
 
-	host := s.d.pool.Host(backend)
-	if np != nil {
-		host = host.InPod(np.home, s.nodeName(backend))
-	}
+	host := s.d.pool.Host(backend).InPod(np.home, s.nodeName(backend))
 	s.markUsed(backend)
 	id := fmt.Sprintf("%s-%d", s.name, execSeq.Add(1))
 	s.mu.Lock()
@@ -280,10 +254,7 @@ func (s *podState) dispatch(r dispatchReq) (int, error) {
 	// vibepod made on that machine.
 	if home := s.homeOf(backend); home != "" {
 		if sock, err := s.agentFor(backend, home); err == nil && sock != "" {
-			if np != nil {
-				sock = podAgentSock
-			}
-			env = append(env, "SSH_AUTH_SOCK="+sock)
+			env = append(env, "SSH_AUTH_SOCK="+podAgentSock)
 		}
 	}
 	req := remote.Req{Dir: dir, Argv: r.argv, Env: env, TTY: r.tty, ID: id}

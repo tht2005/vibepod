@@ -7,9 +7,9 @@ One pod, two real GPU machines:
 | `gpu03` | AMD MI250, ROCm | `/remote/vast0/duongnguyen/gpu-intern-26`, `/remote/vast0/duongnguyen/models` (ro) |
 | `aiotlab_3gpus_aiotlab` | 3× NVIDIA A30 | `/home/aiotlab/apps`, `/home/aiotlab/data` (ro) |
 
-Your agent and its credentials stay on this machine. Nothing is installed on
-either server unless you run `vp node add` (step 6), and then only one binary in
-`~/.vp/bin`.
+Your agent and its credentials stay on this machine. The only thing either
+server gets is one binary in `~/.vp/bin`, the first time a command is sent there
+(step 6); `vp node drop` removes it.
 
 ## 0. Before the first run
 
@@ -84,15 +84,15 @@ This is the case the design was built for, so try it:
 vp run -- sh -c 'cd /remote/vast0/duongnguyen/gpu-intern-26 && vp @aiotlab_3gpus_aiotlab ls'
 ```
 
-**Refused.** aiotlab has no `/remote/vast0/duongnguyen/…` of its own, and if it
-did it would be different files. To have aiotlab hold this pod's tree at the same
-paths:
+It works, after a pause the first time: aiotlab has no
+`/remote/vast0/duongnguyen/…` of its own (and if it did it would be different
+files), so the first command sent there gives it a pod holding this pod's tree
+at the same paths. That copies vibepod to aiotlab:~/.vp/bin and nothing else;
+naming the machine in vibepod.yaml is the consent. The same goes the other way:
 
 ```sh
-vp node add aiotlab_3gpus_aiotlab    # asks nothing more: typing it is the consent.
-                                     # Copies vibepod to aiotlab:~/.vp/bin, nothing else.
-vp run -- sh -c 'cd /remote/vast0/duongnguyen/gpu-intern-26 && vp @aiotlab_3gpus_aiotlab ls'
-vp node                              # what aiotlab holds
+vp @gpu03 ls /home/aiotlab           # aiotlab's directories, read on gpu03
+vp node                              # what each machine's pod holds
 ```
 
 aiotlab mounts gpu03's directory *itself* if it can ssh to gpu03 with its own

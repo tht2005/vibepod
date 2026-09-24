@@ -79,3 +79,11 @@ func TestParserGivesUpOnARunawayOSC(t *testing.T) {
 		t.Fatalf("got %d events, last %+v", len(evs), evs[len(evs)-1])
 	}
 }
+
+func TestParserReadsFpath(t *testing.T) {
+	var p Parser
+	evs := p.Feed([]byte("\x1b]7717;fpath=/a:/b c\a"))
+	if len(evs) != 1 || evs[0].Kind != Fpath || evs[0].Fpath != "/a:/b c" {
+		t.Fatalf("got %+v", evs)
+	}
+}

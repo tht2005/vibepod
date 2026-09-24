@@ -14,8 +14,22 @@ import (
 // node pod is a namespace, not a different transport.
 func (h *Host) InPod(home, pod string) *Host {
 	c := *h
-	c.enter = fmt.Sprintf("%s/.vp/bin/vibepod nodeexec --pod %s --", home, pod)
+	c.enter = fmt.Sprintf("%s/.vp/bin/vibepod nodeexec --pod %s", home, pod)
 	return &c
+}
+
+// enterAt is the command prefix that runs what follows inside the node pod, in
+// dir. The directory is named rather than inherited: it is a path in the pod,
+// and the bare machine the ssh lands on may have nothing there to cd into.
+func (h *Host) enterAt(dir string, tty bool, extra string) string {
+	cmd := h.enter + extra
+	if tty {
+		cmd += " --tty"
+	}
+	if dir != "" {
+		cmd += " --cwd " + quote(dir)
+	}
+	return cmd + " --"
 }
 
 // InPod reports whether this view enters a node pod.
@@ -52,15 +66,20 @@ func (h *Host) Run(r Req) (int, error) {
 	// same descriptors on to the pod and waits. The pid file still names the
 	// shell, so the signal path below is unchanged.
 	command := joinArgs(r.Argv)
-	if h.enter != "" {
-		command = h.enter + " " + command
-	}
 	// An empty Dir means "this machine's own home": the caller's directory was one
 	// this machine does not have, and a command that does not care where it runs
 	// should run rather than be refused. Which it was is reported; see the daemon.
 	cd := "cd " + quote(r.Dir) + " || exit 1"
 	if r.Dir == "" {
 		cd = "cd || exit 1"
+	}
+	if h.enter != "" {
+		// The directory is the pod's, and nodeexec goes there inside it; out here
+		// the ssh only needs somewhere to stand.
+		// The command's pid is in the pod's own namespace, so nodeexec writes it
+		// down beside the pid file: it is what Children asks the pod about.
+		command = h.enterAt(r.Dir, false, ` --pidfile "$d/`+r.ID+`.pod"`) + " " + command
+		cd = "cd"
 	}
 	// ~/.vp/bin goes on the *end* of PATH: it holds what vibepod was allowed to
 	// copy there (see toolbin), and a tool the machine has of its own must always
@@ -170,6 +189,12 @@ func joinArgs(argv []string) string {
 func (h *Host) Children(id string) ([]string, error) {
 	script := fmt.Sprintf(`d=%s; p=$(cat "$d/%s" 2>/dev/null) || exit 0; `+
 		`ps -o pid=,args= --ppid "$p" 2>/dev/null; exit 0`, runDirExpr, id)
+	if h.enter != "" {
+		// Inside a node pod the command is a child of the pod, not of the ssh, and
+		// its pid is the pod's: ask there.
+		script = fmt.Sprintf(`d=%s; p=$(cat "$d/%s.pod" 2>/dev/null) || exit 0; `+
+			`%s -- ps -o pid=,args= --ppid "$p" 2>/dev/null; exit 0`, runDirExpr, id, h.enter)
+	}
 	args := append(h.Opts(), h.Alias, "sh -c "+quote(script))
 	out, err := exec.Command("ssh", args...).Output()
 	if err != nil {

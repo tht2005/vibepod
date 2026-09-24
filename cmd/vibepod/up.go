@@ -68,8 +68,10 @@ func loadSpec(name string) (*proto.Msg, error) {
 
 func cmdUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
+	// Every machine the config names gets a pod the first time a command is sent
+	// there; --push builds them now instead, so the first command does not wait.
 	push := fs.Bool("push", false,
-		"allow vibepod to put one binary in ~/.vp/bin on the machines this pod uses")
+		"build each machine's pod now rather than on its first command")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

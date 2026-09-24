@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"vibepod/internal/daemon"
 	"vibepod/internal/node"
@@ -40,6 +41,12 @@ func main() {
 		case "nodeexec":
 			if err := node.Exec(args[1:]); err != nil {
 				fmt.Fprintln(os.Stderr, "nodeexec:", err)
+				// A program that is not there is 127, as a shell says it: nothing
+				// ran, and it is what the daemon's copy-and-retry waits for.
+				if strings.Contains(err.Error(), "executable file not found") ||
+					strings.Contains(err.Error(), "no such file or directory") {
+					os.Exit(127)
+				}
 				os.Exit(exitUnavailable)
 			}
 			return

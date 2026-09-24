@@ -224,6 +224,15 @@ func (k *ctlConn) serve() {
 				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID,
 					NodeInfos: s.nodeList()})
 			}
+		case proto.OpComplete:
+			go func() {
+				out, err := k.d.complete(m)
+				if err != nil {
+					_ = k.c.Errorf(m.ID, "%v", err)
+					return
+				}
+				_ = k.c.Send(&proto.Msg{Op: proto.OpOK, ID: m.ID, Detail: out})
+			}()
 		case proto.OpDispatch:
 			files := adopt(fds)
 			go func() {
@@ -426,7 +435,7 @@ func podOp(op string) bool {
 	case proto.OpPs, proto.OpLog, proto.OpTree, proto.OpHosts, proto.OpStat,
 		proto.OpBackend, proto.OpBrief, proto.OpUse, proto.OpDispatch,
 		proto.OpExec, proto.OpMount, proto.OpUnmount, proto.OpSignal,
-		proto.OpNodeList, proto.OpForward:
+		proto.OpNodeList, proto.OpForward, proto.OpComplete:
 		return true
 	}
 	return false

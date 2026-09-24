@@ -50,8 +50,12 @@ type podState struct {
 	// mount.
 	machines []string
 	// consented is the machines allowed to hold one pushed binary. Nothing is
-	// copied anywhere without an entry here.
+	// copied anywhere without an entry here; a machine the pod names gets one
+	// the first time a command is sent to it (see ensureNodePod).
 	consented map[string]bool
+	// nodeBuild holds one lock per machine, so two commands arriving at once for
+	// a machine with no pod build it once.
+	nodeBuild sync.Map
 	envMode   EnvPolicy
 	used      map[string]bool // machines this pod has reached
 	// nodePods are the pods this pod has on other machines: the same composed

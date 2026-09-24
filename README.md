@@ -56,15 +56,17 @@ a command to gpu05 with a working directory of `/remote/vast0/…/proj` and eith
 the path is missing — fine, it fails — or **it exists and holds different bytes**,
 which succeeds, writes somewhere real, and is discovered days later.
 
-So vibepod does not translate paths. It reproduces them: `vp node add gpu05`
-builds a pod *on gpu05* holding the same composed tree at the same absolute
-paths. What crosses is one binary in `~/.vp/bin` and a description of the mounts.
+So vibepod does not translate paths. It reproduces them: the first command sent
+to gpu05 builds a pod *on gpu05* holding the same composed tree at the same
+absolute paths (`vp node add gpu05` does it ahead of time). What crosses is one binary in `~/.vp/bin` and a description of the mounts.
 No credentials, no agent, nothing installed outside that directory, and `vp node
 drop` removes what it made.
 
-The node keeps its **own** `/usr`, `/etc` and `/opt`, because that difference is
-the reason to dispatch there at all — a minimal root on a GPU box hides the GPUs
-and reads as "ROCm is broken". A mount can say what it needs of whoever runs it:
+Everything else in a node pod is the node's **own**: its toolchain, devices, home,
+conda and module trees, because that difference is the reason to dispatch there
+at all — a minimal root on a GPU box hides the GPUs and reads as "ROCm is
+broken". The composed tree is placed over it without writing to the machine. A
+mount can say what it needs of whoever runs it:
 
 ```yaml
   - remote: gpu03:/remote/vast0/duongnguyen/imagenet
@@ -208,7 +210,7 @@ machine it ran on, in which directory, and how it ended.
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ ❯ run on gpu03                                                               │
 ╰──────────────────────────────────────────────────────────────────────────────╯
- gpu03  ~/gpu-intern-26              ↑ history · alt+⏎ newline · ctrl+d exit
+ gpu03  ~/gpu-intern-26           / commands · tab complete · ctrl+\ detach
 ```
 
 Underneath it is the same login shell as before, in the pod or over ssh, so
@@ -217,13 +219,35 @@ When it first sees a shell (bash or zsh), vibepod types a few hooks into it
 that mark where each command's output begins and ends. Nothing is installed,
 and your prompt, rc files and history stay yours. A block's bar is coloured by
 machine. A finished block goes into the terminal's own scrollback, so scrolling,
-searching and copying work, and it is still there after you quit.
+searching and copying work, and it is still there after you quit. The input box
+stays on the bottom rows, and output fills the screen from just above it, the
+way a plain terminal scrolls. It starts on a clean screen, with what was there
+scrolled up rather than erased, and `clear` clears the terminal rather than just
+its own block.
+
+**Tab** completes the way the shell on that machine would: zsh's completion
+system or bash-completion, run where the session is and in its directory, so on
+gpu03 it offers gpu03's files and commands. **PgUp** and the mouse wheel scroll
+back; inside tmux they go straight into copy mode, with no prefix key, and
+scrolling back to the bottom leaves it.
+
+A line that starts with `/` and a name below is vp shell's own command; any other
+line goes to the shell, so `/usr/bin/ls` still runs. A leading space sends even
+these to the shell. Typing `/` shows them.
+
+| | |
+|---|---|
+| `/use <machine>` | move this session — the way back from a machine with no `vp` on it |
+| `/hosts` | the machines this pod knows |
+| `/clear` | clear the screen and the scrollback |
+| `/detach`, `/exit` | as ctrl+\ and ctrl+d |
+| `/help` | commands and keys |
 
 While a command runs, every key goes to it, and its output is drawn by a
 terminal emulator. That means progress bars, a Python REPL, a password prompt
 and inline interfaces like Claude Code's all work. A program that takes the
-whole screen (vim, htop, less) gets the real terminal until it leaves. `vp use
-gpu03` typed at the prompt moves to that machine's shell.
+whole screen (vim, htop, less) gets the real terminal until it leaves. `/use
+gpu03` moves to that machine's shell, and `/use pod` comes back.
 `ctrl+\` detaches, and `vp attach` brings the blocks back, including a command
 that was still running. `vp shell --raw` is the shell's own pty, without any of
 this. So is a shell whose hooks do not take (fish, for now), and it says so.

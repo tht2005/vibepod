@@ -40,6 +40,15 @@ func connect() (*proto.Conn, error) {
 	return nil, fmt.Errorf("daemon did not come up; see %s/daemon.log", daemon.RunDir())
 }
 
+// dialQuiet reaches a daemon that is already running, and says nothing: it is
+// for requests made from inside an interface that owns the terminal.
+func dialQuiet() (*proto.Conn, error) {
+	if s := os.Getenv("VIBEPOD_SOCK"); s != "" {
+		return proto.Dial(s)
+	}
+	return proto.Dial(daemon.HostSock())
+}
+
 // warnStaleDaemon says so when the daemon is from a different build than this
 // binary. It is not an error — the old daemon works fine, for the old
 // behaviour — but the symptom otherwise is a change you just made having no
@@ -52,7 +61,8 @@ func warnStaleDaemon() {
 	if running := strings.TrimSpace(string(b)); running != daemon.Version {
 		fmt.Fprintf(os.Stderr,
 			"vibepod: the running daemon is build %s, this is %s. "+
-				"`vpctl down` your pods to pick up the new one.\n",
+				"`vibepod down` your pods and stop it (pkill -f 'vibepod daemon') "+
+				"to pick up the new one.\n",
 			running, daemon.Version)
 	}
 }

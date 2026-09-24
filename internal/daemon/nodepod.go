@@ -146,6 +146,16 @@ func (s *podState) nodeSpecFor(host, home string) (*proto.NodeSpec, error) {
 		if m.Via != "relay" {
 			spec.Mounts = append(spec.Mounts, m)
 		}
+		if m.Host != host || m.Path != m.At {
+			spec.Placed = append(spec.Placed, m.At)
+		}
+	}
+	// The node keeps its own home (see vpnode), and this machine's own paths are
+	// the ones it could hold a same-named copy of there.
+	for _, m := range s.mountList() {
+		if m.Identity || (m.Owner == route.Pod && !contains(m.ExposeTo, host)) {
+			spec.Mask = append(spec.Mask, m.At)
+		}
 	}
 
 	return spec, nil
@@ -306,7 +316,9 @@ func (s *podState) startNodePod(host string, consented map[string]bool, pr *Prog
 	// whole: adoption of a pod that was already running goes through the same
 	// path, and there the answer is genuinely unknown.
 	if err := s.reconcile(np); err != nil {
-		s.nodePods.drop(host)
+		// Stopped, not just forgotten: a pod left running there would be adopted
+		// half-built by the next command, or squat on the machine until its lease.
+		s.stopNodePod(host)
 		return fmt.Errorf("%s built a pod but could not be reconciled: %w", host, err)
 	}
 	s.markUsed(host)
@@ -393,26 +405,6 @@ func (s *podState) stopNodePod(host string) {
 	}
 }
 
-// needNodePod explains why a command cannot be sent to a machine that has no pod,
-// and what to do about it.
-//
-// The refusal is the point. Sending it anyway would run in a directory of the same
-// name on a machine where that name means something else — which succeeds, writes
-// somewhere real, and is discovered days later.
-func (s *podState) needNodePod(host, cwd string) error {
-	owner := route.Owner(s.table(), cwd)
-	switch {
-	case owner == route.Pod:
-		return fmt.Errorf("%s is a directory on this machine, and %s has no pod that "+
-			"reproduces it; run this on `pod`, or give %s a pod with "+
-			"`vp node add %s`", cwd, host, host, host)
-	default:
-		return fmt.Errorf("%s belongs to %s, and %s has no pod that reproduces it — a "+
-			"command there would be in a directory of the same name on a different "+
-			"filesystem; `vp node add %s` builds one", cwd, owner, host, host)
-	}
-}
-
 // holds reports whether a machine's pod has this directory, which is what makes a
 // dispatch to a node that is behind a visible refusal rather than a wrong path.
 func (np *nodePod) holds(dir string) bool {
@@ -489,19 +481,59 @@ func (s *podState) nodeList() []proto.NodeInfo {
 	return out
 }
 
-// ensureNodePod builds a pod on a machine if this pod already has consent for it,
-// which is what makes `vibepod up --push` mean "and keep doing that".
+// ensureNodePod builds a pod on a machine this pod uses, if it has none.
+//
+// Naming a machine in vibepod.yaml, or mounting from it, is the consent: the
+// promise is the same view on every machine, and a machine that has not been
+// given a pod does not keep it. What a pod costs there is one binary in
+// ~/.vp/bin — no credentials, no agent, nothing outside that directory — and
+// `vp node drop` takes it away.
 func (s *podState) ensureNodePod(host string) error {
 	if s.nodePods.get(host) != nil {
 		return nil
 	}
+	if !s.knownBackend(host) {
+		return fmt.Errorf("this pod has no machine called %q; `vp hosts` lists them", host)
+	}
 	s.mu.Lock()
+	if s.consented == nil {
+		s.consented = map[string]bool{}
+	}
+	s.consented[host] = true
 	consented := copySet(s.consented)
 	s.mu.Unlock()
-	if !consented[host] {
-		return fmt.Errorf("not consented")
-	}
 	return s.startNodePod(host, consented, nil)
+}
+
+// nodePodFor is the pod a command sent to host runs in, built on first use.
+// Building one takes seconds, so a person at a terminal is told why it is
+// waiting; an agent's stderr is left alone, and the build is in `vp log`.
+func (s *podState) nodePodFor(host string, stderr *os.File, tty bool) (*nodePod, error) {
+	if np := s.nodePods.get(host); np != nil {
+		return np, nil
+	}
+	mu, _ := s.nodeBuild.LoadOrStore(host, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+	if np := s.nodePods.get(host); np != nil {
+		return np, nil
+	}
+	if tty && stderr != nil {
+		fmt.Fprintf(stderr, "vibepod: giving %s a pod, so it sees the same tree as "+
+			"everywhere else (once)…\r\n", host)
+	}
+	if err := s.ensureNodePod(host); err != nil {
+		return nil, fmt.Errorf("%s has no pod and one could not be built, so a "+
+			"command there would see that machine's own files rather than this "+
+			"pod's: %w", host, err)
+	}
+	np := s.nodePods.get(host)
+	if np == nil {
+		return nil, fmt.Errorf("%s: the pod was built but is not answering", host)
+	}
+	s.d.bus.Publish(event.Event{Kind: event.KindPod, Pod: s.name, Target: host,
+		Detail: "node pod built on first use"})
+	return np, nil
 }
 
 func copySet(in map[string]bool) map[string]bool {

@@ -195,18 +195,18 @@ func (s *podState) openShell(sess *session, backend string, argv []string,
 		if rows > 0 && cols > 0 {
 			_ = sys.SetWinsize(master.Fd(), rows, cols)
 		}
-		dir := route.Dir(s.table(), cwd, backend)
-		host := s.d.pool.Host(backend)
-		// In that machine's pod when it has one, so the shell opens in a directory
-		// that means what it says. Without one the shell is on the bare machine,
-		// which is right when the directory is that machine's own and is what the
-		// prompt then shows.
-		if np := s.nodePods.get(backend); np != nil {
-			host = host.InPod(np.home, s.nodeName(backend))
-		} else if err := s.ensureNodePod(backend); err == nil {
-			if np := s.nodePods.get(backend); np != nil {
-				host = host.InPod(np.home, s.nodeName(backend))
-			}
+		// In that machine's pod, like every command sent there, so the shell
+		// opens in a directory that means what it says and every path typed into
+		// it means what it means here.
+		np, err := s.nodePodFor(backend, nil, false)
+		if err != nil {
+			master.Close()
+			return nil, err
+		}
+		host := s.d.pool.Host(backend).InPod(np.home, s.nodeName(backend))
+		dir := cwd
+		if !np.holds(dir) {
+			dir = ""
 		}
 		cmd, err := host.Shell(dir, slave)
 		if err != nil {

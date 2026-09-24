@@ -49,6 +49,9 @@ type ShellConfig struct {
 	// Rows and Cols are the terminal's size at the start: the replayed
 	// scrollback can arrive before Bubble Tea has measured the window.
 	Rows, Cols int
+	// Dial opens a connection of its own to the daemon, for what the interface
+	// asks it — completions, /use — while Conn carries the session.
+	Dial func() (*proto.Conn, error)
 }
 
 // ShellResult is how a `vp shell` ended.
@@ -66,8 +69,9 @@ func EmuSize(rows, cols int) (int, int) {
 }
 
 // chromeRows is what the live block cannot use: a blank line, the input box's
-// three rows and the status line.
-const chromeRows = 5
+// three rows and the status line — and two rows of output above it, the least
+// a scroll region can be, which is how lines leave for the scrollback.
+const chromeRows = 7
 
 type phase int
 
@@ -97,11 +101,15 @@ type (
 // RunShell runs the interface until the session ends or is detached from. The
 // session must already be attached, framed, with its output on cfg.Out.
 func RunShell(cfg ShellConfig) ShellResult {
+	// Start on a clean screen: what was on it goes up into the scrollback, where
+	// it is kept, and the interface starts at the top instead of under it.
+	scrollAway(cfg.Rows)
 	m := newShell(cfg)
+	defer tmuxQuietClear(m.tmux)()
+	m.histBase, _ = tmuxHistory(m.tmux)
+	m.histLimit = tmuxHistoryLimit(m.tmux)
 	p := tea.NewProgram(m)
-	m.pr = newPrinter(p)
 	m.st = &stream{p: p}
-	go m.pr.run()
 	go m.st.run(cfg.Out)
 	go func() {
 		for {
@@ -135,7 +143,6 @@ func RunShell(cfg ShellConfig) ShellResult {
 type shellModel struct {
 	cfg ShellConfig
 	st  *stream
-	pr  *printer
 
 	w, h int
 	in   textarea.Model
@@ -175,6 +182,38 @@ type shellModel struct {
 
 	quitting bool
 	res      ShellResult
+
+	// The menu over the input — /commands, or what Tab found — and whether Esc
+	// closed the command menu for this line.
+	menu          *menu
+	menuDismissed bool
+	compSeq       int
+	// fpath is each machine's zsh function path, as its shell reported it.
+	fpath map[string]string
+	// busy is what the interface is waiting on; flash is one line of news,
+	// until the next key.
+	busy, flash string
+	// tmux is the pane this runs in, when it runs in tmux: scrolling back is
+	// then its copy mode.
+	tmux string
+	// cleared is set when the running block cleared the terminal, which takes
+	// its header and needs no blank line after it.
+	cleared bool
+
+	// tail is the output on screen above the box, a row each; pending is what
+	// has left it for the scrollback and is still to be written there. clearing
+	// and rehome are writes owed to the terminal: see frame.go.
+	tail, pending []string
+	clearing      bool
+	realignSeq    int
+	realigning    bool
+	// In tmux, histBase is the pane's scrollback size when last asked, and
+	// pushed how many lines went into it since; recent are the last of them.
+	// A resize compares, to know what the terminal moved: see frame.go.
+	histBase, pushed, histLimit int
+	recent                      []string
+	// row1 is what was last painted on the first row, which is outside the frame.
+	row1 string
 }
 
 func newShell(cfg ShellConfig) *shellModel {
@@ -206,7 +245,8 @@ func newShell(cfg ShellConfig) *shellModel {
 	in.KeyMap.InsertNewline.SetKeys("alt+enter", "shift+enter", "ctrl+j")
 	in.Focus()
 	m := &shellModel{cfg: cfg, in: in, booted: map[string]bool{},
-		hist: loadHistory(cfg.History), w: cfg.Cols, h: cfg.Rows}
+		hist: loadHistory(cfg.History), w: cfg.Cols, h: cfg.Rows,
+		fpath: map[string]string{}, tmux: tmuxPane()}
 	m.in.SetWidth(max(m.w-4, 10))
 	m.histAt = len(m.hist)
 	return m
@@ -224,15 +264,18 @@ func (m *shellModel) winch(rows, cols int) {
 	_ = m.cfg.Conn.Send(&proto.Msg{Op: proto.OpWinch, Rows: rows, Cols: cols})
 }
 
-func (m *shellModel) print(s string) {
-	if !m.quiet {
-		m.pr.add(s)
-	}
+func (m *shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	_, cmd := m.update(msg)
+	return m, tea.Batch(cmd, m.fit())
 }
 
-func (m *shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *shellModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		var realign tea.Cmd
+		if m.w != 0 && (msg.Width != m.w || msg.Height != m.h) {
+			realign = m.resized(msg.Width, msg.Height)
+		}
 		m.w, m.h = msg.Width, msg.Height
 		m.in.SetWidth(max(m.w-4, 10))
 		rows, cols := EmuSize(m.h, m.w)
@@ -242,6 +285,17 @@ func (m *shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.ph != phHand && m.ph != phRaw {
 			m.winch(rows, cols)
 		}
+		return m, realign
+
+	case realignMsg:
+		if msg.seq == m.realignSeq && m.ph != phHand && m.ph != phRaw {
+			return m, tea.Exec(realign{}, func(error) tea.Msg { return realignedMsg{} })
+		}
+		return m, nil
+
+	case realignedMsg:
+		m.realigning = false
+		m.row1 = "\x00" // repainted: the rows were cleared
 		return m, nil
 
 	case streamMsg:
@@ -273,9 +327,11 @@ func (m *shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.emu != nil {
 			m.finish(msg.code, !msg.detached)
 		}
+		// What has left the screen is written before the interface goes; what is
+		// still on it stays there as the program's last frame.
+		cmd := m.fit()
 		m.quitting = true
-		pr := m.pr
-		return m, func() tea.Msg { pr.wait(); return tea.QuitMsg{} }
+		return m, tea.Sequence(cmd, tea.Quit)
 
 	case sentTimeoutMsg:
 		// No output marker, but the shell did something with the line: asked for
@@ -307,9 +363,28 @@ func (m *shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.ticking = false
-		if m.ph == phRun || m.ph == phSent {
+		if m.ph == phRun || m.ph == phSent || m.busy != "" {
 			m.spin++
 			return m, m.tick()
+		}
+		return m, nil
+
+	case controlMsg:
+		m.busy = ""
+		if msg.err != nil {
+			m.print(stFail.Render("✗ ") + msg.err.Error())
+		} else if msg.text != "" {
+			m.print(msg.text)
+		}
+		return m, nil
+
+	case completeMsg:
+		m.completed(msg)
+		return m, nil
+
+	case tea.MouseWheelMsg:
+		if msg.Button == tea.MouseWheelUp {
+			return m, m.tmuxScroll(false, 3)
 		}
 		return m, nil
 
@@ -344,6 +419,12 @@ func (m *shellModel) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		_ = m.cfg.Conn.Send(&proto.Msg{Op: proto.OpDetach})
 		return m, nil
 	}
+	m.flash = ""
+	// Scrolling back is the terminal's, whatever is running: a build's output
+	// is what you most want to scroll through while it runs.
+	if m.tmux != "" && (k.String() == "pgup" || k.String() == "shift+pgup") {
+		return m, m.tmuxScroll(true, 0)
+	}
 	switch m.ph {
 	case phRun:
 		if m.emu != nil {
@@ -368,12 +449,20 @@ func (m *shellModel) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.menu != nil {
+		if cmd, ok := m.menuKey(k); ok {
+			return m, cmd
+		}
+	}
 	switch k.String() {
 	case "enter":
 		return m.submit()
+	case "tab":
+		return m, m.startComplete()
 	case "ctrl+c":
 		m.in.Reset()
 		m.histAt = len(m.hist)
+		m.menu, m.menuDismissed = nil, false
 		return m, nil
 	case "ctrl+d":
 		if m.in.Value() == "" {
@@ -406,6 +495,7 @@ func (m *shellModel) key(k tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.in, cmd = m.in.Update(k)
+	m.syncSlashMenu()
 	return m, cmd
 }
 
@@ -420,6 +510,10 @@ func (m *shellModel) submit() (tea.Model, tea.Cmd) {
 	}
 	m.histAt, m.draft = len(m.hist), ""
 	m.in.Reset()
+	m.menu, m.menuDismissed = nil, false
+	if c, args, ok := slashLine(line); ok {
+		return m, m.runSlash(c, args)
+	}
 	m.cmd = line
 	m.echo = nil
 	m.ph = phSent
@@ -439,7 +533,21 @@ func (m *shellModel) handle(ev Event) tea.Cmd {
 		// arrive before the interface has taken the terminal back.
 		switch {
 		case m.emu != nil:
-			_, _ = m.emu.Write(ev.Data)
+			data := ev.Data
+			for {
+				i := bytes.Index(data, []byte("\x1b[3J"))
+				if i < 0 {
+					break
+				}
+				// The program asked for the scrollback to go, so the real one goes:
+				// what it printed before is already out there, not in the block.
+				_, _ = m.emu.Write(data[:i+4])
+				data = data[i+4:]
+				m.emu.ClearScrollback()
+				m.clearTerminal()
+				m.cleared = true
+			}
+			_, _ = m.emu.Write(data)
 		case m.ph == phSent || m.ph == phIdle:
 			m.echo = append(m.echo, ev.Data...)
 		}
@@ -480,6 +588,9 @@ func (m *shellModel) handle(ev Event) tea.Cmd {
 
 	case Cwd:
 		m.cwd, m.home = ev.Cwd, ev.Home
+
+	case Fpath:
+		m.fpath[m.backend] = ev.Fpath
 
 	case Prompt:
 		m.sawMark = true
@@ -570,6 +681,7 @@ func (m *shellModel) startBlock() {
 		}
 	}()
 	m.emu = e
+	m.cleared = false
 	m.started = time.Now()
 	m.blockOn, m.blockCwd = m.backend, m.cwd
 	m.ph = phRun
@@ -633,10 +745,20 @@ func (m *shellModel) screenRows(withCursor bool) []string {
 func (m *shellModel) finish(code int, ended bool) {
 	m.drain()
 	var b strings.Builder
-	for _, r := range m.screenRows(false) {
+	rows := m.screenRows(false)
+	for _, r := range rows {
 		b.WriteString(bar(m.blockOn) + r + "\n")
 	}
 	took := time.Since(m.started)
+	if m.cleared && len(rows) == 0 && code == 0 {
+		// `clear`: the screen it asked for is the one it should leave.
+		_ = m.emu.Close()
+		m.emu = nil
+		if m.ph == phRun || m.ph == phHand {
+			m.ph = phIdle
+		}
+		return
+	}
 	switch {
 	case !ended:
 	case code != 0:
@@ -666,13 +788,51 @@ func round(d time.Duration) string {
 var spinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func (m *shellModel) View() tea.View {
-	if m.quitting || m.w == 0 || m.ph == phHand || m.ph == phRaw {
+	if m.quitting {
+		// The output that was on screen stays, without the box under it: the
+		// rows under the first, which is already there and outside the frame.
+		rows := m.tailView(m.tailRows())
+		if len(rows) > 0 {
+			rows = rows[1:]
+		}
+		for len(rows) > 0 && rows[0] == "" {
+			rows = rows[1:]
+		}
+		return tea.NewView(strings.Join(rows, "\n"))
+	}
+	// While a full-screen program has the terminal the frame stays as it was:
+	// emptying a frame the height of the screen scrolls it into the scrollback.
+	if m.w == 0 || m.ph == phRaw {
 		return tea.NewView("")
 	}
+	if m.realigning {
+		return tea.NewView(" ") // see resized
+	}
+	chrome, cur := m.chrome()
+	lines := m.tailView(m.h - len(chrome))
+	if len(lines) > 0 {
+		lines = lines[1:] // the first row: see frame.go
+	}
+	lines = append(lines, chrome...)
+	if cur != nil {
+		cur.Position.Y += len(lines) - len(chrome)
+	}
+	v := tea.NewView(strings.Join(lines, "\n"))
+	v.Cursor = cur
+	if m.tmux != "" {
+		// Only for the wheel, which tmux hands to copy mode: see tmuxScroll.
+		v.MouseMode = tea.MouseModeCellMotion
+	}
+	return v
+}
+
+// chrome is everything under the output: the running block, the menu, the
+// input box and the status line, with the cursor counted from its top.
+func (m *shellModel) chrome() ([]string, *tea.Cursor) {
 	var lines []string
 	var cur *tea.Cursor
 
-	if m.ph == phRun {
+	if m.ph == phRun && m.emu != nil {
 		rows := m.screenRows(true)
 		for _, r := range rows {
 			lines = append(lines, bar(m.blockOn)+r)
@@ -685,6 +845,11 @@ func (m *shellModel) View() tea.View {
 		}
 	}
 	lines = append(lines, "")
+	if m.ph == phIdle {
+		if mv := m.menuView(); len(mv) > 0 {
+			lines = append(lines[:len(lines)-1], mv...)
+		}
+	}
 
 	border := colAccent
 	if m.ph != phIdle {
@@ -714,10 +879,7 @@ func (m *shellModel) View() tea.View {
 		}
 	}
 	lines = append(lines, m.status())
-
-	v := tea.NewView(strings.Join(lines, "\n"))
-	v.Cursor = cur
-	return v
+	return lines, cur
 }
 
 func (m *shellModel) backendName() string {
@@ -733,15 +895,28 @@ func (m *shellModel) status() string {
 	if m.lastCode != 0 && m.ph == phIdle {
 		left += stFail.Render(fmt.Sprintf("  ✗ %d", m.lastCode))
 	}
-	var right string
+	// What is being waited on, or just happened, is worth more than the path.
+	news := ""
+	switch {
+	case m.busy != "":
+		news = stAccent.Render(spinner[m.spin%len(spinner)]) + stDim.Render(" "+m.busy+" ")
+	case m.flash != "":
+		news = stWarn.Render(m.flash + " ")
+	}
+	if news != "" {
+		if room := m.w - lipgloss.Width(news) - 2; lipgloss.Width(left) > room {
+			left = ansi.Truncate(left, max(room, 1), "…")
+		}
+		return spread(left, news, m.w)
+	}
 	switch m.ph {
 	case phRun, phSent:
-		right = stAccent.Render(spinner[m.spin%len(spinner)]) +
-			stDim.Render(fmt.Sprintf(" %s · ctrl+c interrupt · ctrl+\\ detach ", round(time.Since(m.started))))
-	default:
-		right = stDim.Render("↑ history · alt+⏎ newline · ctrl+d exit · ctrl+\\ detach ")
+		took := stAccent.Render(spinner[m.spin%len(spinner)]) +
+			stDim.Render(" "+round(time.Since(m.started))+" · ")
+		return hintLine(left, took, []string{"ctrl+c interrupt", "ctrl+\\ detach"}, nil, m.w)
 	}
-	return spread(left, right, m.w)
+	return hintLine(left, "", []string{"/ commands", "tab complete", "ctrl+\\ detach",
+		"↑ history", "alt+⏎ newline", "ctrl+d exit"}, nil, m.w)
 }
 
 // stream reads the session's output and splits it, handing a full-screen
@@ -869,60 +1044,4 @@ func (s *stream) feed(b []byte) {
 		batch = append(batch, ev)
 	}
 	flush()
-}
-
-// printer puts lines above the interface in the order they were produced.
-// Bubble Tea runs each command in its own goroutine, so two prints from two
-// updates would otherwise race, and a block's output could land above its
-// own header.
-type printer struct {
-	p    *tea.Program
-	mu   sync.Mutex
-	cond *sync.Cond
-	q    []string
-	busy bool
-}
-
-func newPrinter(p *tea.Program) *printer {
-	pr := &printer{p: p}
-	pr.cond = sync.NewCond(&pr.mu)
-	return pr
-}
-
-func (pr *printer) add(s string) {
-	pr.mu.Lock()
-	s = strings.TrimSuffix(s, "\n")
-	if s == "" {
-		s = " " // a blank line, which Println would otherwise drop
-	}
-	pr.q = append(pr.q, s)
-	pr.mu.Unlock()
-	pr.cond.Broadcast()
-}
-
-func (pr *printer) run() {
-	for {
-		pr.mu.Lock()
-		for len(pr.q) == 0 {
-			pr.cond.Wait()
-		}
-		items := pr.q
-		pr.q = nil
-		pr.busy = true
-		pr.mu.Unlock()
-		pr.p.Println(strings.Join(items, "\n"))
-		pr.mu.Lock()
-		pr.busy = false
-		pr.mu.Unlock()
-		pr.cond.Broadcast()
-	}
-}
-
-// wait returns once everything added has been printed.
-func (pr *printer) wait() {
-	pr.mu.Lock()
-	for len(pr.q) > 0 || pr.busy {
-		pr.cond.Wait()
-	}
-	pr.mu.Unlock()
 }

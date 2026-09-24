@@ -36,24 +36,40 @@ func nodeProject(t *testing.T, name string) string {
 	return dir
 }
 
-// Nothing is copied anywhere without consent, and the refusal says what to allow.
-func TestANodePodIsNotBuiltWithoutConsent(t *testing.T) {
-	dir := nodeProject(t, "e2e-node-consent")
+// A machine the config names gets its pod the first time a command is sent to
+// it, so every command anywhere sees the same tree — its cwd, and every absolute
+// path in its arguments. There is no plain-ssh fallback that would give those
+// paths the bare machine's meaning.
+func TestANodePodIsBuiltOnFirstUse(t *testing.T) {
+	dir := nodeProject(t, "e2e-node-first")
 	if _, errOut, code := vpIn(t, dir, "up"); code != 0 {
 		t.Fatalf("up: %s", errOut)
 	}
-	// A directory that belongs to vptest, dispatched to vptest2: the same string
-	// there is a different filesystem, so it needs a pod and there is none.
-	_, errOut, code := vpIn(t, dir, "run", "--", "/bin/sh", "-c",
-		"cd "+remoteSrv+" && vp @vptest2 /usr/bin/pwd")
-	if code == 0 {
-		t.Fatal("a command was sent to a machine with no pod reproducing its directory")
+	// A directory that belongs to vptest, dispatched to vptest2.
+	out, errOut, code := vpIn(t, dir, "run", "--", "/bin/sh", "-c",
+		"cd "+remoteSrv+" && vp @vptest2 /usr/bin/cat data.txt")
+	if code != 0 {
+		t.Fatalf("exit %d: %s %s", code, out, errOut)
 	}
-	if !strings.Contains(errOut, "vp node add") {
-		t.Errorf("the refusal does not say how to allow it: %q", errOut)
+	if !strings.Contains(out, "served from the remote") {
+		t.Errorf("the node pod does not hold the composed zone: %q", out)
 	}
-	if !strings.Contains(errOut, "same name") && !strings.Contains(errOut, "reproduces") {
-		t.Errorf("the refusal does not say why it matters: %q", errOut)
+	// From a directory that is nobody's, an absolute path in the arguments still
+	// means the pod's: it is read inside vptest2's pod, from its mount.
+	out, errOut, code = vpIn(t, dir, "run", "--", "/bin/sh", "-c",
+		"cd / && vp @vptest2 /usr/bin/grep -c "+remoteSrv+" /proc/self/mountinfo")
+	if code != 0 || strings.TrimSpace(out) == "0" {
+		t.Errorf("an absolute path was not the pod's on vptest2: %q %q", out, errOut)
+	}
+	// And the node keeps its own home, where its toolchain lives.
+	out, _, _ = vpIn(t, dir, "run", "--", "/bin/sh", "-c",
+		"vp @vptest2 /bin/sh -c 'test -d \"$HOME\" && echo home-ok'")
+	if !strings.Contains(out, "home-ok") {
+		t.Errorf("the node pod hides the machine's own home: %q", out)
+	}
+	out, _, _ = vpIn(t, dir, "node")
+	if !strings.Contains(out, "vptest2") {
+		t.Errorf("`vp node` does not list the pod built on first use:\n%s", out)
 	}
 }
 
@@ -119,9 +135,10 @@ func TestANodeBindsWhatItOwnsNatively(t *testing.T) {
 	if !strings.Contains(out, "its own") {
 		t.Errorf("the node's own directory is not bound natively:\n%s", out)
 	}
-	// No FUSE at all in that pod, which is the observable form of "native".
+	// Not FUSE, which is the observable form of "native". (The node's own home
+	// is in its pod too, with whatever the machine has mounted under it.)
 	out, errOut, code := vpIn(t, dir, "run", "--", "/bin/sh", "-c",
-		"vp @vptest /usr/bin/grep -c fuse /proc/self/mountinfo || true")
+		"vp @vptest /usr/bin/grep ' "+remoteSrv+" ' /proc/self/mountinfo | /usr/bin/grep -c fuse || true")
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, errOut)
 	}
